@@ -125,12 +125,20 @@ class Raft {
 public:
 	Raft(asio::any_io_executor ex, RaftConfig cfg, RaftDelegate<Node>* delegate)
 		: ex_(ex), cfg_(cfg), d_(delegate),
-		  election_timer_(ex), heartbeat_timer_(ex), add_command_signal_(ex), relinquish_signal_(ex),
+		  election_timer_(ex), heartbeat_timer_(ex), add_command_signal_(ex), request_vote_signal_(ex), relinquish_signal_(ex),
 		  rng_(std::random_device{}()) {
 		election_timer_.set_callback([this] { election_timeout_cb(); });
 		heartbeat_timer_.set_callback([this] { heartbeat_cb(); });
 		add_command_signal_.set_callback([this] { drain_add_commands(); });
-		relinquish_signal_.set_callback([this] { request_vote(false); });
+		request_vote_signal_.set_callback([this] { request_vote(false); });
+		relinquish_signal_.set_callback([this] {
+			// Xapiand raft_relinquish_leadership: go permanently ineligible, and if we still
+			// hold leadership/candidacy force an immediate election so another node takes
+			// over promptly (graceful hand-off on shutdown / demotion) instead of waiting a
+			// full election timeout.
+			eligible_ = false;
+			if (role_ != RaftRole::FOLLOWER) { request_vote(true); }
+		});
 	}
 
 	// Arm the initial (fast) election timeout. Call once the transport is up.
@@ -158,9 +166,16 @@ public:
 		add_command_signal_.send();
 	}
 
-	// Step down + reset the election timeout (Xapiand's _raft_request_vote(false) /
-	// raft_relinquish_leadership). Thread-safe (posts onto the loop); used when the app
-	// detects a lost leader / lost quorum (e.g. a CLUSTER_BYE from the leader).
+	// Step down to FOLLOWER + reset the election timeout, WITHOUT changing eligibility
+	// (Xapiand's raft_request_vote() / _raft_request_vote(false)). Thread-safe (posts onto
+	// the loop). Used when the app detects a lost leader / lost quorum (a CLUSTER_BYE from
+	// the leader, no quorum) or arms the first election on joining.
+	void request_vote() { request_vote_signal_.send(); }
+
+	// Go ineligible + hand off leadership immediately if we are leader/candidate (Xapiand's
+	// raft_relinquish_leadership). Thread-safe (posts onto the loop); used on graceful
+	// shutdown so the cluster re-elects promptly. Distinct from request_vote(): this also
+	// makes the node stop standing for election.
 	void relinquish_leadership() { relinquish_signal_.send(); }
 
 	RaftRole role() const { return role_; }
@@ -168,6 +183,7 @@ public:
 
 	// Whether this node may become leader / vote for itself (Xapiand's raft_eligible; the
 	// primary-preference hybrid). Default true.
+	bool eligible() const { return eligible_; }
 	void set_eligible(bool e) { eligible_ = e; }
 
 private:
@@ -672,6 +688,7 @@ private:
 	reactor::PeriodicTimer election_timer_;
 	reactor::PeriodicTimer heartbeat_timer_;
 	reactor::Signal add_command_signal_;
+	reactor::Signal request_vote_signal_;
 	reactor::Signal relinquish_signal_;
 
 	RaftRole role_ = RaftRole::FOLLOWER;

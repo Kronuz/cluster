@@ -121,6 +121,22 @@ the invariant documented). None was silently "improved".
   varint 0/1). Each side is consistent, so no bug — just an inconsistency to trip over. Severity:
   cosmetic.
 
+## Corrected during the Xapiand wiring (was a real bug in this lib)
+
+- **[FIXED] `relinquish_leadership()` conflated two distinct Xapiand behaviors.** The first cut
+  mapped `relinquish_leadership()` to `request_vote(false)` (plain step-down). But Xapiand has
+  TWO separate public entry points: `raft_request_vote()` → `_raft_request_vote(false)` (step
+  down to follower + reset the election timeout, eligibility unchanged), and
+  `raft_relinquish_leadership()` → `raft_eligible = false; if (role != FOLLOWER)
+  _raft_request_vote(true)` (go **ineligible** and hand off leadership immediately). Collapsing
+  them lost the graceful-shutdown hand-off: a leaving leader would not go ineligible nor force a
+  prompt re-election, so the cluster would wait a full election timeout to recover. Now split:
+  `request_vote()` (step-down) and `relinquish_leadership()` (ineligible + immediate hand-off) are
+  distinct, plus an `eligible()` getter (Xapiand's `_ASYNC_elect_primary` reads it for the
+  ELECT_PRIMARY_RESPONSE). Covered by a new `run_relinquish_scenario()` in `test/raft_test.cc`
+  (leader relinquishes → goes ineligible → a different, still-alive node takes over), 3/3
+  non-flaky.
+
 ## Status / next
 
 - `cluster::Bus` + `length.h` — done.
@@ -128,5 +144,8 @@ the invariant documented). None was silently "improved".
   (election/vote/append/commit) with an injected `RaftDelegate`. Validated standalone by
   `test/raft_test.cc` (election + replication + re-election, 3 & 5 nodes); demoed
   (`examples/raft_election.cc`) + benchmarked (`benchmarks/raft_bench.cc`).
-- membership gossip (HELLO/WAVE/SNEER/ENTER/BYE + node table) — next.
-- Then Xapiand's Discovery becomes a thin adapter over the substrate; retire libev.
+- membership gossip (HELLO/WAVE/SNEER/ENTER/BYE + node table) — stays app-side in Xapiand
+  (thin glue over `Node::`, a decision recorded in the extraction backlog); Bus + Raft are the libs.
+- Xapiand's Discovery is now a thin adapter over this substrate (`cluster::Bus` +
+  `cluster::Raft` + `XapiandRaftDelegate`), replacing the libev UDP + all raft_* handlers.
+  Validated: 2-node `cluster_check.sh` GREEN + a byte-identical discovery wire diff.

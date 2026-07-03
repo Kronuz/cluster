@@ -181,9 +181,76 @@ static void run_scenario(const std::vector<std::string>& ids, bool failover) {
 	loop.join();
 }
 
+// A leader that gracefully relinquishes leadership (Xapiand's shutdown path) must go
+// ineligible AND hand off promptly to a different, still-alive node -- distinct from
+// request_vote(), which only steps down without giving up eligibility.
+static void run_relinquish_scenario() {
+	std::printf("== raft: leadership relinquish (graceful hand-off) ==\n");
+	std::vector<std::string> ids{"n1", "n2", "n3"};
+
+	Harness h;
+	for (const auto& id : ids) { h.ids.insert(id); }
+
+	cluster::RaftConfig cfg;
+	cfg.heartbeat_timeout = 0.02;
+	cfg.election_init = 0.03;
+	cfg.election_min = 0.05;
+	cfg.election_max = 0.15;
+
+	for (const auto& id : ids) {
+		Harness::NodeCtx ctx;
+		ctx.id = id;
+		ctx.del = std::make_unique<TestDelegate>(&h, id);
+		ctx.raft = std::make_unique<cluster::Raft<TestNode>>(h.io.get_executor(), cfg, ctx.del.get());
+		h.nodes.push_back(std::move(ctx));
+	}
+
+	auto guard = asio::make_work_guard(h.io);
+	std::thread loop([&h] { h.io.run(); });
+	for (auto& n : h.nodes) { n.raft->start(); }
+	std::this_thread::sleep_for(1500ms);
+
+	std::string leader_id = on_loop(h.io, [&] {
+		for (auto& n : h.nodes) { if (n.raft->role() == cluster::RaftRole::LEADER) { return n.id; } }
+		return std::string();
+	});
+	check(!leader_id.empty(), "a leader is elected before relinquish");
+
+	// the leader gracefully hands off (stays alive + in the membership, just ineligible).
+	on_loop(h.io, [&] {
+		for (auto& n : h.nodes) { if (n.id == leader_id) { n.raft->relinquish_leadership(); } }
+		return 0;
+	});
+	std::this_thread::sleep_for(2500ms);   // hand-off + re-election among the eligible
+
+	bool ineligible = on_loop(h.io, [&] {
+		for (auto& n : h.nodes) { if (n.id == leader_id) { return !n.raft->eligible(); } }
+		return false;
+	});
+	check(ineligible, "the relinquishing node is now ineligible");
+
+	auto [l2, who2] = on_loop(h.io, [&] {
+		int c = 0; std::string who;
+		for (auto& n : h.nodes) {
+			if (n.raft->role() == cluster::RaftRole::LEADER) { ++c; who = n.id; }
+		}
+		return std::pair<int, std::string>{c, who};
+	});
+	std::printf("     leader after relinquish: %s (was %s)\n", who2.empty() ? "<none>" : who2.c_str(), leader_id.c_str());
+	check(l2 == 1, "exactly one leader after relinquish");
+	check(!who2.empty() && who2 != leader_id, "leadership handed off to a different node");
+
+	for (auto& n : h.nodes) { asio::post(h.io, [r = n.raft.get()] { r->stop(); }); }
+	std::this_thread::sleep_for(50ms);
+	guard.reset();
+	h.io.stop();
+	loop.join();
+}
+
 int main() {
 	run_scenario({"n1", "n2", "n3"}, /*failover=*/true);
 	run_scenario({"n1", "n2", "n3", "n4", "n5"}, /*failover=*/false);
+	run_relinquish_scenario();
 	std::printf("\n%s (%d failures)\n", g_fail == 0 ? "PASS" : "FAIL", g_fail);
 	return g_fail == 0 ? 0 : 1;
 }
