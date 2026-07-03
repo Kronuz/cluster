@@ -1,0 +1,5 @@
+build/
+build-*/
+_deps/
+*.o
+*.a
