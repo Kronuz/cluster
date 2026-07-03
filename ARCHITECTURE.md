@@ -9,7 +9,7 @@ protocol handler. Read `README.md` first for the shape and the layering; this is
       app        its node type + state hooks + apply(command) + its own message types
      ---------------------------- the injected seams ----------------------------------
   cluster   Bus         versioned, token-scoped, typed multicast messaging   [done]
-            Raft        term/log/role/votes + election + append + commit     [next]
+            Raft        term/log/role/votes + election + append + commit     [done]
             gossip      HELLO/WAVE/SNEER/ENTER/BYE naming + the node table    [next]
             length      the varint length + length-prefixed string codec (wire-compat)
      ---------------------------------------------------------------------------------
@@ -67,6 +67,41 @@ datagram handler and the timers. This is why the protocols schedule their timers
 `bus.io()` (`reactor::PeriodicTimer` / `reactor::Signal`), and never touch that state from another
 thread. Sends are the one exception — UDP send and receive are independent directions, so
 `bus.send()` is safe from any thread — but an ordering-sensitive protocol posts its sends too.
+
+## Raft (`raft.h`) — a faithful port
+
+`cluster::Raft<Node>` is a line-for-line port of the proven Raft in Xapiand's discovery.cc,
+made generic: the algorithm and the byte-identical wire format are the module's; everything
+app-specific is injected through a `RaftDelegate<Node>` (~16 seams). It owns the term, the
+replicated log, the role (follower/candidate/leader), the vote tallies, and the next/match
+indexes, and it drives two `reactor::PeriodicTimer`s (election + heartbeat) on the bus loop.
+
+```
+  election timeout fires  ->  become CANDIDATE, ++term, broadcast REQUEST_VOTE
+  a majority grant         ->  become LEADER, broadcast heartbeats/APPEND_ENTRIES
+  a leader's heartbeat     ->  followers reset their election timeout (stay followers)
+  add_command (leader)     ->  append to log, replicate via heartbeats, commit on majority
+  commit advances          ->  delegate.apply(command) on every node
+```
+
+What is injected (the delegate), and why it is larger than a textbook Raft: this Raft is
+fused with a cluster-lifecycle by design. Beyond the obvious seams — `broadcast` (transport),
+the node serialise/parse, `total_nodes`/`quorum`/`is_alive` (membership), `apply` (the state
+machine) — it carries app *policy*: `prefers(a,b)` (a leader-preference / primary-designation
+hybrid, Xapiand's `is_superset`), `eligible` (may this node lead), and the lifecycle gates
+`active`/`ready`/`joining` + `ensure_setup` (where an app's join state machine plugs in). The
+messages also carry full node records, so a receive doubles as a membership touch — that is
+the fusion with gossip. The seam is honest about this: it is a generic Raft with injected
+policy, not a pretend-pure one.
+
+Only the trace logging is dropped from the port (side-band observability, not behavior).
+The timing constants that were fixed in Xapiand (heartbeat 1s, election 4/10/30s) are now
+`RaftConfig`, defaulting to those exact values; tests/benchmarks pass tiny values.
+
+`test/raft_test.cc` proves the port standalone — no sockets, no Xapiand — with N in-memory
+nodes over a fake broadcast bus: a single stable leader is elected, a command is committed
+and applied on every node, and after the leader is killed a new one is elected among the
+survivors (3 and 5 nodes). `benchmarks/raft_bench.cc` measures the election latency.
 
 ## What lives above (the injected seams)
 

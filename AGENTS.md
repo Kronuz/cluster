@@ -30,14 +30,28 @@ bus.h       cluster::Bus -- the versioned, token-scoped, typed multicast message
             + broadcasts; a received datagram is validated (version <= ours, token match,
             type in range) then dispatched to on_message on the bus reactor thread. io()
             exposes the loop for the Raft/gossip/app timers.
+raft.h      cluster::Raft<Node> -- a line-for-line port of Xapiand's Raft (election/vote/
+            append/commit), generic via a RaftDelegate<Node> (~16 injected seams: transport,
+            node serialise/parse, membership/quorum, prefers/eligible policy, active/ready/
+            joining + ensure_setup lifecycle gates, apply). Timers on the bus loop. Timing is
+            RaftConfig (Xapiand defaults). Only trace logging dropped.
 examples/gossip.cc     A runnable demo: three nodes announce themselves over the bus and
                        print what they hear (loopback-pinned, self-contained).
+examples/raft_election.cc  A Raft demo: five in-memory nodes elect a leader + replicate a
+                       command (uses examples/mem_cluster.h, the in-memory harness).
+examples/mem_cluster.h  Support: a minimal in-memory N-node cluster (fake broadcast bus +
+                       delegate) for the raft example/benchmark. NOT part of the library.
 benchmarks/bus_bench.cc  The per-message overhead the bus adds -- framing on send + parse/
                        validate on receive (~30 ns / ~1.5 ns per message; UDP throughput is
                        OS-bound and not the point).
+benchmarks/raft_bench.cc  Raft election latency over many trials (consensus formation time;
+                       bounded by the election-timeout config, reported alongside it).
 test/bus_test.cc   ctest "cluster_bus": length-codec round-trips + a two-node bus exchange
                    over loopback multicast (token scoping, version rejection). Multicast is
                    loopback-pinned + env-probed (skips if the host can't multicast).
+test/raft_test.cc  ctest "cluster_raft": N in-memory nodes over a fake bus -- one stable
+                   leader elected, a command committed+applied on every node, and re-election
+                   after the leader is killed (3 and 5 nodes). No sockets, no Xapiand.
 CMakeLists.txt     Header-only INTERFACE target cluster::cluster; FetchContents reactor
                    (-DFETCHCONTENT_SOURCE_DIR_REACTOR for local dev); example/bench/tests
                    only top-level.
@@ -72,8 +86,9 @@ VPN (which breaks default-route multicast).
 ## Status / next
 
 - `cluster::Bus` + `length.h` — done.
-- `raft.h` (cluster::Raft) — faithfully port Xapiand's raft (election/vote/append/commit)
-  as a module riding the Bus, with injected Membership + Callbacks. Unit-test with N
-  in-memory nodes over a fake bus.
+- `raft.h` (`cluster::Raft<Node>`) — DONE. A faithful, generic port of Xapiand's Raft
+  (election/vote/append/commit) with an injected `RaftDelegate`. Validated standalone by
+  `test/raft_test.cc` (election + replication + re-election, 3 & 5 nodes); demoed
+  (`examples/raft_election.cc`) + benchmarked (`benchmarks/raft_bench.cc`).
 - membership gossip (HELLO/WAVE/SNEER/ENTER/BYE + node table) — next.
-- Then Xapiand's Discovery becomes a thin adapter over `cluster::Cluster`; retire libev.
+- Then Xapiand's Discovery becomes a thin adapter over the substrate; retire libev.

@@ -42,12 +42,26 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	add_executable(cluster_gossip examples/gossip.cc)
 	target_link_libraries(cluster_gossip PRIVATE cluster)
 
+	# A Raft demo: five in-memory nodes elect a leader + replicate a command.
+	add_executable(cluster_raft_election examples/raft_election.cc)
+	target_link_libraries(cluster_raft_election PRIVATE cluster)
+
 	# The per-message overhead the bus adds (framing + parse/validate).
 	add_executable(cluster_bus_bench benchmarks/bus_bench.cc)
 	target_link_libraries(cluster_bus_bench PRIVATE cluster)
+
+	# Raft election latency over many trials (consensus formation time).
+	add_executable(cluster_raft_bench benchmarks/raft_bench.cc)
+	target_link_libraries(cluster_raft_bench PRIVATE cluster)
+	target_include_directories(cluster_raft_bench PRIVATE examples)   # mem_cluster.h support
 
 	add_executable(cluster_bus_test test/bus_test.cc)
 	target_link_libraries(cluster_bus_test PRIVATE cluster)
 	add_test(NAME cluster_bus COMMAND cluster_bus_test)
 	set_tests_properties(cluster_bus PROPERTIES TIMEOUT 60)
+
+	add_executable(cluster_raft_test test/raft_test.cc)
+	target_link_libraries(cluster_raft_test PRIVATE cluster)
+	add_test(NAME cluster_raft COMMAND cluster_raft_test)
+	set_tests_properties(cluster_raft PROPERTIES TIMEOUT 60)
 endif()

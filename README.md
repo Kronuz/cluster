@@ -17,7 +17,7 @@ multicast Raft.
        |
   cluster::Bus     versioned, token-scoped, typed multicast messaging   [done]
        |
-  cluster::Raft    term / log / role / votes + election + append + commit   [next]
+  cluster::Raft    term / log / role / votes + election + append + commit   [done]
   cluster::gossip  HELLO/WAVE/SNEER/ENTER/BYE naming + the node table       [next]
        |
   the app          its node type, state hooks, apply(command), its own message types
@@ -79,5 +79,10 @@ multicast, cluster-token scoping, and version rejection).
 
 ## Status
 
-Phase 1 (`cluster::Bus`) is done. `cluster::Raft` and the membership gossip are next; then a
-search engine (Xapiand) rides the substrate, retiring its libev Discovery.
+`cluster::Bus` (Phase 1) and `cluster::Raft` (Phase 2) are done. Raft is a faithful, generic
+port of a proven multicast Raft, validated standalone — `test/raft_test.cc` runs N in-memory
+nodes over a fake bus and elects a stable leader, replicates + applies a command on every
+node, and re-elects after the leader is killed (3 and 5 nodes); `examples/raft_election.cc`
+demos it and `benchmarks/raft_bench.cc` measures election latency (~40 ms with a 20–60 ms
+election window). The membership gossip is next; then a search engine (Xapiand) rides the
+substrate, retiring its libev Discovery.
