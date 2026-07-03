@@ -83,6 +83,44 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release -DFETCHCONTENT_SOURCE_DIR_REACTOR=../r
 The bus test's multicast section is loopback-pinned + env-probed, so it stays green under a
 VPN (which breaks default-route multicast).
 
+## Flagged during extraction (Raft) — preserved verbatim, NOT fixed
+
+The line-by-line port surfaced these. Per the fidelity rule they were ported unchanged; they
+are flagged here so the owner can decide (fix as a separate validated change, or accept with
+the invariant documented). None was silently "improved".
+
+- **[ANTI-PATTERN] Consensus is fused with membership.** Every Raft message carries a full
+  serialised node record, and processing any Raft message runs `parse_node` → the membership
+  touch as a side effect (a heartbeat doubles as a liveness ping). *Why it's suspect:* Raft
+  (consensus) and gossip (membership/liveness) are two concerns welded into one message flow —
+  you cannot run this Raft over a different membership source, and every vote/heartbeat is
+  inflated by a node blob. This is the direct cause of the large `RaftDelegate` seam. Severity:
+  architecture smell, not a correctness bug.
+- **[SCALABILITY BOUNDARY] Broadcast Raft with self-loopback.** It runs over UDP multicast:
+  every node receives + processes every message, including its own (self-voting is written into
+  the algorithm). *Why it's suspect:* textbook Raft is point-to-point; here one election round is
+  O(N²) deliveries (each of N nodes broadcasts its vote to all N). Fine for small clusters (the
+  target), quadratic beyond. Severity: an unstated cluster-size limit, not a bug.
+- **[LATENT FOOT-GUN] `add_command` dedups by exact command content across the ENTIRE log.**
+  `do_add_command` skips the append if any existing entry (committed or not, any term) has an
+  identical command string. *Why it's suspect:* a legitimately-repeated command is **silently
+  dropped** (never re-applied) — correct only under the implicit invariant that every command is
+  globally unique/idempotent (Xapiand's are). Also O(log) per add. *Bonus:* this same dedup is
+  what stands in for log compaction (the log grows only by distinct commands, so it stays
+  bounded); removing it without adding snapshotting would let the log grow unbounded. Severity:
+  latent foot-gun + minor perf, load-bearing invariant.
+- **[FRAGILE-BUT-CORRECT] Unsigned underflow guarded only by a short-circuit.** In
+  `on_append_entries`: `entry_index <= 1 || (prev_log_index <= last_index && log_[prev_log_index
+  - 1].term == prev_log_term)`. `prev_log_index` is unsigned, so `log_[prev_log_index - 1]` reads
+  `log_[SIZE_MAX]` when it is 0 — safe **only** because `entry_index == prev_log_index + 1`, so
+  `prev_log_index == 0 ⟺ entry_index <= 1` short-circuits first. Correct today; a reorder of the
+  condition or a change to how `entry_index` is derived would introduce an out-of-bounds read.
+  Severity: fragile, correct now.
+- **[COSMETIC] Two boolean encodings in one protocol.** `eligible` goes on the wire via
+  `serialise_bool` (a '1'/'0' byte); `success` (in the `*_RESPONSE`) via `serialise_length` (a
+  varint 0/1). Each side is consistent, so no bug — just an inconsistency to trip over. Severity:
+  cosmetic.
+
 ## Status / next
 
 - `cluster::Bus` + `length.h` — done.
