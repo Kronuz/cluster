@@ -34,9 +34,17 @@ target_compile_features(cluster INTERFACE cxx_std_20)
 target_link_libraries(cluster INTERFACE reactor::reactor)
 add_library(cluster::cluster ALIAS cluster)
 
-# --- tests (built only when this repo is top-level) ---
+# --- example + benchmark + tests (built only when this repo is top-level) ---
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	enable_testing()
+
+	# A runnable gossip demo (three nodes announce themselves over the bus).
+	add_executable(cluster_gossip examples/gossip.cc)
+	target_link_libraries(cluster_gossip PRIVATE cluster)
+
+	# The per-message overhead the bus adds (framing + parse/validate).
+	add_executable(cluster_bus_bench benchmarks/bus_bench.cc)
+	target_link_libraries(cluster_bus_bench PRIVATE cluster)
 
 	add_executable(cluster_bus_test test/bus_test.cc)
 	target_link_libraries(cluster_bus_test PRIVATE cluster)

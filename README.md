@@ -71,8 +71,11 @@ Header-only: add the directory to your include path (or `FetchContent` this repo
 `cluster::cluster` (which pulls in `reactor::reactor` + standalone Asio). Point
 `-DFETCHCONTENT_SOURCE_DIR_REACTOR=<path>` at a local reactor checkout for dev.
 
-`test/bus_test.cc` covers the length codec (wire-compat round-trips) and the bus (a
-two-node exchange over loopback multicast, cluster-token scoping, and version rejection).
+`examples/gossip.cc` (`cluster_gossip`) is a runnable demo — three nodes announce themselves
+over the bus and print what they hear. `benchmarks/bus_bench.cc` (`cluster_bus_bench`) measures
+the per-message overhead the bus adds (framing + parse/validate — ~30 ns / ~1.5 ns). `test/bus_test.cc`
+covers the length codec (wire-compat round-trips) and the bus (a two-node exchange over loopback
+multicast, cluster-token scoping, and version rejection).
 
 ## Status
 

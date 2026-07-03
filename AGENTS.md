@@ -30,11 +30,17 @@ bus.h       cluster::Bus -- the versioned, token-scoped, typed multicast message
             + broadcasts; a received datagram is validated (version <= ours, token match,
             type in range) then dispatched to on_message on the bus reactor thread. io()
             exposes the loop for the Raft/gossip/app timers.
+examples/gossip.cc     A runnable demo: three nodes announce themselves over the bus and
+                       print what they hear (loopback-pinned, self-contained).
+benchmarks/bus_bench.cc  The per-message overhead the bus adds -- framing on send + parse/
+                       validate on receive (~30 ns / ~1.5 ns per message; UDP throughput is
+                       OS-bound and not the point).
 test/bus_test.cc   ctest "cluster_bus": length-codec round-trips + a two-node bus exchange
                    over loopback multicast (token scoping, version rejection). Multicast is
                    loopback-pinned + env-probed (skips if the host can't multicast).
 CMakeLists.txt     Header-only INTERFACE target cluster::cluster; FetchContents reactor
-                   (-DFETCHCONTENT_SOURCE_DIR_REACTOR for local dev); tests only top-level.
+                   (-DFETCHCONTENT_SOURCE_DIR_REACTOR for local dev); example/bench/tests
+                   only top-level.
 ```
 
 ## Invariants — do not regress these
