@@ -125,11 +125,12 @@ class Raft {
 public:
 	Raft(asio::any_io_executor ex, RaftConfig cfg, RaftDelegate<Node>* delegate)
 		: ex_(ex), cfg_(cfg), d_(delegate),
-		  election_timer_(ex), heartbeat_timer_(ex), add_command_signal_(ex),
+		  election_timer_(ex), heartbeat_timer_(ex), add_command_signal_(ex), relinquish_signal_(ex),
 		  rng_(std::random_device{}()) {
 		election_timer_.set_callback([this] { election_timeout_cb(); });
 		heartbeat_timer_.set_callback([this] { heartbeat_cb(); });
 		add_command_signal_.set_callback([this] { drain_add_commands(); });
+		relinquish_signal_.set_callback([this] { request_vote(false); });
 	}
 
 	// Arm the initial (fast) election timeout. Call once the transport is up.
@@ -156,6 +157,11 @@ public:
 		{ std::lock_guard<std::mutex> lk(cmd_mtx_); cmd_queue_.push_back(command); }
 		add_command_signal_.send();
 	}
+
+	// Step down + reset the election timeout (Xapiand's _raft_request_vote(false) /
+	// raft_relinquish_leadership). Thread-safe (posts onto the loop); used when the app
+	// detects a lost leader / lost quorum (e.g. a CLUSTER_BYE from the leader).
+	void relinquish_leadership() { relinquish_signal_.send(); }
 
 	RaftRole role() const { return role_; }
 	std::uint64_t term() const { return current_term_; }
@@ -666,6 +672,7 @@ private:
 	reactor::PeriodicTimer election_timer_;
 	reactor::PeriodicTimer heartbeat_timer_;
 	reactor::Signal add_command_signal_;
+	reactor::Signal relinquish_signal_;
 
 	RaftRole role_ = RaftRole::FOLLOWER;
 	std::uint64_t current_term_ = 0;
