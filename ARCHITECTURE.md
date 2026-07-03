@@ -3,6 +3,11 @@
 How the cluster substrate is put together, and the path a datagram takes from the wire to a
 protocol handler. Read `README.md` first for the shape and the layering; this is the map.
 
+![cluster: Raft consensus riding a multicast gossip Bus](assets/architecture.svg)
+
+<!-- Diagram: assets/architecture.svg. Edit the D2 source below and re-render with:
+     d2 --theme 0 --pad 20 <this-source>.d2 assets/architecture.svg
+
 ```d2
 # cluster: Raft consensus riding a multicast gossip Bus.
 direction: down
@@ -15,6 +20,7 @@ app -> bus: "send / recv app messages"
 raft -> bus: "consensus RPCs ride the bus"
 bus -> net
 ```
+-->
 
 ## Dependencies
 
