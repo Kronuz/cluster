@@ -60,6 +60,10 @@ is in range, and its token matches; otherwise it is dispatched on the bus reacto
 the same loop the caller runs its timers on (`bus.io()`), so a single-threaded protocol
 never races the receive.
 
+## Dependencies
+
+**[reactor](https://github.com/Kronuz/reactor)** (which brings standalone **asio**), via CMake `FetchContent`; otherwise header-only. The node type, its state hooks / `apply(command)`, the message codec, and logging are **injected seams**, not dependencies.
+
 ## Build
 
 ```sh

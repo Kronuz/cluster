@@ -3,6 +3,26 @@
 How the cluster substrate is put together, and the path a datagram takes from the wire to a
 protocol handler. Read `README.md` first for the shape and the layering; this is the map.
 
+```d2
+# cluster: Raft consensus riding a multicast gossip Bus.
+direction: down
+app: "application\n(e.g. Discovery: membership + primary election)" { style.fill: "#e8f5ee" }
+raft: "cluster::Raft\n(terms, leader election, AppendEntries, commit-on-majority)" { style.fill: "#eef2f7" }
+bus: "cluster::Bus\n(framed multicast gossip datagrams)" { style.fill: "#eef2f7" }
+net: "UDP multicast (on the reactor runtime)" { style.fill: "#faf3e6" }
+app -> raft: "propose / apply"
+app -> bus: "send / recv app messages"
+raft -> bus: "consensus RPCs ride the bus"
+bus -> net
+```
+
+## Dependencies
+
+**[reactor](https://github.com/Kronuz/reactor)** (which brings standalone
+**asio**), pulled in by CMake `FetchContent`; otherwise header-only. The node type, its
+state hooks / `apply(command)`, the message codec, and logging are **injected seams**
+(see [What lives above](#what-lives-above-the-injected-seams)), not dependencies.
+
 ## The layering
 
 ```
