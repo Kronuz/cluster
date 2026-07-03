@@ -89,6 +89,15 @@ int main() {
 		bool sok = cluster::unserialise_string(&p, p + s.size(), sv);
 		check(sok && sv == "hello-token", "serialise_string/unserialise_string round-trip");
 
+		// serialise_bool: one byte '1'/'0', round-trips both ways.
+		bool bv = false;
+		std::string bt = cluster::serialise_bool(true), bf = cluster::serialise_bool(false);
+		const char* bp = bt.data();
+		bool bok = cluster::unserialise_bool(&bp, bp + bt.size(), bv) && bv;
+		const char* bp2 = bf.data();
+		bok = bok && cluster::unserialise_bool(&bp2, bp2 + bf.size(), bv) && !bv;
+		check(bok, "serialise_bool/unserialise_bool round-trip (both values)");
+
 		// truncated inputs are rejected, not crashed.
 		const char* q = s.data();
 		std::string_view sv2;

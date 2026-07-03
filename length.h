@@ -81,6 +81,19 @@ inline std::string serialise_string(std::string_view input) {
 	return result;
 }
 
+// A boolean is one byte, '1' or '0' -- byte-compatible with Xapiand's serialise_bool.
+inline std::string serialise_bool(bool value) {
+	return value ? "1" : "0";
+}
+
+inline bool unserialise_bool(const char** p, const char* end, bool& out) {
+	if (*p == end) { return false; }
+	char c = *(*p)++;
+	if (c < '0' || c > '1') { return false; }
+	out = (c != '0');
+	return true;
+}
+
 // Read a length-prefixed string; out views into the same buffer as *p. false on truncation.
 inline bool unserialise_string(const char** p, const char* end, std::string_view& out) {
 	unsigned long long len = 0;
