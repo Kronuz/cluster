@@ -476,7 +476,7 @@ private:
 
 			auto last_index = log_.size();
 			auto entry_index = prev_log_index + 1;
-			if (entry_index <= 1 || (prev_log_index <= last_index && log_[prev_log_index - 1].term == prev_log_term)) {
+			if (entry_index <= 1 || (prev_log_index >= 1 && prev_log_index <= last_index && log_[prev_log_index - 1].term == prev_log_term)) {
 				std::uint64_t leader_commit_u = 0;
 				if (!unserialise_length(&p, p_end, leader_commit_u)) { return; }
 				std::size_t leader_commit = static_cast<std::size_t>(leader_commit_u);
