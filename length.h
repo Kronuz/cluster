@@ -56,7 +56,11 @@ inline std::string serialise_length(unsigned long long len) {
 }
 
 // Read a length from [*p, end); advance *p. false on truncated/overlong input.
-inline bool unserialise_length(const char** p, const char* end, unsigned long long& out) {
+// Templated on the destination integer type so it binds equally to uint64_t,
+// unsigned long long, or size_t (these are distinct types under LP64 even when
+// same-width, so a fixed unsigned-long-long& reference would reject a uint64_t).
+template <typename T>
+inline bool unserialise_length(const char** p, const char* end, T& out) {
 	if (*p == end) { return false; }
 	unsigned long long len = static_cast<unsigned char>(*(*p)++);
 	if (len == 0xff) {
@@ -71,7 +75,7 @@ inline bool unserialise_length(const char** p, const char* end, unsigned long lo
 		} while ((ch & 0x80) == 0);
 		len += 255;
 	}
-	out = len;
+	out = static_cast<T>(len);
 	return true;
 }
 
