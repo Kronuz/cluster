@@ -15,10 +15,10 @@ multicast Raft.
 ```
   Kronuz/reactor   UdpServer / PeriodicTimer / Signal   -- the Asio transport + loop
        |
-  cluster::Bus     versioned, token-scoped, typed multicast messaging   [done]
+  cluster::Bus     versioned, token-scoped, typed multicast messaging
        |
-  cluster::Raft    term / log / role / votes + election + append + commit   [done]
-  cluster::gossip  HELLO/WAVE/SNEER/ENTER/BYE naming + the node table       [next]
+  cluster::Raft    term / log / role / votes + election + append + commit
+  cluster::gossip  HELLO/WAVE/SNEER/ENTER/BYE naming + the node table
        |
   the app          its node type, state hooks, apply(command), its own message types
 ```
@@ -81,12 +81,12 @@ the per-message overhead the bus adds (framing + parse/validate — ~30 ns / ~1.
 covers the length codec (wire-compat round-trips) and the bus (a two-node exchange over loopback
 multicast, cluster-token scoping, and version rejection).
 
-## Status
+## Limitations
 
-`cluster::Bus` (Phase 1) and `cluster::Raft` (Phase 2) are done. Raft is a faithful, generic
-port of a proven multicast Raft, validated standalone — `test/raft_test.cc` runs N in-memory
-nodes over a fake bus and elects a stable leader, replicates + applies a command on every
-node, and re-elects after the leader is killed (3 and 5 nodes); `examples/raft_election.cc`
-demos it and `benchmarks/raft_bench.cc` measures election latency (~40 ms with a 20–60 ms
-election window). The membership gossip is next; then a search engine (Xapiand) rides the
-substrate, retiring its libev Discovery.
+`cluster::Bus` and `cluster::Raft` are implemented; membership gossip (the node table)
+is not yet. Raft is a faithful, generic port of a proven multicast Raft, validated
+standalone — `test/raft_test.cc` runs N in-memory nodes over a fake bus and elects a
+stable leader, replicates + applies a command on every node, and re-elects after the
+leader is killed (3 and 5 nodes); `examples/raft_election.cc` demos it and
+`benchmarks/raft_bench.cc` measures election latency (~40 ms with a 20–60 ms election
+window).
