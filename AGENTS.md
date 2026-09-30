@@ -137,6 +137,23 @@ the invariant documented). None was silently "improved".
   (leader relinquishes → goes ineligible → a different, still-alive node takes over), 3/3
   non-flaky.
 
+## Found by a downstream consumer (Detent) — RaftDelegate contract gap
+
+- **[DOCS] `is_alive()`/`alive_nodes()` looked like optional hints; they aren't.** A first
+  implementation (Detent, a config-distribution app using `cluster::Raft` with a static peer
+  list instead of Xapiand's gossip membership) returned `true` for any configured peer,
+  reasoning "real safety comes from vote/ack counting." Real consequence, found via a live
+  3-node test: `heartbeat_cb()` picks the log entry to broadcast next as the MINIMUM
+  `next_index` among `is_alive()` peers; a permanently-dead peer wrongly reported alive
+  forever freezes that pick at its last (stale) `next_index`, silently blocking every later
+  entry from ever reaching quorum -- even with an otherwise-healthy majority. Xapiand never
+  hits this because its real delegate's `is_alive()` reads a `Node::touched` timestamp
+  maintained by its own separate gossip layer (HELLO/WAVE/SNEER/ENTER/BYE, stays app-side,
+  see "Status / next" below) -- a library consumer without that layer has to implement real
+  liveness tracking itself (Detent's fix: a last-seen timestamp per peer, updated on any
+  parsed Raft message, checked against a few heartbeat_timeouts). `raft.h`'s own
+  `RaftDelegate` interface comments now spell this contract out explicitly.
+
 ## Status / next
 
 - `cluster::Bus` + `length.h` — done.
