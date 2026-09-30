@@ -108,7 +108,30 @@ struct RaftDelegate {
 	virtual std::size_t total_nodes() = 0;
 	virtual std::size_t alive_nodes() = 0;
 	virtual bool quorum(std::size_t total, std::size_t count) = 0;
-	virtual bool prefers(const Node& a, const Node& b) = 0;   // is_superset(a,b): a outranks b
+	// is_superset(a,b): a outranks b -- Xapiand's primary-preference hybrid,
+	// used both to steer voting toward a designated preferred node (see
+	// on_request_vote's `!eligible || prefers(local, node)` branch) AND, in
+	// on_request_vote_response, to recognize whether a peer's response
+	// ("I voted for X") counts as a vote FOR the local candidate: that
+	// second use compares `prefers(local, voted_for_node)`, which REQUIRES
+	// prefers(x, x) to be true for any node x -- i.e. a reflexive
+	// relation, not merely a "does A outrank B" comparison between two
+	// generally-different nodes. A delegate with no primary-preference
+	// concept at all (every node an equal peer, ordinary Raft log-
+	// completeness voting decides ties) must still implement this as
+	// `return a.node_id() == b.node_id();` (or equivalent identity
+	// comparison), NOT as an unconditional `return false;` -- the latter
+	// compiles and looks like the obviously-correct "no preference"
+	// answer, but silently breaks self-vote-recognition: every
+	// REQUEST_VOTE_RESPONSE is then counted as denied regardless of who
+	// was actually voted for, so no candidate can ever reach quorum and
+	// the cluster runs an unbounded sequence of elections without ever
+	// producing a leader (reproduced: a real 3-node Bus-backed cluster,
+	// prefers() returning unconditional false, ran for 100+ REQUEST_VOTE
+	// rounds with zero elections resolved). See examples/mem_cluster.h's
+	// own `a.id == b.id` for a minimal, correct reference implementation
+	// of exactly this "no preference, but reflexive" case.
+	virtual bool prefers(const Node& a, const Node& b) = 0;
 	virtual bool is_alive(const std::string& id) = 0;
 
 	// cluster-lifecycle gates + hooks
