@@ -43,6 +43,11 @@ struct Delegate : cluster::RaftDelegate<Node> {
 	std::string serialise(const Node& n) override { return cluster::serialise_string(n.id); }
 	std::string node_id(const Node& n) override { return n.id; }
 	bool quorum(std::size_t total, std::size_t count) override { return count * 2 > total; }
+	// No primary-preference hybrid (every node is an equal peer): identity
+	// equality, not an unconditional `false` -- see RaftDelegate::prefers's
+	// own doc comment (raft.h) for why the reflexive case (a node
+	// "preferring" itself) has to stay true for self-vote-recognition to
+	// work at all.
 	bool prefers(const Node& a, const Node& b) override { return a.id == b.id; }
 	bool active() override { return true; }
 	bool ready() override { return true; }
