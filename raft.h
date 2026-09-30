@@ -106,9 +106,20 @@ struct RaftDelegate {
 
 	// membership / quorum
 	virtual std::size_t total_nodes() = 0;
+	// is_alive()-filtered count, used only for heartbeat_cb()'s own
+	// quorum-loss check (does this leader still have enough live peers to
+	// keep heartbeating). Must reflect real liveness for that check to
+	// mean anything -- see is_alive()'s own comment.
 	virtual std::size_t alive_nodes() = 0;
 	virtual bool quorum(std::size_t total, std::size_t count) = 0;
 	virtual bool prefers(const Node& a, const Node& b) = 0;   // is_superset(a,b): a outranks b
+	// MUST reflect real liveness (e.g. "heard from within N heartbeats"),
+	// not static configured membership. heartbeat_cb() picks the log
+	// entry to broadcast next as the MINIMUM next_index among is_alive()
+	// peers; a permanently-dead peer wrongly reported alive forever
+	// freezes that pick at its last (stale) next_index, silently
+	// blocking every later entry from ever reaching quorum -- even
+	// though the actually-alive peers would otherwise be enough.
 	virtual bool is_alive(const std::string& id) = 0;
 
 	// cluster-lifecycle gates + hooks
