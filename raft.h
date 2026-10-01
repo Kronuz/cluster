@@ -120,6 +120,9 @@ struct RaftDelegate {
 	// freezes that pick at its last (stale) next_index, silently
 	// blocking every later entry from ever reaching quorum -- even
 	// though the actually-alive peers would otherwise be enough.
+	// liveness.h's LivenessTracker is a ready-to-use implementation of
+	// exactly this (last-seen-timestamp-per-peer, timeout-based) if a
+	// delegate has no other authoritative liveness source of its own.
 	virtual bool is_alive(const std::string& id) = 0;
 
 	// cluster-lifecycle gates + hooks

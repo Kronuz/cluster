@@ -22,9 +22,16 @@ apply) through the injected interfaces. Do not "improve" the algorithm during ex
 ## File map
 
 ```
-length.h    A varint length + length-prefixed string codec, BYTE-COMPATIBLE with Xapiand's
-            serialise_length/serialise_string. Header-only, no exceptions (returns false on
-            bad input). Vendored so the wire format interops without a dependency.
+length.h    A thin compatibility shim over the external `varint` library
+            (github.com/Kronuz/varint): `using varint::serialise_length` etc. into
+            `namespace cluster`, so every existing #include/call site keeps working
+            unchanged. The actual codec used to be vendored here directly; it's now
+            varint's own code (this repo's prior rewrite, extracted -- see varint's
+            README for why, including a real licensing issue in Xapiand's original
+            length.h that this code was never actually derived from).
+liveness.h  LivenessTracker -- a ready-to-use RaftDelegate::is_alive() implementation
+            (last-seen timestamp per peer, timeout-based), for a delegate with no other
+            authoritative liveness source. See "Found by a downstream consumer" below.
 bus.h       cluster::Bus -- the versioned, token-scoped, typed multicast message bus over
             reactor::UdpServer. send(type, content) frames [major][minor][type][token][content]
             + broadcasts; a received datagram is validated (version <= ours, token match,
@@ -60,8 +67,9 @@ CMakeLists.txt     Header-only INTERFACE target cluster::cluster; FetchContents 
 ## Invariants — do not regress these
 
 - **The wire frame is fixed** (`[major][minor][type][serialise_string(token)][content]`) and
-  byte-compatible with Xapiand's classic transport. `length.h` must stay identical to
-  `serialise_length`. Changing either breaks interop with an un-migrated node.
+  byte-compatible with Xapiand's classic transport. `length.h`'s re-exported functions (from
+  `varint`) must stay byte-identical to that encoding. Changing either breaks interop with
+  an un-migrated node.
 - **Everything runs on the one bus reactor thread.** The Raft/gossip/app protocols mutate
   shared state (terms, votes, the node table) without locks, so they MUST schedule their
   timers/posts onto `bus.io()` (`reactor::PeriodicTimer` / `reactor::Signal` / `asio::post`),
@@ -152,11 +160,13 @@ the invariant documented). None was silently "improved".
   see "Status / next" below) -- a library consumer without that layer has to implement real
   liveness tracking itself (Detent's fix: a last-seen timestamp per peer, updated on any
   parsed Raft message, checked against a few heartbeat_timeouts). `raft.h`'s own
-  `RaftDelegate` interface comments now spell this contract out explicitly.
+  `RaftDelegate` interface comments now spell this contract out explicitly, and
+  `liveness.h`'s `LivenessTracker` is that same fix, generalized into a ready-to-use
+  helper for any delegate without its own authoritative liveness source.
 
 ## Status / next
 
-- `cluster::Bus` + `length.h` — done.
+- `cluster::Bus` + `length.h` (now `varint`) — done.
 - `raft.h` (`cluster::Raft<Node>`) — DONE. A faithful, generic port of Xapiand's Raft
   (election/vote/append/commit) with an injected `RaftDelegate`. Validated standalone by
   `test/raft_test.cc` (election + replication + re-election, 3 & 5 nodes); demoed
