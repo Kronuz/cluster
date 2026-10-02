@@ -653,9 +653,6 @@ private:
 	// ---- add command (leader append / follower forward) ----
 	void do_add_command(const std::string& command) {   // _raft_add_command
 		if (role_ == RaftRole::LEADER) {
-			if (commit_index_ < log_.size() && log_[commit_index_].term != current_term_) {
-				log_.resize(commit_index_);
-			}
 			if (std::find_if(log_.begin(), log_.end(), [&](const RaftLogEntry& e) {
 					return e.command == command;
 				}) != log_.end()) {

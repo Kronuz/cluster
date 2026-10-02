@@ -18,6 +18,12 @@ A candidate requires affirmative votes from a quorum of the configured membershi
 
 Votes belong to terms, not roles. A candidate records its self-vote before broadcasting, and same-term candidate-to-follower, leader-to-follower, or explicit step-down transitions retain that vote. A higher term permits a new vote. The regression schedules delay self-loopback, deliver same-term leader traffic, and request another candidate's vote before checking a new-term vote.
 
+## Inherited log entries
+
+A new leader retains the log it inherited. An entry from an earlier term may already have been acknowledged by the previous leader's majority even when the successor has not learned its commit index. Appending a new command cannot truncate that prefix. Replicating a current-term entry commits the preceding prefix in order. Whole-command deduplication remains unchanged for Xapiand compatibility.
+
+The regression models an old leader replicating an entry to the successor and crashing before communicating its committed index. The surviving fixed majority elects the successor in the next term; a newly replicated command commits both entries in order. The schedule failed before removal of leader-side suffix truncation.
+
 ## Upgrade boundary
 
 The seven logical message types and their field encodings are unchanged. Old followers can decode the new initial heartbeat. New leaders defend against old heartbeat match claims, but old leaders retain the original safety defects. Frame compatibility is not proof of safe mixed-version consensus. Upgrade all voters before relying on corrected behavior, and validate the application's discovery/bootstrap and leadership policies separately.

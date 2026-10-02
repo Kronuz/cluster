@@ -271,8 +271,25 @@ static void retained_vote() {
 	check(voted_for(delayed_self) == "C", "a new term permits a new vote");
 }
 
+static void inherited_log() {
+	Fixture successor;
+	// B replicated x to A and acknowledged its majority, but died before
+	// advertising the commit index. A holds x without knowing it committed.
+	successor.raft.on_message(RaftMessage::APPEND_ENTRIES,
+		append("B", 1, 0, 0, 0) + serialise_length(1) + serialise_length(1) + serialise_string("inherited"));
+	check(successor.delegate.applied.empty(), "the successor has not learned the old leader's commit index");
+	successor.candidate(); successor.vote("C");
+	check(successor.raft.role() == cluster::RaftRole::LEADER && successor.raft.term() == 2,
+		"the successor wins the next term with the surviving fixed majority");
+	successor.command("new-term");
+	successor.raft.on_message(RaftMessage::APPEND_ENTRIES_RESPONSE, serialise_string("C") +
+		serialise_length(2) + serialise_length(1) + serialise_length(3) + serialise_length(2));
+	check(successor.delegate.applied == std::vector<std::string>({"inherited", "new-term"}),
+		"a new leader preserves and commits its inherited prefix before its new command");
+}
+
 int main() {
-	try { heartbeat_safety(); affirmative_majority(); retained_vote(); }
+	try { heartbeat_safety(); affirmative_majority(); retained_vote(); inherited_log(); }
 	catch (const std::exception& e) { check(false, e.what()); }
 	return failures == 0 ? 0 : 1;
 }
