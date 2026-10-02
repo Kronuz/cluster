@@ -24,6 +24,12 @@ A new leader retains the log it inherited. An entry from an earlier term may alr
 
 The regression models an old leader replicating an entry to the successor and crashing before communicating its committed index. The surviving fixed majority elects the successor in the next term; a newly replicated command commits both entries in order. The schedule failed before removal of leader-side suffix truncation.
 
+## Term handling and message validation
+
+Complete message decoding precedes Raft-state changes. A valid higher term is observed before role filtering, clearing the previous ballot, replication bookkeeping, and advertised leader. Tested truncated messages and unrepresentable preceding indexes do not depose a leader. Encoded-integer overflow in the shared length decoder is tracked separately until its correction lands. A missing vote-response ballot is distinct from the existing empty-node encoding. The injected node parser may still touch membership while decoding; its contract is unchanged.
+
+Stale requests are rejected using the receiver's current term without starting elections or resetting election timeouts. Same-term valid leader traffic retains the ballot while stepping a candidate down. Response field encodings remain unchanged. Deterministic regressions cover higher-term requests and responses in different roles, stale traffic, response terms, malformed fields, and index overflow.
+
 ## Upgrade boundary
 
 The seven logical message types and their field encodings are unchanged. Old followers can decode the new initial heartbeat. New leaders defend against old heartbeat match claims, but old leaders retain the original safety defects. Frame compatibility is not proof of safe mixed-version consensus. Upgrade all voters before relying on corrected behavior, and validate the application's discovery/bootstrap and leadership policies separately.

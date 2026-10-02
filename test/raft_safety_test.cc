@@ -22,6 +22,7 @@ struct Delegate : cluster::RaftDelegate<Node> {
 	struct Message { RaftMessage type; std::string body; };
 	std::size_t members;
 	std::string me;
+	std::string leader;
 	std::vector<Message> sent;
 	std::vector<std::string> applied;
 	explicit Delegate(std::size_t count, std::string id = "A") : members(count), me(std::move(id)) {}
@@ -44,7 +45,7 @@ struct Delegate : cluster::RaftDelegate<Node> {
 	bool ready() override { return true; }
 	bool joining() override { return false; }
 	void ensure_setup() override {}
-	void set_leader(const Node&) override {}
+	void set_leader(const Node& node) override { leader = node.id; }
 	void apply(const std::string& command) override { applied.push_back(command); }
 };
 
@@ -288,8 +289,75 @@ static void inherited_log() {
 		"a new leader preserves and commits its inherited prefix before its new command");
 }
 
+static std::uint64_t response_term(const Fixture& node) {
+	const auto& body = node.delegate.sent.back().body;
+	const char* p = body.data(); const char* end = p + body.size();
+	std::string_view sender; std::uint64_t term = 0;
+	if (!cluster::unserialise_string(&p, end, sender) || !cluster::unserialise_length(&p, end, term)) {
+		throw std::runtime_error("invalid response term");
+	}
+	return term;
+}
+
+static void term_safety() {
+	Fixture heartbeat_leader;
+	heartbeat_leader.leader();
+	heartbeat_leader.raft.on_message(RaftMessage::HEARTBEAT, append("B", 2, 0, 0, 0));
+	check(heartbeat_leader.raft.role() == cluster::RaftRole::FOLLOWER && heartbeat_leader.raft.term() == 2,
+		"a leader recognizes a higher-term heartbeat before role filtering");
+
+	Fixture vote_leader;
+	vote_leader.leader();
+	vote_leader.raft.on_message(RaftMessage::REQUEST_VOTE_RESPONSE,
+		serialise_string("B") + serialise_length(5) + serialise_length(3) + serialise_string("B"));
+	check(vote_leader.raft.role() == cluster::RaftRole::FOLLOWER && vote_leader.raft.term() == 5 &&
+		vote_leader.delegate.leader.empty(), "a higher-term vote response makes an elected leader step down");
+
+	Fixture response_follower;
+	response_follower.raft.on_message(RaftMessage::APPEND_ENTRIES_RESPONSE,
+		serialise_string("B") + serialise_length(7) + serialise_length(0));
+	check(response_follower.raft.term() == 7 && response_follower.raft.role() == cluster::RaftRole::FOLLOWER,
+		"a follower observes a higher term in an append response");
+
+	Fixture stale;
+	stale.raft.on_message(RaftMessage::HEARTBEAT, append("B", 2, 0, 0, 0));
+	stale.raft.on_message(RaftMessage::HEARTBEAT, append("B", 1, 0, 0, 0));
+	check(stale.raft.term() == 2 && stale.raft.role() == cluster::RaftRole::FOLLOWER,
+		"a stale heartbeat cannot inflate the term or start an election");
+	check(response_term(stale) == 2, "a stale heartbeat response carries the receiver's current term");
+	stale.raft.on_message(RaftMessage::REQUEST_VOTE, request("C", 1));
+	check(response_term(stale) == 2, "a stale vote response carries the receiver's current term");
+
+	Fixture malformed_vote;
+	malformed_vote.raft.on_message(RaftMessage::REQUEST_VOTE,
+		serialise_string("B") + cluster::serialise_bool(true) + serialise_length(10));
+	check(malformed_vote.raft.term() == 0 && malformed_vote.delegate.sent.empty(),
+		"a truncated higher-term vote request cannot mutate Raft state");
+
+	Fixture malformed_append;
+	malformed_append.leader();
+	malformed_append.raft.on_message(RaftMessage::HEARTBEAT, serialise_string("B") + serialise_length(10));
+	check(malformed_append.raft.term() == 1 && malformed_append.raft.role() == cluster::RaftRole::LEADER,
+		"a truncated higher-term heartbeat cannot depose a leader");
+	malformed_append.raft.on_message(RaftMessage::APPEND_ENTRIES_RESPONSE, serialise_string("B") + serialise_length(10));
+	check(malformed_append.raft.term() == 1 && malformed_append.raft.role() == cluster::RaftRole::LEADER,
+		"a truncated higher-term append response cannot mutate Raft state");
+	malformed_append.raft.on_message(RaftMessage::REQUEST_VOTE_RESPONSE,
+		serialise_string("B") + serialise_length(10) + serialise_length(3));
+	check(malformed_append.raft.term() == 1 && malformed_append.raft.role() == cluster::RaftRole::LEADER,
+		"a missing response ballot cannot masquerade as an empty ballot");
+	malformed_append.raft.on_message(RaftMessage::HEARTBEAT,
+		append("B", 10, std::numeric_limits<std::uint64_t>::max(), 0, 0));
+	check(malformed_append.raft.term() == 1 && malformed_append.raft.role() == cluster::RaftRole::LEADER,
+		"overflowing append indexes cannot mutate Raft state");
+	malformed_append.raft.on_message(RaftMessage::REQUEST_VOTE_RESPONSE,
+		serialise_string("B") + serialise_length(10) + serialise_length(3) + serialise_string(""));
+	check(malformed_append.raft.term() == 10 && malformed_append.raft.role() == cluster::RaftRole::FOLLOWER,
+		"a valid empty ballot response still communicates a higher term");
+}
+
 int main() {
-	try { heartbeat_safety(); affirmative_majority(); retained_vote(); inherited_log(); }
+	try { heartbeat_safety(); affirmative_majority(); retained_vote(); inherited_log(); term_safety(); }
 	catch (const std::exception& e) { check(false, e.what()); }
 	return failures == 0 ? 0 : 1;
 }

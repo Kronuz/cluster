@@ -48,6 +48,7 @@
 #include <cstdint>
 #include <deque>
 #include <map>
+#include <limits>
 #include <mutex>
 #include <optional>
 #include <random>
@@ -207,6 +208,23 @@ private:
 	void set_leader(const Node& node) { d_->set_leader(node); }   // _raft_set_leader_node
 	void apply_command(const std::string& command) { d_->apply(command); }
 
+	// Call only after the complete message has been decoded. Roles do not
+	// exempt a peer from observing a new term, and malformed packets cannot
+	// erase a ballot or depose a leader.
+	bool observe_higher_term(std::uint64_t term) {
+		if (term <= current_term_) { return false; }
+		current_term_ = term;
+		role_ = RaftRole::FOLLOWER;
+		voted_for_.reset();
+		voters_.clear();
+		votes_granted_ = votes_denied_ = 0;
+		next_indexes_.clear();
+		match_indexes_.clear();
+		set_leader(Node{});
+		election_timeout_reset(random_election());
+		return true;
+	}
+
 	void commit_log() {   // _raft_commit_log
 		auto last_index = log_.size();
 		for (std::size_t index = commit_index_ + 1; index <= last_index; ++index) {
@@ -308,14 +326,11 @@ private:
 		if (!unserialise_bool(&p, p_end, eligible)) { return; }
 		std::uint64_t term = 0;
 		if (!unserialise_length(&p, p_end, term)) { return; }
-		if (term > current_term_) {
-			current_term_ = term;
-			role_ = RaftRole::FOLLOWER;
-			voted_for_.reset();
-			next_indexes_.clear();
-			match_indexes_.clear();
-			election_timeout_reset(random_election());
-		}
+		std::uint64_t remote_last_log_term = 0, remote_last_log_index_u = 0;
+		if (!unserialise_length(&p, p_end, remote_last_log_term) ||
+			!unserialise_length(&p, p_end, remote_last_log_index_u) || p != p_end ||
+			remote_last_log_index_u > std::numeric_limits<std::size_t>::max()) { return; }
+		observe_higher_term(term);
 
 		Node local = d_->local_node();
 
@@ -326,10 +341,6 @@ private:
 					voted_for_ = local;
 					if (voters_.insert(d_->node_id(local)).second) { ++votes_granted_; }
 				} else if (role_ == RaftRole::FOLLOWER) {
-					std::uint64_t remote_last_log_term = 0;
-					std::uint64_t remote_last_log_index_u = 0;
-					if (!unserialise_length(&p, p_end, remote_last_log_term)) { return; }
-					if (!unserialise_length(&p, p_end, remote_last_log_index_u)) { return; }
 					std::size_t remote_last_log_index = static_cast<std::size_t>(remote_last_log_index_u);
 					auto last_log_index = log_.size();
 					auto last_log_term = last_log_index > 0 ? log_[last_log_index - 1].term : 0;
@@ -350,14 +361,13 @@ private:
 		auto total_nodes = d_->total_nodes();
 		d_->broadcast(RaftMessage::REQUEST_VOTE_RESPONSE,
 			d_->serialise(local) +
-			serialise_length(term) +
+			serialise_length(current_term_) +
 			serialise_length(total_nodes) +
 			d_->serialise(voted_for_ ? *voted_for_ : Node{}));
 	}
 
 	void on_request_vote_response(std::string_view message) {   // raft_request_vote_response
 		if (!d_->active()) { return; }
-		if (role_ != RaftRole::CANDIDATE) { return; }
 
 		const char* p = message.data();
 		const char* p_end = p + message.size();
@@ -369,22 +379,19 @@ private:
 
 		std::uint64_t term = 0;
 		if (!unserialise_length(&p, p_end, term)) { return; }
-		if (term > current_term_) {
-			current_term_ = term;
-			role_ = RaftRole::FOLLOWER;
-			voted_for_.reset();
-			next_indexes_.clear();
-			match_indexes_.clear();
-			election_timeout_reset(random_election());
-		}
+		std::uint64_t total_nodes_u = 0;
+		if (!unserialise_length(&p, p_end, total_nodes_u) ||
+			total_nodes_u > std::numeric_limits<std::size_t>::max()) { return; }
+		std::string_view ballot(p, static_cast<std::size_t>(p_end - p));
+		auto voted_for_node = d_->parse_node(&p, p_end);
+		if (p != p_end || (!voted_for_node && ballot != d_->serialise(Node{}))) { return; }
+		observe_higher_term(term);
+		if (role_ != RaftRole::CANDIDATE) { return; }
 
 		if (term == current_term_) {
-			std::uint64_t total_nodes_u = 0;
-			if (!unserialise_length(&p, p_end, total_nodes_u)) { return; }
 			std::size_t total_nodes = std::max(static_cast<std::size_t>(total_nodes_u), d_->total_nodes());
 
 			if (voters_.insert(d_->node_id(node)).second) {
-				auto voted_for_node = d_->parse_node(&p, p_end);
 				if (voted_for_node) {
 					if (d_->prefers(local, *voted_for_node)) { ++votes_granted_; }
 					else { ++votes_denied_; }
@@ -428,6 +435,30 @@ private:
 
 		std::uint64_t term = 0;
 		if (!unserialise_length(&p, p_end, term)) { return; }
+		std::uint64_t prev_log_index_u = 0, prev_log_term = 0, leader_commit_u = 0;
+		if (!unserialise_length(&p, p_end, prev_log_index_u) ||
+			!unserialise_length(&p, p_end, prev_log_term) ||
+			!unserialise_length(&p, p_end, leader_commit_u) ||
+			prev_log_index_u >= std::numeric_limits<std::size_t>::max() ||
+			leader_commit_u > std::numeric_limits<std::size_t>::max()) { return; }
+		bool has_entry = p != p_end;
+		std::uint64_t last_log_index_u = 0, entry_term = 0;
+		std::string_view entry_command;
+		if (has_entry) {
+			if (type == RaftMessage::HEARTBEAT ||
+				!unserialise_length(&p, p_end, last_log_index_u) ||
+				!unserialise_length(&p, p_end, entry_term) ||
+				!unserialise_string(&p, p_end, entry_command) ||
+				last_log_index_u < prev_log_index_u + 1 || entry_term > term) { return; }
+		}
+		if (p != p_end) { return; }
+		observe_higher_term(term);
+		RaftMessage response_type = (type == RaftMessage::HEARTBEAT)
+			? RaftMessage::HEARTBEAT_RESPONSE : RaftMessage::APPEND_ENTRIES_RESPONSE;
+		if (term < current_term_) {
+			d_->broadcast(response_type, d_->serialise(local) + serialise_length(current_term_) + serialise_length(0));
+			return;
+		}
 
 		if (role_ == RaftRole::LEADER) {
 			if (!d_->prefers(local, node)) {
@@ -436,28 +467,11 @@ private:
 			return;
 		}
 
-		if (term < current_term_) {
-			request_vote(true);
-			return;
-		}
-
-		if (term > current_term_) {
-			current_term_ = term;
-			role_ = RaftRole::FOLLOWER;
-			voted_for_.reset();
-			next_indexes_.clear();
-			match_indexes_.clear();
-		}
-
 		std::size_t next_index = 0;
 		std::size_t match_index = 0;
 		bool success = false;
 
 		if (term == current_term_) {
-			std::uint64_t prev_log_index_u = 0;
-			std::uint64_t prev_log_term = 0;
-			if (!unserialise_length(&p, p_end, prev_log_index_u)) { return; }
-			if (!unserialise_length(&p, p_end, prev_log_term)) { return; }
 			std::size_t prev_log_index = static_cast<std::size_t>(prev_log_index_u);
 
 			if (role_ == RaftRole::CANDIDATE) {
@@ -472,22 +486,10 @@ private:
 			auto last_index = log_.size();
 			auto entry_index = prev_log_index + 1;
 			if (prev_log_index == 0 || (prev_log_index <= last_index && log_[prev_log_index - 1].term == prev_log_term)) {
-				std::uint64_t leader_commit_u = 0;
-				if (!unserialise_length(&p, p_end, leader_commit_u)) { return; }
 				std::size_t leader_commit = static_cast<std::size_t>(leader_commit_u);
 				auto verified_index = prev_log_index;
-				if (type == RaftMessage::HEARTBEAT && p != p_end) { return; }
 
-				if (p != p_end) {
-					std::uint64_t last_log_index_u = 0;
-					std::uint64_t entry_term = 0;
-					std::string_view entry_command;
-					if (!unserialise_length(&p, p_end, last_log_index_u)) { return; }
-					if (!unserialise_length(&p, p_end, entry_term)) { return; }
-					if (!unserialise_string(&p, p_end, entry_command)) { return; }
-					std::size_t last_log_index = static_cast<std::size_t>(last_log_index_u);
-					(void)last_log_index;
-
+				if (has_entry) {
 					if (entry_index <= last_index) {
 						if (entry_index >= 1 && log_[entry_index - 1].term != entry_term) {
 							log_.resize(entry_index - 1);
@@ -521,12 +523,9 @@ private:
 			}
 		}
 
-		RaftMessage response_type = (type == RaftMessage::HEARTBEAT)
-			? RaftMessage::HEARTBEAT_RESPONSE
-			: RaftMessage::APPEND_ENTRIES_RESPONSE;
 		d_->broadcast(response_type,
 			d_->serialise(local) +
-			serialise_length(term) +
+			serialise_length(current_term_) +
 			serialise_length(success ? 1 : 0) +
 			(success
 				? serialise_length(next_index) + serialise_length(match_index)
@@ -543,29 +542,24 @@ private:
 		if (!node_opt) { return; }
 		const Node& node = *node_opt;
 
-		if (role_ != RaftRole::LEADER) { return; }
-
 		std::uint64_t term = 0;
 		if (!unserialise_length(&p, p_end, term)) { return; }
-		if (term > current_term_) {
-			current_term_ = term;
-			role_ = RaftRole::FOLLOWER;
-			voted_for_.reset();
-			next_indexes_.clear();
-			match_indexes_.clear();
-			election_timeout_reset(random_election());
+		bool success = false;
+		if (!unserialise_bool_len(&p, p_end, success)) { return; }
+		std::uint64_t next_index = 0, match_index = 0;
+		if (success) {
+			if (!unserialise_length(&p, p_end, next_index) ||
+				!unserialise_length(&p, p_end, match_index) || next_index == 0 ||
+				next_index > std::numeric_limits<std::size_t>::max() ||
+				match_index >= std::numeric_limits<std::size_t>::max()) { return; }
 		}
+		if (p != p_end) { return; }
+		observe_higher_term(term);
 
 		if (term == current_term_ && role_ == RaftRole::LEADER) {
-			bool success = false;
-			if (!unserialise_bool_len(&p, p_end, success)) { return; }
 			std::string id = d_->node_id(node);
 			if (id == d_->node_id(d_->local_node())) { return; }
 			if (success) {
-				std::uint64_t next_index = 0, match_index = 0;
-				if (!unserialise_length(&p, p_end, next_index)) { return; }
-				if (!unserialise_length(&p, p_end, match_index)) { return; }
-				if (p != p_end) { return; }
 				// Old followers report prev+1 for an empty heartbeat. Heartbeats
 				// never prove data replication, even when their indexes look valid.
 				if (type == RaftMessage::HEARTBEAT_RESPONSE) {
@@ -683,6 +677,7 @@ private:
 	static bool unserialise_bool_len(const char** p, const char* end, bool& out) {
 		std::uint64_t v = 0;
 		if (!unserialise_length(p, end, v)) { return false; }
+		if (v > 1) { return false; }
 		out = (v != 0);
 		return true;
 	}
