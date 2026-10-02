@@ -200,6 +200,10 @@ private:
 		heartbeat_timer_.again();
 	}
 	void election_timeout_reset(double timeout) {   // _raft_leader_election_timeout_reset
+		if (current_term_ == std::numeric_limits<std::uint64_t>::max() && role_ == RaftRole::FOLLOWER) {
+			stop();
+			return;
+		}
 		election_timer_.set_repeat(timeout);
 		election_timer_.again();
 		heartbeat_timer_.stop();
@@ -251,6 +255,15 @@ private:
 		set_leader(Node{});
 
 		if (immediate) {
+			if (current_term_ == std::numeric_limits<std::uint64_t>::max()) {
+				role_ = RaftRole::FOLLOWER;
+				next_indexes_.clear();
+				match_indexes_.clear();
+				voters_.clear();
+				votes_granted_ = votes_denied_ = 0;
+				stop();
+				return;
+			}
 			++current_term_;
 			if (eligible_) {
 				role_ = RaftRole::CANDIDATE;

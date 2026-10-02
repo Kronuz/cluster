@@ -67,7 +67,9 @@ struct Fixture {
 	void candidate(bool loopback = true) {
 		raft.start();
 		io.restart();
-		io.run_for(std::chrono::milliseconds(20));
+		while (raft.role() != cluster::RaftRole::CANDIDATE) {
+			if (io.run_one() == 0) { throw std::runtime_error("election did not start"); }
+		}
 		raft.stop();
 		io.restart();
 		io.poll();
@@ -179,7 +181,10 @@ static void heartbeat_safety() {
 		serialise_length(2) + serialise_length(restarted_leader.raft.term()) + serialise_string("after-restart"));
 	restarted_leader.raft.on_message(RaftMessage::APPEND_ENTRIES_RESPONSE, restarted_peer.delegate.sent.back().body);
 	restarted_leader.delegate.sent.clear();
-	restarted_leader.io.restart(); restarted_leader.io.run_for(std::chrono::milliseconds(10));
+	restarted_leader.io.restart();
+	while (restarted_leader.delegate.sent.empty()) {
+		if (restarted_leader.io.run_one() == 0) { throw std::runtime_error("replay heartbeat did not run"); }
+	}
 	bool replayed_prefix = false;
 	for (const auto& message : restarted_leader.delegate.sent) {
 		if (message.type != RaftMessage::APPEND_ENTRIES) { continue; }
@@ -199,7 +204,10 @@ static void heartbeat_safety() {
 	}
 	restarted_leader.raft.on_message(RaftMessage::APPEND_ENTRIES_RESPONSE, restarted_peer.delegate.sent.back().body);
 	restarted_leader.delegate.sent.clear();
-	restarted_leader.io.restart(); restarted_leader.io.run_for(std::chrono::milliseconds(10));
+	restarted_leader.io.restart();
+	while (restarted_leader.delegate.sent.empty()) {
+		if (restarted_leader.io.run_one() == 0) { throw std::runtime_error("catch-up heartbeat did not run"); }
+	}
 	for (const auto& message : restarted_leader.delegate.sent) {
 		if (message.type == RaftMessage::APPEND_ENTRIES) { restarted_peer.raft.on_message(message.type, message.body); }
 	}
@@ -361,8 +369,46 @@ static void term_safety() {
 		"a valid empty ballot response still communicates a higher term");
 }
 
+static void exhausted_term() {
+	constexpr auto maximum = std::numeric_limits<std::uint64_t>::max();
+	Fixture exhausted;
+	exhausted.raft.on_message(RaftMessage::REQUEST_VOTE, request("B", maximum));
+	check(voted_for(exhausted) == "B", "maximum-term observation can cast its first ballot");
+	exhausted.raft.start(); exhausted.io.restart(); exhausted.io.run_for(std::chrono::milliseconds(20));
+	check(exhausted.raft.term() == maximum && exhausted.raft.role() == cluster::RaftRole::FOLLOWER,
+		"an exhausted follower cannot wrap its election term to zero");
+	exhausted.raft.request_vote(); exhausted.io.restart(); exhausted.io.poll();
+	exhausted.raft.start(); exhausted.io.restart(); exhausted.io.run_for(std::chrono::milliseconds(20));
+	exhausted.raft.on_message(RaftMessage::REQUEST_VOTE, request("C", maximum));
+	check(voted_for(exhausted) == "B", "step-down and repeated start retain a maximum-term ballot");
+	exhausted.raft.on_message(RaftMessage::HEARTBEAT, append("B", maximum, 0, 0, 0));
+	check(response_term(exhausted) == maximum && exhausted.delegate.leader == "B",
+		"an exhausted follower still participates in valid maximum-term leader traffic");
+	bool no_campaign = true;
+	for (const auto& message : exhausted.delegate.sent) {
+		if (message.type == RaftMessage::REQUEST_VOTE) { no_campaign = false; }
+	}
+	check(no_campaign, "an exhausted follower emits no further vote requests");
+
+	Fixture last_election;
+	last_election.raft.on_message(RaftMessage::HEARTBEAT, append("B", maximum - 1, 0, 0, 0));
+	last_election.candidate(); last_election.vote("B");
+	check(last_election.raft.term() == maximum && last_election.raft.role() == cluster::RaftRole::LEADER,
+		"a candidate may complete the election from the penultimate into the maximum term");
+	last_election.delegate.sent.clear();
+	last_election.raft.relinquish_leadership();
+	last_election.io.restart(); last_election.io.poll();
+	check(last_election.raft.term() == maximum && last_election.raft.role() == cluster::RaftRole::FOLLOWER &&
+		last_election.delegate.sent.empty(), "immediate leadership hand-off cannot advance beyond the maximum term");
+	last_election.raft.request_vote(); last_election.io.restart(); last_election.io.poll();
+	last_election.raft.start(); last_election.io.restart(); last_election.io.run_for(std::chrono::milliseconds(20));
+	last_election.raft.on_message(RaftMessage::REQUEST_VOTE, request("C", maximum));
+	check(last_election.raft.term() == maximum && last_election.raft.role() == cluster::RaftRole::FOLLOWER &&
+		voted_for(last_election) == "A", "the last elected leader cannot campaign past the maximum or cast a second ballot");
+}
+
 int main() {
-	try { heartbeat_safety(); affirmative_majority(); retained_vote(); inherited_log(); term_safety(); }
+	try { heartbeat_safety(); affirmative_majority(); retained_vote(); inherited_log(); term_safety(); exhausted_term(); }
 	catch (const std::exception& e) { check(false, e.what()); }
 	return failures == 0 ? 0 : 1;
 }

@@ -30,6 +30,10 @@ Complete message decoding precedes Raft-state changes. A valid higher term is ob
 
 Stale requests are rejected using the receiver's current term without starting elections or resetting election timeouts. Same-term valid leader traffic retains the ballot while stepping a candidate down. Response field encodings remain unchanged. Deterministic regressions cover higher-term requests and responses in different roles, stale traffic, response terms, malformed fields, and index overflow.
 
+## Term exhaustion
+
+An election cannot advance beyond the maximum 64-bit term. An attempted advance keeps the term and ballot, steps down, clears election/replication bookkeeping, and stops timers without broadcasting a vote request. Exhausted followers do not arm election timers through `start()`, explicit step-down, or leader traffic, but still process valid maximum-term traffic and retain their single ballot. A candidate advancing from the preceding term may complete the maximum-term election, and an elected leader may continue serving until it steps down. The regression schedules reproduce wraparound and loss of the maximum-term ballot before correction.
+
 ## Upgrade boundary
 
 The seven logical message types and their field encodings are unchanged. Old followers can decode the new initial heartbeat. New leaders defend against old heartbeat match claims, but old leaders retain the original safety defects. Frame compatibility is not proof of safe mixed-version consensus. Upgrade all voters before relying on corrected behavior, and validate the application's discovery/bootstrap and leadership policies separately.
