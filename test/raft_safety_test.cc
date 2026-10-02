@@ -208,8 +208,23 @@ static void heartbeat_safety() {
 		"a restarted follower replays both entries and catches up after rejection");
 }
 
+static void affirmative_majority() {
+	Fixture election(5);
+	election.candidate();
+	election.vote("B");
+	election.vote("C", "C");
+	check(election.raft.role() == cluster::RaftRole::CANDIDATE,
+		"five voters cannot elect with two grants and one denial");
+	election.vote("B");
+	check(election.raft.role() == cluster::RaftRole::CANDIDATE,
+		"a duplicated affirmative response cannot create a quorum");
+	election.vote("D");
+	check(election.raft.role() == cluster::RaftRole::LEADER,
+		"three distinct affirmative votes elect a leader in five voters");
+}
+
 int main() {
-	try { heartbeat_safety(); }
+	try { heartbeat_safety(); affirmative_majority(); }
 	catch (const std::exception& e) { check(false, e.what()); }
 	return failures == 0 ? 0 : 1;
 }

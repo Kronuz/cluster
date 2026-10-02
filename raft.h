@@ -392,27 +392,25 @@ private:
 					++votes_denied_;
 				}
 			}
-			if (d_->quorum(total_nodes, votes_granted_ + votes_denied_)) {
-				if (votes_granted_ > votes_denied_) {
-					role_ = RaftRole::LEADER;
-					voted_for_.reset();
-					next_indexes_.clear();
-					match_indexes_.clear();
+			if (role_ == RaftRole::CANDIDATE && d_->quorum(total_nodes, votes_granted_)) {
+				role_ = RaftRole::LEADER;
+				voted_for_.reset();
+				next_indexes_.clear();
+				match_indexes_.clear();
 
-					leader_heartbeat_reset(cfg_.heartbeat_timeout);
-					set_leader(local);
+				leader_heartbeat_reset(cfg_.heartbeat_timeout);
+				set_leader(local);
 
-					auto prev_log_index = log_.size();
-					auto prev_log_term = prev_log_index > 0 ? log_[prev_log_index - 1].term : 0;
-					d_->broadcast(RaftMessage::HEARTBEAT,
-						d_->serialise(local) +
-						serialise_length(current_term_) +
-						serialise_length(prev_log_index) +
-						serialise_length(prev_log_term) +
-						serialise_length(commit_index_));
+				auto prev_log_index = log_.size();
+				auto prev_log_term = prev_log_index > 0 ? log_[prev_log_index - 1].term : 0;
+				d_->broadcast(RaftMessage::HEARTBEAT,
+					d_->serialise(local) +
+					serialise_length(current_term_) +
+					serialise_length(prev_log_index) +
+					serialise_length(prev_log_term) +
+					serialise_length(commit_index_));
 
-					if (d_->joining()) { d_->ensure_setup(); }
-				}
+				if (d_->joining()) { d_->ensure_setup(); }
 			}
 		}
 	}

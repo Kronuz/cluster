@@ -10,6 +10,10 @@ Leaders ignore heartbeat match claims as a compatibility policy because older fo
 
 `test/raft_safety_test.cc` drives fixed-membership message schedules through the public API. Its initial election uses a short timer because `PeriodicTimer::again()` with a zero repeat cancels the timer; subsequent timeouts are one hour and message deliveries are controlled by the test. `cluster_raft_safety` runs active checks in Release builds.
 
+## Election majority
+
+A candidate requires affirmative votes from a quorum of the configured membership. A quorum of responses followed by more grants than denials is insufficient: two grants and one denial previously elected a leader in five voters. Duplicate voter responses cannot increase the affirmative count. The fixed-membership regression proves both the denied election and the successful election after a third distinct grant.
+
 ## Upgrade boundary
 
 The seven logical message types and their field encodings are unchanged. Old followers can decode the new initial heartbeat. New leaders defend against old heartbeat match claims, but old leaders retain the original safety defects. Frame compatibility is not proof of safe mixed-version consensus. Upgrade all voters before relying on corrected behavior, and validate the application's discovery/bootstrap and leadership policies separately.
