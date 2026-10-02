@@ -83,6 +83,8 @@ multicast, cluster-token scoping, and version rejection).
 
 ## Limitations
 
+See [Legacy Raft safety corrections](SAFETY.md) for corrected replication progress, mixed-version limits, and deterministic regressions. These are separately validated behavior corrections after extraction. Terms, votes, and logs are still volatile, and the legacy module is not a durable write authority.
+
 `cluster::Bus` and `cluster::Raft` are implemented; membership gossip (the node table)
 is not yet. Raft is a faithful, generic port of a proven multicast Raft, validated
 standalone — `test/raft_test.cc` runs N in-memory nodes over a fake bus and elects a

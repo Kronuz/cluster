@@ -12,6 +12,8 @@ this is the working notes.
 
 ## Origin + the fidelity rule
 
+The owner has authorized separately validated consensus safety corrections for Detent. [SAFETY.md](SAFETY.md) records those corrections and their upgrade boundaries. Preserve public APIs and wire encodings; the extraction fidelity rule below does not require preserving the recorded unsafe decisions. Durable consensus remains an additive module, not an implicit change to legacy persistence semantics.
+
 This is being **extracted faithfully** from Xapiand's `src/server/discovery.cc` (a working
 libev UDP + Raft + gossip monolith). The wire format, the Raft algorithm, and the gossip
 handshake must stay **byte- and behavior-identical** so a migrated Xapiand still forms a

@@ -22,17 +22,17 @@
  */
 
 // cluster::Raft -- a leader-election + replicated-log consensus module, a faithful
-// (line-for-line) port of the proven Raft in Xapiand's discovery.cc, made generic: the
+// port of the legacy Raft in Xapiand's discovery.cc, made generic: the
 // algorithm and the byte-identical wire format are the library's; the transport, the node
 // type, the membership, and the cluster-lifecycle side effects are injected through a
 // RaftDelegate the app implements. It runs on one reactor loop (bus.io()) via
 // reactor::PeriodicTimer election/heartbeat timers -- single-threaded, no locks on its
 // state. add_command() is the one thread-safe entry point (posts onto the loop).
 //
-// Faithfulness: every state transition, vote rule, log-matching/commit rule, and the
-// Xapiand primary-preference hybrid (eligible + prefers/is_superset) are preserved
-// verbatim. Only the trace logging (L_RAFT*) is dropped -- side-band observability, not
-// behavior; add an app trace hook if you want it back. The timing constants that were
+// Public seams and wire encodings preserve Xapiand compatibility. Separately tested
+// safety corrections after extraction are documented in SAFETY.md. The legacy state
+// remains volatile; this is not a durable write authority. Trace logging (L_RAFT*)
+// was dropped; add an app trace hook if needed. The timing constants that were
 // fixed in Xapiand are now RaftConfig (defaults reproduce Xapiand's exactly).
 //
 // Standalone Asio only (ASIO_STANDALONE), header-only, C++20.
@@ -402,10 +402,9 @@ private:
 					leader_heartbeat_reset(cfg_.heartbeat_timeout);
 					set_leader(local);
 
-					auto entry_index = log_.size();
-					auto prev_log_index = entry_index - 1;
-					auto prev_log_term = entry_index > 1 ? log_[prev_log_index - 1].term : 0;
-					d_->broadcast(RaftMessage::APPEND_ENTRIES,
+					auto prev_log_index = log_.size();
+					auto prev_log_term = prev_log_index > 0 ? log_[prev_log_index - 1].term : 0;
+					d_->broadcast(RaftMessage::HEARTBEAT,
 						d_->serialise(local) +
 						serialise_length(current_term_) +
 						serialise_length(prev_log_index) +
@@ -476,10 +475,12 @@ private:
 
 			auto last_index = log_.size();
 			auto entry_index = prev_log_index + 1;
-			if (entry_index <= 1 || (prev_log_index >= 1 && prev_log_index <= last_index && log_[prev_log_index - 1].term == prev_log_term)) {
+			if (prev_log_index == 0 || (prev_log_index <= last_index && log_[prev_log_index - 1].term == prev_log_term)) {
 				std::uint64_t leader_commit_u = 0;
 				if (!unserialise_length(&p, p_end, leader_commit_u)) { return; }
 				std::size_t leader_commit = static_cast<std::size_t>(leader_commit_u);
+				auto verified_index = prev_log_index;
+				if (type == RaftMessage::HEARTBEAT && p != p_end) { return; }
 
 				if (p != p_end) {
 					std::uint64_t last_log_index_u = 0;
@@ -496,17 +497,16 @@ private:
 							log_.resize(entry_index - 1);
 							log_.push_back({entry_term, std::string(entry_command)});
 							last_index = log_.size();
-						} else if (entry_index == last_log_index_u) {
-							return;
 						}
 					} else {
 						log_.push_back({entry_term, std::string(entry_command)});
 						last_index = log_.size();
 					}
+					verified_index = entry_index;
 				}
 
 				if (leader_commit > commit_index_) {
-					commit_index_ = std::min(leader_commit, entry_index);
+					commit_index_ = std::max(commit_index_, std::min(leader_commit, verified_index));
 					if (commit_index_ > last_applied_) {
 						while (commit_index_ > last_applied_ && last_applied_ < last_index) {
 							apply_command(log_[last_applied_].command);
@@ -519,8 +519,8 @@ private:
 					if (d_->joining()) { d_->ensure_setup(); }
 				}
 
-				next_index = last_index + 1;
-				match_index = entry_index;
+				next_index = verified_index + 1;
+				match_index = verified_index;
 				success = true;
 			}
 		}
@@ -537,7 +537,7 @@ private:
 				: std::string()));
 	}
 
-	void on_append_entries_response(RaftMessage /*type*/, std::string_view message) {   // raft_append_entries_response
+	void on_append_entries_response(RaftMessage type, std::string_view message) {   // raft_append_entries_response
 		if (!d_->active()) { return; }
 
 		const char* p = message.data();
@@ -560,17 +560,30 @@ private:
 			election_timeout_reset(random_election());
 		}
 
-		if (term == current_term_) {
+		if (term == current_term_ && role_ == RaftRole::LEADER) {
 			bool success = false;
 			if (!unserialise_bool_len(&p, p_end, success)) { return; }
 			std::string id = d_->node_id(node);
+			if (id == d_->node_id(d_->local_node())) { return; }
 			if (success) {
 				std::uint64_t next_index = 0, match_index = 0;
 				if (!unserialise_length(&p, p_end, next_index)) { return; }
 				if (!unserialise_length(&p, p_end, match_index)) { return; }
-				next_indexes_[id] = static_cast<std::size_t>(next_index);
-				match_indexes_[id] = static_cast<std::size_t>(match_index);
+				if (p != p_end) { return; }
+				// Old followers report prev+1 for an empty heartbeat. Heartbeats
+				// never prove data replication, even when their indexes look valid.
+				if (type == RaftMessage::HEARTBEAT_RESPONSE) {
+					next_indexes_[id] = match_indexes_[id] + 1;
+					return;
+				}
+				if (match_index > log_.size() || next_index < match_index + 1) { return; }
+				auto& matched = match_indexes_[id];
+				matched = std::max(matched, static_cast<std::size_t>(match_index));
+				next_indexes_[id] = matched + 1;
 			} else {
+				// Legacy followers lose their log on restart under the same ID.
+				// A rejection invalidates the old evidence, permitting prefix replay.
+				match_indexes_[id] = 0;
 				auto it = next_indexes_.find(id);
 				auto& next_index = it == next_indexes_.end()
 					? next_indexes_[id] = log_.size() + 2
