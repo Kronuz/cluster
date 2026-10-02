@@ -30,6 +30,7 @@
 #pragma once
 
 #include <cstddef>
+#include <limits>
 #include <string>
 #include <string_view>
 
@@ -68,13 +69,17 @@ inline bool unserialise_length(const char** p, const char* end, T& out) {
 		unsigned char ch = 0;
 		unsigned shift = 0;
 		do {
-			if (*p == end || shift > (sizeof(unsigned long long) * 8 / 7 * 7)) { return false; }
+			if (*p == end || shift >= std::numeric_limits<unsigned long long>::digits) { return false; }
 			ch = static_cast<unsigned char>(*(*p)++);
-			len |= static_cast<unsigned long long>(ch & 0x7f) << shift;
+			auto chunk = static_cast<unsigned long long>(ch & 0x7f);
+			if (chunk > (std::numeric_limits<unsigned long long>::max() >> shift)) { return false; }
+			len |= chunk << shift;
 			shift += 7;
 		} while ((ch & 0x80) == 0);
+		if (len > std::numeric_limits<unsigned long long>::max() - 255) { return false; }
 		len += 255;
 	}
+	if (len > static_cast<unsigned long long>(std::numeric_limits<T>::max())) { return false; }
 	out = static_cast<T>(len);
 	return true;
 }

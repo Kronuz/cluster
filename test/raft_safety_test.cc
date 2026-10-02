@@ -350,6 +350,11 @@ static void term_safety() {
 		append("B", 10, std::numeric_limits<std::uint64_t>::max(), 0, 0));
 	check(malformed_append.raft.term() == 1 && malformed_append.raft.role() == cluster::RaftRole::LEADER,
 		"overflowing append indexes cannot mutate Raft state");
+	std::string overflowing_term = "\xff" + std::string(9, '\0') + "\x82";
+	malformed_append.raft.on_message(RaftMessage::REQUEST_VOTE,
+		serialise_string("B") + cluster::serialise_bool(true) + overflowing_term + serialise_length(0) + serialise_length(0));
+	check(malformed_append.raft.term() == 1 && malformed_append.raft.role() == cluster::RaftRole::LEADER,
+		"an overflowing encoded term cannot masquerade as a legitimate higher term");
 	malformed_append.raft.on_message(RaftMessage::REQUEST_VOTE_RESPONSE,
 		serialise_string("B") + serialise_length(10) + serialise_length(3) + serialise_string(""));
 	check(malformed_append.raft.term() == 10 && malformed_append.raft.role() == cluster::RaftRole::FOLLOWER,

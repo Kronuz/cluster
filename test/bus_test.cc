@@ -102,6 +102,25 @@ int main() {
 		const char* q = s.data();
 		std::string_view sv2;
 		check(!cluster::unserialise_string(&q, q + 2, sv2), "a truncated length-prefixed string is rejected");
+
+		for (unsigned long long value : {~0ull, ~0ull - 255}) {
+			auto encoded = cluster::serialise_length(value);
+			const char* position = encoded.data(); unsigned long long decoded = 0;
+			check(cluster::unserialise_length(&position, position + encoded.size(), decoded) && decoded == value,
+				"maximum representable lengths retain their wire encoding");
+		}
+		auto rejected = [](const std::string& encoded) {
+			const char* position = encoded.data(); unsigned long long decoded = 17;
+			return !cluster::unserialise_length(&position, position + encoded.size(), decoded) && decoded == 17;
+		};
+		std::string excessive_chunk = "\xff" + std::string(9, '\0') + "\x82";
+		check(rejected(excessive_chunk), "an overflowing tenth payload chunk is rejected without changing output");
+		std::string excessive_offset = "\xff" + std::string(9, '\x7f') + "\x81";
+		check(rejected(excessive_offset), "the length codec rejects overflow when restoring the 255 offset");
+		auto narrow_encoded = cluster::serialise_length(65536);
+		const char* narrow_position = narrow_encoded.data(); std::uint16_t narrow = 17;
+		check(!cluster::unserialise_length(&narrow_position, narrow_position + narrow_encoded.size(), narrow) && narrow == 17,
+			"a length wider than its destination is rejected without truncation");
 	}
 
 	// [B] two buses, same token: a typed message is framed, delivered, and dispatched with
