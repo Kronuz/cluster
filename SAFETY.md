@@ -14,6 +14,10 @@ Leaders ignore heartbeat match claims as a compatibility policy because older fo
 
 A candidate requires affirmative votes from a quorum of the configured membership. A quorum of responses followed by more grants than denials is insufficient: two grants and one denial previously elected a leader in five voters. Duplicate voter responses cannot increase the affirmative count. The fixed-membership regression proves both the denied election and the successful election after a third distinct grant.
 
+## Vote lifetime
+
+Votes belong to terms, not roles. A candidate records its self-vote before broadcasting, and same-term candidate-to-follower, leader-to-follower, or explicit step-down transitions retain that vote. A higher term permits a new vote. The regression schedules delay self-loopback, deliver same-term leader traffic, and request another candidate's vote before checking a new-term vote.
+
 ## Upgrade boundary
 
 The seven logical message types and their field encodings are unchanged. Old followers can decode the new initial heartbeat. New leaders defend against old heartbeat match claims, but old leaders retain the original safety defects. Frame compatibility is not proof of safe mixed-version consensus. Upgrade all voters before relying on corrected behavior, and validate the application's discovery/bootstrap and leadership policies separately.

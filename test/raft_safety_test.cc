@@ -63,7 +63,7 @@ struct Fixture {
 	explicit Fixture(std::size_t members = 3, std::string id = "A", bool heartbeats = false)
 		: delegate(members, std::move(id)), raft(io.get_executor(), config(heartbeats), &delegate), keep_heartbeats(heartbeats) {}
 	~Fixture() { raft.stop(); io.restart(); io.poll(); }
-	void candidate() {
+	void candidate(bool loopback = true) {
 		raft.start();
 		io.restart();
 		io.run_for(std::chrono::milliseconds(20));
@@ -71,6 +71,7 @@ struct Fixture {
 		io.restart();
 		io.poll();
 		if (raft.role() != cluster::RaftRole::CANDIDATE) { throw std::runtime_error("election did not start"); }
+		if (!loopback) { return; }
 		// The legacy bus loops requests back to the sender to cast its own vote.
 		for (const auto& message : delegate.sent) {
 			if (message.type == RaftMessage::REQUEST_VOTE) {
@@ -223,8 +224,55 @@ static void affirmative_majority() {
 		"three distinct affirmative votes elect a leader in five voters");
 }
 
+static std::string request(const char* peer, std::uint64_t term) {
+	return serialise_string(peer) + cluster::serialise_bool(true) + serialise_length(term) +
+		serialise_length(0) + serialise_length(0);
+}
+
+static std::string voted_for(const Fixture& node) {
+	const auto& message = node.delegate.sent.back();
+	const char* p = message.body.data(); const char* end = p + message.body.size();
+	std::string_view peer, vote;
+	std::uint64_t term = 0, members = 0;
+	if (message.type != RaftMessage::REQUEST_VOTE_RESPONSE ||
+		!cluster::unserialise_string(&p, end, peer) || !cluster::unserialise_length(&p, end, term) ||
+		!cluster::unserialise_length(&p, end, members) || !cluster::unserialise_string(&p, end, vote) || p != end) {
+		throw std::runtime_error("invalid vote response");
+	}
+	return std::string(vote);
+}
+
+static void retained_vote() {
+	Fixture candidate;
+	candidate.candidate();
+	candidate.raft.on_message(RaftMessage::HEARTBEAT, append("B", candidate.raft.term(), 0, 0, 0));
+	candidate.raft.on_message(RaftMessage::REQUEST_VOTE, request("C", candidate.raft.term()));
+	check(voted_for(candidate) == "A", "same-term leader traffic cannot erase a candidate's vote");
+
+	Fixture step_down;
+	step_down.candidate();
+	step_down.raft.request_vote();
+	step_down.io.restart(); step_down.io.poll();
+	step_down.raft.on_message(RaftMessage::REQUEST_VOTE, request("B", step_down.raft.term()));
+	check(voted_for(step_down) == "A", "explicit same-term step-down cannot grant a second vote");
+	Fixture elected_leader;
+	elected_leader.leader();
+	elected_leader.raft.request_vote();
+	elected_leader.io.restart(); elected_leader.io.poll();
+	elected_leader.raft.on_message(RaftMessage::REQUEST_VOTE, request("B", elected_leader.raft.term()));
+	check(voted_for(elected_leader) == "A", "an elected leader retains its ballot after same-term step-down");
+
+	Fixture delayed_self;
+	delayed_self.candidate(false);
+	delayed_self.raft.on_message(RaftMessage::HEARTBEAT, append("B", delayed_self.raft.term(), 0, 0, 0));
+	delayed_self.raft.on_message(RaftMessage::REQUEST_VOTE, request("C", delayed_self.raft.term()));
+	check(voted_for(delayed_self) == "A", "a candidate records its self-vote before multicast loopback");
+	delayed_self.raft.on_message(RaftMessage::REQUEST_VOTE, request("C", delayed_self.raft.term() + 1));
+	check(voted_for(delayed_self) == "C", "a new term permits a new vote");
+}
+
 int main() {
-	try { heartbeat_safety(); affirmative_majority(); }
+	try { heartbeat_safety(); affirmative_majority(); retained_vote(); }
 	catch (const std::exception& e) { check(false, e.what()); }
 	return failures == 0 ? 0 : 1;
 }

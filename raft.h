@@ -236,12 +236,13 @@ private:
 			++current_term_;
 			if (eligible_) {
 				role_ = RaftRole::CANDIDATE;
-				voted_for_.reset();
+				voted_for_ = d_->local_node();
 				next_indexes_.clear();
 				match_indexes_.clear();
-				votes_granted_ = 0;
+				votes_granted_ = 1;
 				votes_denied_ = 0;
 				voters_.clear();
+				voters_.insert(d_->node_id(*voted_for_));
 			} else {
 				role_ = RaftRole::FOLLOWER;
 				voted_for_.reset();
@@ -262,7 +263,6 @@ private:
 				serialise_length(last_log_index));
 		} else {
 			role_ = RaftRole::FOLLOWER;
-			voted_for_.reset();
 			next_indexes_.clear();
 			match_indexes_.clear();
 			if (current_term_ == 0) {
@@ -280,7 +280,7 @@ private:
 				++current_term_;
 				Node local = d_->local_node();
 				role_ = RaftRole::LEADER;
-				voted_for_.reset();
+				voted_for_ = local;
 				next_indexes_.clear();
 				match_indexes_.clear();
 				leader_heartbeat_reset(cfg_.heartbeat_timeout);
@@ -394,7 +394,6 @@ private:
 			}
 			if (role_ == RaftRole::CANDIDATE && d_->quorum(total_nodes, votes_granted_)) {
 				role_ = RaftRole::LEADER;
-				voted_for_.reset();
 				next_indexes_.clear();
 				match_indexes_.clear();
 
@@ -463,7 +462,6 @@ private:
 
 			if (role_ == RaftRole::CANDIDATE) {
 				role_ = RaftRole::FOLLOWER;
-				voted_for_.reset();
 				next_indexes_.clear();
 				match_indexes_.clear();
 			}
