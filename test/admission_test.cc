@@ -74,6 +74,13 @@ void uncertainty() {
 }
 void slots() {
 	auto small = limits; small.maximum_tickets = 3;
+	{
+		Admission mixed(census({100, 10}), small);
+		auto control = mixed.reserve(AdmissionClass::Control, {1, 1});
+		auto replacement = mixed.reserve(AdmissionClass::Replacement, {1, 1});
+		auto normal = mixed.reserve(AdmissionClass::Normal, {1, 1});
+		check(control && replacement && normal, "occupied protected slots do not block the remaining normal slot");
+	}
 	for (bool replacement_first : {false, true}) {
 		Admission ledger(census({100, 10}), small);
 		auto normal = ledger.reserve(AdmissionClass::Normal, {1, 1});
@@ -103,6 +110,57 @@ void interleaved_replacement() {
 	ledger.credit_durable_reclaim({300, 30});
 	check(ledger.stats().normal_ready && ledger.stats().replacement_available == limits.replacement_pool, "durable cleanup restores replacement protection after interleaving"); bounded(ledger);
 }
+void control_pack_slots() {
+	auto configured = limits; configured.maximum_tickets = 6; configured.control_slots = 3;
+	for (bool replacement_first : {false, true}) {
+		Admission ledger(census({100, 10}), configured);
+		auto normal = ledger.reserve(AdmissionClass::Normal, {1, 1});
+		auto second = ledger.reserve(AdmissionClass::Normal, {1, 1});
+		check(normal && second && !ledger.reserve(AdmissionClass::Normal, {1, 1}), "normal saturation preserves a complete three-write control pack and replacement");
+		std::optional<StoragePermit> replacement;
+		if (replacement_first) { replacement = ledger.reserve(AdmissionClass::Replacement, {1, 1}); }
+		std::vector<StoragePermit> pack;
+		for (unsigned i = 0; i < 3; ++i) {
+			auto permit = ledger.reserve(AdmissionClass::Control, {1, 1});
+			check(permit.has_value(), "every control continuation fits after normal saturation");
+			if (permit) { pack.push_back(std::move(*permit)); }
+		}
+		if (!replacement_first) { replacement = ledger.reserve(AdmissionClass::Replacement, {1, 1}); }
+		check(replacement && ledger.stats().tickets == 6, "either pack/replacement order preserves all protected slots");
+		pack.clear();
+		check(!ledger.reserve(AdmissionClass::Normal, {1, 1}), "canceled control pack restores protection before new normal admission");
+		normal.reset(); second.reset(); replacement.reset();
+		check(ledger.stats().tickets == 0 && !ledger.stats().tainted, "pack cancellation releases all counters once");
+	}
+	for (auto slots : {std::size_t{0}, std::size_t{5}}) {
+		configured.control_slots = slots;
+		check(throws([&] { Admission invalid(census({0, 0}), configured); }), "invalid protected slot configurations reject before use");
+	}
+	configured.maximum_tickets = 5; configured.control_slots = 3;
+	{
+		Admission minimum(census({100, 10}), configured);
+		auto replacement = minimum.reserve(AdmissionClass::Replacement, {1, 1});
+		auto one = minimum.reserve(AdmissionClass::Control, {1, 1});
+		auto two = minimum.reserve(AdmissionClass::Control, {1, 1});
+		auto three = minimum.reserve(AdmissionClass::Control, {1, 1});
+		auto normal = minimum.reserve(AdmissionClass::Normal, {1, 1});
+		check(replacement && one && two && three && normal, "five-slot minimum fits protected pack before normal admission");
+		one->mark_started(); one->settle({1, 1});
+		check(!minimum.reserve(AdmissionClass::Normal, {1, 1}) && minimum.reserve(AdmissionClass::Control, {1, 1}), "settled control slot remains reusable exclusively by protected work at saturation");
+	}
+	Admission lifecycle(census({100, 10}), configured);
+	auto replacement = lifecycle.reserve(AdmissionClass::Replacement, {1, 1});
+	auto first = lifecycle.reserve(AdmissionClass::Control, {1, 1});
+	auto second = lifecycle.reserve(AdmissionClass::Control, {1, 1});
+	*second = std::move(*first);
+	auto normal = lifecycle.reserve(AdmissionClass::Normal, {1, 1});
+	check(normal && !lifecycle.reserve(AdmissionClass::Normal, {1, 1}), "move assignment preserves exact remaining control protection");
+	second->mark_started(); second->settle({1, 1});
+	check(!lifecycle.reserve(AdmissionClass::Normal, {1, 1}), "settlement restores the vacant protected control slot");
+	auto control = lifecycle.reserve(AdmissionClass::Control, {1, 1});
+	control->mark_started(); control->abandon();
+	check(lifecycle.stats().tainted && lifecycle.stats().tickets == 2, "abandonment releases its slot once while fencing uncertain accounting");
+}
 void schedules() {
 	Admission ledger(census({100, 10}), limits); std::mt19937 random(0x504f4f4c); std::vector<StoragePermit> held;
 	for (unsigned step = 0; step < 2000; ++step) {
@@ -121,6 +179,6 @@ void schedules() {
 }
 }
 int main() {
-	try { pools(); uncertainty(); slots(); interleaved_replacement(); schedules(); } catch (const std::exception& error) { check(false, error.what()); }
+	try { pools(); uncertainty(); slots(); interleaved_replacement(); control_pack_slots(); schedules(); } catch (const std::exception& error) { check(false, error.what()); }
 	std::cout << checks << " admission checks, " << failures << " failures\n"; return failures ? 1 : 0;
 }

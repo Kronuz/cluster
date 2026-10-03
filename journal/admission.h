@@ -12,6 +12,7 @@ enum class AdmissionClass { Normal, Control, Replacement };
 struct AdmissionLimits {
 	StorageResources hard, control_pool, replacement_pool;
 	std::size_t maximum_tickets = 64;
+	std::size_t control_slots = 1;
 };
 struct AdmissionStats {
 	StorageResources used, control_available, replacement_available, outstanding;
@@ -24,6 +25,7 @@ struct AdmissionState {
 	AdmissionStats value;
 	StorageResources control_held, replacement_held;
 	bool replacement_active = false;
+	std::size_t active_control = 0;
 	StorageResources free() const {
 		auto charged = resources_add(resources_add(value.used, value.outstanding), resources_add(value.control_available, value.replacement_available));
 		if (!resources_fit(charged, limits.hard)) { return {}; }
@@ -103,6 +105,7 @@ private:
 	}
 	void finish() noexcept {
 		--state_->value.tickets;
+		if (class_ == AdmissionClass::Control) { --state_->active_control; }
 		if (class_ == AdmissionClass::Replacement) { state_->replacement_active = false; }
 	}
 	void release() noexcept {
@@ -127,6 +130,7 @@ class Admission {
 public:
 	Admission(const InventoryStats& inventory, AdmissionLimits limits) {
 		if (!inventory.ready() || limits.maximum_tickets < 3 || limits.maximum_tickets > 4096 ||
+			limits.control_slots == 0 || limits.control_slots > limits.maximum_tickets - 2 ||
 			!detail::resources_fit(detail::resources_add(limits.control_pool, limits.replacement_pool), limits.hard)) {
 			throw std::invalid_argument("unready census or invalid storage admission limits");
 		}
@@ -141,9 +145,11 @@ public:
 			throw std::invalid_argument("invalid storage admission class");
 		}
 		if (peak == StorageResources{} || state_->value.tainted || state_->value.tickets == state_->limits.maximum_tickets) { return std::nullopt; }
-		// Protect permit slots as well as bytes/entries. Normal leaves slots
-		// for both protected classes; control cannot steal replacement's slot.
-		if ((kind == AdmissionClass::Normal && state_->value.tickets >= state_->limits.maximum_tickets - 2) ||
+		// Already held protected permits occupy their reserved slots. Preserve
+		// only the remaining protection when admitting ordinary work.
+		auto remaining_control = state_->limits.control_slots - std::min(state_->limits.control_slots, state_->active_control);
+		auto remaining_replacement = state_->replacement_active ? 0u : 1u;
+		if ((kind == AdmissionClass::Normal && state_->value.tickets >= state_->limits.maximum_tickets - remaining_control - remaining_replacement) ||
 			(kind == AdmissionClass::Control && state_->value.tickets >= state_->limits.maximum_tickets - (state_->replacement_active ? 0 : 1))) { return std::nullopt; }
 		auto available = kind == AdmissionClass::Normal ? state_->free() :
 			(kind == AdmissionClass::Control ? state_->value.control_available : state_->value.replacement_available);
@@ -153,6 +159,7 @@ public:
 		if (kind == AdmissionClass::Control) {
 			state_->value.control_available = detail::resources_subtract(available, peak);
 			state_->control_held = detail::resources_add(state_->control_held, peak);
+			++state_->active_control;
 		}
 		if (kind == AdmissionClass::Replacement) {
 			state_->value.replacement_available = detail::resources_subtract(available, peak);
