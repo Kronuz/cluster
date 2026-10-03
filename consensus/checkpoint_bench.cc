@@ -50,7 +50,7 @@ int main() {
 			if (!checkpoint) { throw std::runtime_error("benchmark capture rejected"); }
 			cpu_begin = cpu_seconds();
 			auto sequence = journal.frontier().sequence;
-			auto bytes = encode_checkpoint(CheckpointBundle{sequence, application.descriptor(), checkpoint->state});
+			auto bytes = encode_checkpoint(checkpoint->state, sequence, application.descriptor());
 			auto builder = journal.prepare_artifact(); std::size_t offset = 0;
 			while (offset < bytes.size()) { auto chunk = std::min(bytes.size() - offset, std::size_t(64 * 1024)); builder.append_chunk(std::string_view(bytes).substr(offset, chunk)); offset += chunk; }
 			auto bundle = builder.finish(); journal.publish_checkpoint(bundle, std::array{application}, sequence);

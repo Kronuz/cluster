@@ -72,29 +72,36 @@ public:
 			limits.log_bytes < limits.rpc_bytes || limits.log_entries == 0) { throw std::invalid_argument("invalid storage recovery configuration or limits"); }
 		state_.configuration = expected_;
 	}
+	// Pure semantic validation, shared by encoding, decoding, and restore.
+	// Return aggregate payload bytes without copying the retained suffix.
+	std::size_t validate_checkpoint_state(const RecoveredState& state) const {
+		if (state.configuration != expected_ || state.base_index == 0 ||
+			state.base_index >= std::numeric_limits<Index>::max() || state.base_term == 0 || state.base_term > state.hard.term ||
+			state.applied_index != state.base_index || state.hard.commit_index < state.base_index ||
+			state.entries.size() > limits_.log_entries || state.entries.size() >= std::numeric_limits<Index>::max() - state.base_index ||
+			state.hard.commit_index > state.base_index + state.entries.size() ||
+			(state.hard.voted_for && std::find(expected_.voters.begin(), expected_.voters.end(), *state.hard.voted_for) == expected_.voters.end())) {
+			throw storage_detail::Corruption("invalid consensus checkpoint state");
+		}
+		Term previous = state.base_term; std::size_t bytes = 0;
+		for (std::size_t i = 0; i < state.entries.size(); ++i) {
+			const auto& entry = state.entries[i];
+			if (entry.index != state.base_index + i + 1 || entry.term == 0 || entry.term < previous || entry.term > state.hard.term ||
+				entry.payload.size() > limits_.command_bytes || entry.payload.size() > limits_.log_bytes - bytes ||
+				(entry.kind != EntryKind::Command && entry.kind != EntryKind::NoOp) || (entry.kind == EntryKind::NoOp && !entry.payload.empty())) {
+				throw storage_detail::Corruption("invalid consensus checkpoint suffix");
+			}
+			previous = entry.term; bytes += entry.payload.size();
+		}
+		return bytes;
+	}
 	// Only the checkpoint adapter supplies this state, after validating the
 	// bundle's storage sequence and explicit application dependency.
 	void restore(RecoveredState state, std::uint64_t covered_sequence) {
 		if (finished_ || failed_ || sequence_ != 0) { throw std::logic_error("checkpoint restoration unavailable"); }
 		try {
-			if (covered_sequence == 0 || state.configuration != expected_ || state.base_index == 0 ||
-				state.base_index >= std::numeric_limits<Index>::max() || state.base_term == 0 || state.base_term > state.hard.term ||
-				state.applied_index != state.base_index || state.hard.commit_index < state.base_index ||
-				state.entries.size() > limits_.log_entries || state.entries.size() >= std::numeric_limits<Index>::max() - state.base_index ||
-				state.hard.commit_index > state.base_index + state.entries.size() ||
-				(state.hard.voted_for && std::find(expected_.voters.begin(), expected_.voters.end(), *state.hard.voted_for) == expected_.voters.end())) {
-				throw storage_detail::Corruption("invalid consensus checkpoint state");
-			}
-			Term previous = state.base_term; std::size_t bytes = 0;
-			for (std::size_t i = 0; i < state.entries.size(); ++i) {
-				const auto& entry = state.entries[i];
-				if (entry.index != state.base_index + i + 1 || entry.term == 0 || entry.term < previous || entry.term > state.hard.term ||
-					entry.payload.size() > limits_.command_bytes || entry.payload.size() > limits_.log_bytes - bytes ||
-					(entry.kind != EntryKind::Command && entry.kind != EntryKind::NoOp) || (entry.kind == EntryKind::NoOp && !entry.payload.empty())) {
-					throw storage_detail::Corruption("invalid consensus checkpoint suffix");
-				}
-				previous = entry.term; bytes += entry.payload.size();
-			}
+			if (covered_sequence == 0) { throw storage_detail::Corruption("invalid checkpoint storage sequence"); }
+			auto bytes = validate_checkpoint_state(state);
 			state_ = std::move(state); bytes_ = bytes; sequence_ = covered_sequence;
 		} catch (...) { failed_ = true; throw; }
 	}

@@ -524,7 +524,7 @@ void real_journal_integration() {
 				} else if (auto checkpoint = std::get_if<PersistCheckpoint>(&action)) {
 					if (!application) { throw std::logic_error("missing immutable capture"); }
 					auto sequence = journal.frontier().sequence;
-					auto bytes = encode_checkpoint(CheckpointBundle{sequence, application->descriptor(), checkpoint->state});
+					auto bytes = encode_checkpoint(checkpoint->state, sequence, application->descriptor());
 					auto builder = journal.prepare_artifact();
 					while (!bytes.empty()) {
 						auto count = std::min(bytes.size(), std::size_t(64 * 1024)); builder.append_chunk(std::string_view(bytes).substr(0, count)); bytes.erase(0, count);

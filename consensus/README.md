@@ -75,4 +75,13 @@ Two reproducible 1,000-step schedules use three voters (seed `1380009556`) and f
 | 1 | 1,024 | 1,197 | 0.000006 | 0.000011 | 0.085114 | 0.002370 | 0.085141 | 946,176 |
 | 65,535 | 67,107,840 | 68,484,227 | 0.064412 | 0.064330 | 0.570458 | 0.477923 | 0.635166 | 572,751,872 |
 
-The largest fixture reserves one retained slot for its included no-op; its command suffix approaches the default 64 MiB payload bound. Process peak RSS comes from `getrusage`, includes fixture initialization and earlier cases, and is not incremental daemon memory. The suffix capture, owning bundle argument, validation state, and encoded buffer coexist, so bounded payloads still require a larger memory budget. These single samples do not establish tail latency, fleet capacity, energy, or cost. Run `.scratch/consensus/consensus_checkpoint_bench` from the repository root; its dedicated scratch directories are removed after each case. Production integration must budget this pause or change the mechanism.
+The largest fixture reserves one retained slot for its included no-op; its command suffix approaches the default 64 MiB payload bound. Process peak RSS comes from `getrusage`, includes fixture initialization and earlier cases, and is not incremental daemon memory. At baseline revision `96ea4dd`, suffix capture, owning bundle argument, validation state, and encoded buffer coexisted, so bounded payloads required a larger memory budget. These single samples do not establish tail latency, fleet capacity, energy, or cost. Run `.scratch/consensus/consensus_checkpoint_bench` from the repository root; its dedicated scratch directories are removed after each case. Production integration must budget this pause or change the mechanism.
+
+Const-reference semantic validation and encoding now avoid two unnecessary suffix copies, and encoding reserves its exact checked size. Use `encode_checkpoint(action.state, covered_sequence, application.descriptor())` when the action already owns the immutable suffix. The owning-bundle overload delegates to the same implementation. Repeating the identical fixture produced:
+
+| Retained entries | Capture wall s | Capture CPU s | Encode/write/publish wall s | CPU s | Full frozen wall s | Process peak RSS bytes |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | 0.000019 | 0.000024 | 0.083942 | 0.001707 | 0.083970 | 983,040 |
+| 65,535 | 0.062530 | 0.062465 | 0.326839 | 0.240048 | 0.389764 | 286,265,344 |
+
+For the large fixture, process peak RSS falls from approximately 546 MiB to 273 MiB, and the measured full freeze from 635 ms to 390 ms. The encoded bundle remains exactly 68,484,227 bytes; validation and durable ordering remain intact. The same single-sample and process-lifetime limitations apply, and 390 ms still needs an explicit production timing budget.
