@@ -2,6 +2,7 @@
 #include "consensus/admission.h"
 #include "consensus/storage.h"
 #include "consensus/checkpoint.h"
+#include "consensus/snapshot.h"
 #include "journal/journal.h"
 #include "journal/posix.h"
 #include "journal/store.h"
@@ -809,8 +810,50 @@ void storage_footprint_plans() {
 	}
 }
 
+void portable_snapshot_descriptors() {
+	auto fixed = config(1); SnapshotPolicy policy{fixed.cluster, fixed.configuration, 7, 4096};
+	SnapshotDescriptor descriptor{fixed.cluster, fixed.configuration, 7, 42, 3, 9, kronuz::journal::crc32c("123456789")};
+	check(descriptor.application_crc32c == 0xe3069283u && kronuz::journal::crc32c("") == 0, "portable payload checksum uses standard CRC32C vectors");
+	auto bytes = encode_snapshot(descriptor, policy);
+	check(bytes.size() == 72 && bytes.substr(0, 8) == "RFTSNP01" && decode_snapshot(bytes, policy) == descriptor, "portable snapshot has exact versioned framing and round trips");
+	check(static_cast<unsigned char>(bytes[40]) == 7 && static_cast<unsigned char>(bytes[44]) == 42 && static_cast<unsigned char>(bytes[52]) == 3 && static_cast<unsigned char>(bytes[60]) == 9, "portable scalar fields use fixed little-endian offsets");
+	auto wide = descriptor; auto wide_policy = policy;
+	wide_policy.application_format = wide.application_format = 0x01020304u;
+	wide.through = 0x0102030405060708ull; wide.term = 0x1112131415161718ull;
+	wide_policy.maximum_application_bytes = wide.application_bytes = 0x2122232425262728ull;
+	wide.application_crc32c = 0x31323334u;
+	auto wide_bytes = encode_snapshot(wide, wide_policy);
+	check(wide_bytes.substr(40) == std::string_view("\x04\x03\x02\x01\x08\x07\x06\x05\x04\x03\x02\x01\x18\x17\x16\x15\x14\x13\x12\x11\x28\x27\x26\x25\x24\x23\x22\x21\x34\x33\x32\x31", 32), "multi-byte scalar wire fixture is independently little endian");
+	check(decode_snapshot(wide_bytes, wide_policy) == wide, "wide portable scalar fields round trip");
+	for (std::size_t length = 0; length < bytes.size(); ++length) {
+		check(throws([&] { decode_snapshot(std::string_view(bytes).substr(0, length), policy); }), "every truncated descriptor rejects before payload allocation");
+	}
+	check(throws([&] { decode_snapshot(bytes + "x", policy); }), "trailing snapshot framing rejects");
+	auto unknown = bytes; unknown[7] = '2';
+	check(throws([&] { decode_snapshot(unknown, policy); }), "unknown portable snapshot version rejects");
+	for (std::size_t offset : {std::size_t{8}, std::size_t{24}, std::size_t{40}}) {
+		auto foreign = bytes; foreign[offset] ^= 1;
+		check(throws([&] { decode_snapshot(foreign, policy); }), "foreign identity or unsupported application format rejects");
+	}
+	auto invalid = descriptor;
+	invalid.through = 0; check(throws([&] { encode_snapshot(invalid, policy); }), "zero included index rejects");
+	invalid.through = std::numeric_limits<Index>::max(); check(throws([&] { encode_snapshot(invalid, policy); }), "maximum included index rejects instead of overflowing a next index");
+	invalid = descriptor; invalid.term = 0; check(throws([&] { encode_snapshot(invalid, policy); }), "zero included term rejects");
+	invalid = descriptor; invalid.application_bytes = 4097; check(throws([&] { encode_snapshot(invalid, policy); }), "payload length above receiver policy rejects");
+	invalid.application_bytes = std::numeric_limits<std::uint64_t>::max(); check(throws([&] { encode_snapshot(invalid, policy); }), "maximum declared payload rejects without allocation");
+	invalid = descriptor; invalid.application_bytes = 0;
+	check(throws([&] { encode_snapshot(invalid, policy); }), "empty payload requires the empty CRC32C");
+	invalid.application_crc32c = 0; check(decode_snapshot(encode_snapshot(invalid, policy), policy) == invalid, "empty application image is valid");
+	invalid = descriptor; invalid.through = std::numeric_limits<Index>::max() - 1; invalid.term = std::numeric_limits<Term>::max(); invalid.application_bytes = policy.maximum_application_bytes;
+	check(decode_snapshot(encode_snapshot(invalid, policy), policy) == invalid, "maximum legal index, term, and receiver length round trip");
+	policy.application_format = invalid.application_format = 0;
+	check(decode_snapshot(encode_snapshot(invalid, policy), policy) == invalid, "application format zero is accepted only by explicit matching policy");
+	policy.maximum_application_bytes = invalid.application_bytes = std::numeric_limits<std::uint64_t>::max();
+	check(decode_snapshot(encode_snapshot(invalid, policy), policy) == invalid, "explicit wide payload policy does not allocate declared application bytes");
+}
+
 int main() {
-	try { event_admission_plans(); storage_footprint_plans(); persistence_barriers(); delayed_completions_do_not_campaign(); replication_and_restart(); affirmative_majority_and_inheritance(); simultaneous_completions(); reads_and_partitions(); overlapping_reads_preserve_data(); application_lag_does_not_spin_reads(); stale_rpc_and_failure_transitions(); bounds_and_semantic_recovery(); local_checkpoint_core(); compacted_index_exhaustion(); compacted_replication(); checkpoint_semantic_recovery(); real_journal_integration(); real_store_integration(); reordered_crash_schedules(3, 0x52414654); reordered_crash_schedules(5, 0x434c5553); }
+	try { portable_snapshot_descriptors(); event_admission_plans(); storage_footprint_plans(); persistence_barriers(); delayed_completions_do_not_campaign(); replication_and_restart(); affirmative_majority_and_inheritance(); simultaneous_completions(); reads_and_partitions(); overlapping_reads_preserve_data(); application_lag_does_not_spin_reads(); stale_rpc_and_failure_transitions(); bounds_and_semantic_recovery(); local_checkpoint_core(); compacted_index_exhaustion(); compacted_replication(); checkpoint_semantic_recovery(); real_journal_integration(); real_store_integration(); reordered_crash_schedules(3, 0x52414654); reordered_crash_schedules(5, 0x434c5553); }
 	catch (const std::exception& error) { check(false, error.what()); }
 	std::cout << checks << " consensus checks, " << failures << " failures\n";
 	return failures ? 1 : 0;
