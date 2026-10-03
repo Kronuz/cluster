@@ -64,6 +64,20 @@ Call `step(budget)` with 1 through 4,096 entries per turn, then inspect `stats()
 
 Logical bytes and allocated bytes are separate aggregates; unavailable allocation metrics make only that aggregate unknown. Missing entries, counter overflow, and unexpected subdirectories prevent readiness. Subdirectory contents are not traversed or guessed. An IO failure leaves the inventory terminally failed; discard it and restart a census under quiescence after resolving the failure. Partial totals never authorize admission. This helper provides accounting observations, not enforced quotas, free-volume reservations, or automatic scheduling.
 
+## Storage admission accounting
+
+`Admission` in `admission.h` starts from a ready quiescent inventory. Configure hard limits for logical bytes and directory entries, plus independent control and replacement pools. Normal permits cannot consume either protected pool. Startup usage above a hard limit remains observable and reclaimable but admits no positive reservation. Partially funded pools report pressure and stop normal admission; remaining control capacity is usable. Allocation and free-volume observations do not reserve capacity against other users of the filesystem.
+
+The live permit bound is 3 through 4,096. Normal admission leaves two slots for protected work, and control admission leaves one slot for replacement when no replacement is active. Only one replacement cycle is admitted. Held pool capacity remains reserved during other settlements and cleanup, preventing it from being funded twice.
+
+Reserve the worst simultaneous added resources before any mutation, including temporary manifests, filenames, and the complete replacement cycle. A move-only `StoragePermit` retains its accounting session after the facade closes. Call `mark_started()` before IO, then `settle(added, removed)` after the operation and any removal barriers complete. Settlement records final charged additions and already charged resources durably removed; it does not count cumulative transient creation traffic. Actual additions stay charged, while unused allowance returns to its originating pool. Existing reader pins remain charged until actual durable deletion. `credit_durable_reclaim()` credits completed deletion only, then refills control capacity before replacement capacity.
+
+The host supplies each durable removal exactly once. The ledger checks aggregate bounds, but cannot prove deletion identity or detect a duplicate credit that still fits the aggregate. Serialize all permit operations and destruction on the owning executor; filesystem identities and completion correlations remain host responsibilities.
+
+Pre-IO cancellation refunds its permit. A started permit destroyed without settlement, explicit `abandon()`, invalid settlement, or `taint()` prevents further admission and retains uncertain reserved capacity. Actual IO failure must also fence the journal. Reopen storage and construct a new ledger from a fresh quiescent census; old permits retain their old accounting session and cannot credit the new one. All permit operations and destruction use the owning storage executor.
+
+This module does not intercept journal mutations. End-to-end enforcement still requires permits for every write/create/replace, a whole-cycle checkpoint reservation, guaranteed bounded maintenance scheduling, and admission before the strict core emits persistence actions. Never discard an emitted persistence action or invent its completion when a quota is reached. Finite control reserves do not promise progress through an indefinitely full volume; actual IO failures still fence.
+
 ## POSIX backend
 
 `PosixIO` opens an existing directory and resolves validated single-component filenames relative to its descriptor. It rejects final-component symlinks, special files, shared regular-file inodes, files on another device, and ownership or permissions that permit another user to modify the store. Trusted ancestor directories remain a caller precondition. Ownership is exclusive across cooperating processes through a stable `owner.lock`, which is never replaced or removed by manifest publication.
