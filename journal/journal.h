@@ -22,7 +22,8 @@ struct Frontier {
 	std::vector<ArtifactDescriptor> dependencies;
 };
 
-// Synchronous, single-owner opaque storage batches. IO outlives Journal.
+// Synchronous, single-owner opaque storage batches. IO outlives the journal
+// and every artifact builder, prepared handle, and reader.
 // Successful append returns only after the manifest's directory barrier.
 // Recover callbacks must build unpublished state: a later batch can fail.
 class Journal {
@@ -50,6 +51,16 @@ public:
 			throw std::invalid_argument("artifact is not currently referenced or preparation slots are exhausted");
 		}
 		return PreparedArtifact(artifact, owner_);
+	}
+
+
+	void verify_artifact(const PreparedArtifact& artifact) {
+		available();
+		if (!artifact.lease_ || artifact.lease_->owner != owner_) { throw std::invalid_argument("foreign artifact preparation"); }
+		try {
+			validate_artifact_bound(artifact.descriptor());
+			ArtifactReader verified(io_, owner_, frontier_.identity, artifact.descriptor());
+		} catch (...) { owner_->failed = true; throw; }
 	}
 
 	Frontier create(Identity identity) {
@@ -195,10 +206,12 @@ public:
 		}
 		try {
 			validate_artifact_bound(*next.checkpoint);
-			ArtifactReader verified(io_, owner_, frontier_.identity, *next.checkpoint);
 			for (const auto& descriptor : next.dependencies) {
-				validate_artifact_bound(descriptor); ArtifactReader dependency(io_, owner_, frontier_.identity, descriptor);
+				validate_artifact_bound(descriptor);
 			}
+			// Prepared capabilities prove successfully sealed immutable bytes.
+			// Optional readback belongs before freezing the consensus cutover;
+			// recovery always validates all referenced payloads.
 			auto fresh = io_.create_exclusive(data_name(next));
 			write_all(*fresh, 0, file_header(next)); fresh->sync();
 			// All artifact names are already sealed; establish the new journal

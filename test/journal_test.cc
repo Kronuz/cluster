@@ -207,6 +207,16 @@ void checkpoint_basics() {
 }
 
 
+
+void artifact_verification() {
+	auto model = initialized(); MemoryIO io(model); Journal journal(io, 1024); journal.recover([](auto, auto) {});
+	auto artifact = prepare(journal, "immutable"); journal.verify_artifact(artifact);
+	auto& bytes = model.visible.at(artifact_name(artifact.descriptor()))->visible;
+	bytes.back() ^= 1;
+	check(throws([&] { journal.verify_artifact(artifact); }) && journal.fenced(), "optional preflight readback detects corruption and fences owner");
+	check(throws([&] { journal.publish_checkpoint(artifact, {}, 1); }), "failed verification prevents a later cutover");
+}
+
 void checkpoint_successive_generations() {
 	auto model = initialized();
 	{
@@ -562,7 +572,7 @@ void posix() {
 } // namespace
 
 int main() {
-	try { basics(); append_failures(); append_failures(3); append_failures(std::numeric_limits<std::size_t>::max(), true); append_failures(3, true); recovery_failures(); recovery_failures(true); recovery_failures(false, true); recovery_failures(true, true); corruption(); initialization_failures(); checkpoint_basics(); checkpoint_successive_generations(); preparation_ownership_and_failures(); checkpoint_publication_failures(); checkpoint_corruption(); posix(); }
+	try { basics(); append_failures(); append_failures(3); append_failures(std::numeric_limits<std::size_t>::max(), true); append_failures(3, true); recovery_failures(); recovery_failures(true); recovery_failures(false, true); recovery_failures(true, true); corruption(); initialization_failures(); checkpoint_basics(); checkpoint_successive_generations(); artifact_verification(); preparation_ownership_and_failures(); checkpoint_publication_failures(); checkpoint_corruption(); posix(); }
 	catch (const std::exception& error) { check(false, error.what()); }
 	std::cout << checks << " journal checks, " << failures << " failures\n";
 	return failures ? 1 : 0;

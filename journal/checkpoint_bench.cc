@@ -22,7 +22,7 @@ static kronuz::journal::PreparedArtifact prepare(kronuz::journal::Journal& journ
 int main() {
 	try {
 		auto root = std::filesystem::current_path() / ".scratch"; std::filesystem::create_directories(root);
-		std::cout << "application_bytes,bundle_bytes,preparation_wall_s,preparation_cpu_s,publication_wall_s,publication_cpu_s\n";
+		std::cout << "application_bytes,bundle_bytes,preparation_and_verification_wall_s,preparation_and_verification_cpu_s,publication_wall_s,publication_cpu_s\n";
 		for (auto size : {1024u * 1024, 64u * 1024 * 1024}) {
 			auto directory = root / ("checkpoint-bench-" + std::to_string(::getpid()) + "-" + std::to_string(size));
 			if (!std::filesystem::create_directory(directory)) { throw std::runtime_error("benchmark directory exists"); }
@@ -32,6 +32,7 @@ int main() {
 			kronuz::journal::Identity identity{}; identity[0] = 'C'; journal.create(identity); journal.append_batch("covered");
 			auto cpu_begin = cpu_seconds(); auto begin = std::chrono::steady_clock::now();
 			auto application = prepare(journal, size); auto bundle = prepare(journal, size);
+			journal.verify_artifact(application); journal.verify_artifact(bundle);
 			auto preparation_wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count();
 			auto preparation_cpu = cpu_seconds() - cpu_begin;
 			cpu_begin = cpu_seconds(); begin = std::chrono::steady_clock::now();

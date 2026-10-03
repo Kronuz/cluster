@@ -32,11 +32,11 @@ Generation 1 remains readable until the first explicit checkpoint publication. `
 `publish_checkpoint(bundle, dependencies, covered_sequence)` requires prepared handles from the same owner session, no duplicate identities, at most eight dependencies, and the exact current batch sequence. The bundle and dependencies are opaque to this layer. Consensus must separately bind the application snapshot boundary, retained suffix, configuration, and hard state inside its bundle.
 
 ```text
-Verify sealed artifacts → create/sync exclusive new journal generation
+Use sealed capabilities → create/sync exclusive new journal generation
 → sync directory → write/sync replacement manifest → rename → sync directory
 ```
 
-The version 2 manifest binds the bundle and every required dependency by identity, length, and checksum. Physical generation names are unique across interrupted retries. Publication preserves the batch sequence; the next append uses `covered_sequence + 1`. Admission errors leave the journal usable, while uncertain I/O fences its owner session. Artifact verification reads the complete payload with bounded buffers, so publication time grows with total artifact bytes and must be budgeted against election deadlines.
+The version 2 manifest binds the bundle and every required dependency by identity, length, and checksum. Physical generation names are unique across interrupted retries. Publication preserves the batch sequence; the next append uses `covered_sequence + 1`. Admission errors leave the journal usable, while uncertain I/O fences its owner session. Prepared handles prove successful immutable sealing or pinning from verified recovery. Optional `verify_artifact(handle)` reads back the complete payload before freezing a consensus cutover and fences the owner on failure. Publication checks capabilities and metadata without rereading payloads. Recovery always verifies all referenced bytes.
 
 Reopen with `recover(replay, restore)`. The journal verifies the bundle and all dependencies before passing their bounded readers to `restore`, then replays the suffix. Both callbacks must construct unpublished state until recovery returns successfully. A missing or corrupt referenced artifact fails closed; recovery never falls back to an older generation. Older readers reject version 2 metadata instead of reinitializing it. `pin_artifact()` can retain a currently referenced artifact for a later publication without rewriting it.
 
@@ -70,13 +70,22 @@ This measures durability-barrier amortization, with no transaction encoding, rep
 
 ## Checkpoint pause measurement
 
-`checkpoint_bench` separately measures preparing two opaque artifacts and publishing them as bundle plus application dependency. The same Intel Mac and AppleClang 17 Release configuration produced these single-sample results on October 2, 2026:
+The initial `checkpoint_bench` separately measured preparing two opaque artifacts and publishing them as bundle plus application dependency. The same Intel Mac and AppleClang 17 Release configuration produced these single-sample results on October 2, 2026:
 
 | Application bytes | Bundle bytes | Preparation wall s | Preparation CPU s | Publication wall s | Publication CPU s |
 | --- | --- | --- | --- | --- | --- |
 | 1,048,576 | 1,048,576 | 0.054763 | 0.010354 | 0.069765 | 0.007462 |
 | 67,108,864 | 67,108,864 | 0.470017 | 0.361971 | 0.385382 | 0.321468 |
 
-Publication includes rereading and validating both artifacts before the durable generation cutover. The approximately 385 ms sample for 128 MiB of artifacts is a material pause when setting election deadlines; it is not a tail bound. These opaque bytes do not represent a measured Detent key corpus or actual suffix encoder. Run `.scratch/journal/checkpoint_bench` from the repository root; initialization is excluded, and the workload removes only its own dedicated scratch directories. No cost or power conversion is available.
+At revision `b497af6`, publication included rereading and validating both artifacts before the durable generation cutover. The approximately 385 ms sample for 128 MiB of artifacts is a material pause when setting election deadlines; it is not a tail bound. These opaque bytes do not represent a measured Detent key corpus or actual suffix encoder. Run `.scratch/journal/checkpoint_bench` from the repository root; initialization is excluded, and the workload removes only its own dedicated scratch directories. No cost or power conversion is available.
 
 The version 2 Release demo occupies 57,008 bytes, versus 44,544 bytes for the initial version 1 build (+12,464 bytes). The append benchmark occupies 49,032 bytes versus 42,248 (+6,784 bytes); the new checkpoint benchmark occupies 64,448 bytes. These are standalone executable file sizes from the same local toolchain, not measured runtime memory or integrated daemon footprint.
+
+Readback now runs explicitly before cutover. Repeating the workload with preparation plus verification measured separately produced:
+
+| Application bytes | Bundle bytes | Preparation and verification wall s | CPU s | Publication wall s | CPU s |
+| --- | --- | --- | --- | --- | --- |
+| 1,048,576 | 1,048,576 | 0.077054 | 0.011474 | 0.063021 | 0.001249 |
+| 67,108,864 | 67,108,864 | 0.706718 | 0.655203 | 0.063774 | 0.000888 |
+
+For the 128 MiB case, the single local publication sample fell from 385 ms to 64 ms, with preparation and readback outside that interval. This shifts work outside the freeze rather than eliminating checksum work. A real consensus bundle must be encoded and written after freezing its retained suffix; that work remains a separate pause budget. These samples do not establish production tail latency.
