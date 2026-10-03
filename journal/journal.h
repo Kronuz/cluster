@@ -296,7 +296,21 @@ private:
 				read_all(file, 0, std::span<char>(raw.data(), static_cast<std::size_t>(length)));
 				return decode_manifest(std::string_view(raw.data(), static_cast<std::size_t>(length))).identity == frontier_.identity;
 			}
-			auto size = name.starts_with("artifact-") ? detail::artifact_header_size : (name.starts_with("generation-") ? file_header_v2_size : file_header_size);
+			if (name.starts_with("artifact-")) {
+				if (length < 8) { return false; }
+				read_all(file, 0, std::span<char>(raw.data(), 8)); std::string_view version(raw.data(), 8);
+				if (get64(version) == detail::artifact_v2_magic) {
+					if (length < detail::artifact_ownership_size) { return false; }
+					read_all(file, 0, std::span<char>(raw.data(), detail::artifact_ownership_size));
+					std::string_view prefix(raw.data(), detail::artifact_ownership_size);
+					if (crc32c(prefix.substr(0, 40)) != checksum_at_end(prefix)) { return false; }
+					prefix.remove_prefix(8);
+					if (prefix.substr(0, 16) != std::string_view(frontier_.identity.data(), 16)) { return false; }
+					prefix.remove_prefix(16); Identity id{}; std::copy_n(prefix.begin(), id.size(), id.begin());
+					return name == "artifact-" + detail::hexadecimal(id);
+				}
+			}
+			auto size = name.starts_with("artifact-") ? detail::artifact_v1_header_size : (name.starts_with("generation-") ? file_header_v2_size : file_header_size);
 			if (length < size) { return false; }
 			read_all(file, 0, std::span<char>(raw.data(), size));
 			std::string_view bytes(raw.data(), size);
@@ -308,7 +322,7 @@ private:
 				Identity id{}; std::copy_n(bytes.begin(), id.size(), id.begin()); bytes.remove_prefix(id.size());
 				auto payload = get64(bytes);
 				return magic == detail::artifact_magic && name == "artifact-" + detail::hexadecimal(id) &&
-					payload <= maximum_offset - detail::artifact_header_size && length == detail::artifact_header_size + payload;
+					payload <= maximum_offset - detail::artifact_v1_header_size && length == detail::artifact_v1_header_size + payload;
 			}
 			if (name.starts_with("generation-")) {
 				Identity id{}; std::copy_n(bytes.begin(), id.size(), id.begin()); bytes.remove_prefix(id.size());

@@ -43,13 +43,30 @@ struct ArtifactLease {
 	~ArtifactLease() { --owner->prepared; }
 };
 constexpr std::uint64_t artifact_magic = 0x315452415a4e524bull;
-constexpr std::size_t artifact_header_size = 56;
+constexpr std::uint64_t artifact_v2_magic = 0x325452415a4e524bull;
+constexpr std::uint64_t artifact_seal_magic = 0x314c4145535a4e4bull;
+constexpr std::size_t artifact_v1_header_size = 56;
+constexpr std::size_t artifact_ownership_size = 44, artifact_seal_size = 24;
+constexpr std::size_t artifact_header_size = artifact_ownership_size + artifact_seal_size;
 constexpr std::size_t artifact_chunk_size = 64 * 1024;
-inline std::string artifact_header(Identity storage, ArtifactDescriptor artifact) {
+inline std::string artifact_header_v1(Identity storage, ArtifactDescriptor artifact) {
 	std::string result; put64(result, artifact_magic);
 	result.append(storage.data(), storage.size()); result.append(artifact.identity.data(), artifact.identity.size());
 	put64(result, artifact.length); put32(result, artifact.checksum); put32(result, crc32c(result));
 	return result;
+}
+inline std::string artifact_ownership(Identity storage, Identity artifact) {
+	std::string result; put64(result, artifact_v2_magic);
+	result.append(storage.data(), storage.size()); result.append(artifact.data(), artifact.size());
+	put32(result, crc32c(result)); return result;
+}
+inline std::string artifact_seal(Identity storage, ArtifactDescriptor artifact) {
+	auto prefix = artifact_ownership(storage, artifact.identity);
+	std::string result; put64(result, artifact_seal_magic); put64(result, artifact.length); put32(result, artifact.checksum);
+	Checksum checksum; checksum.update(prefix); checksum.update(result); put32(result, checksum.value()); return result;
+}
+inline std::string artifact_header(Identity storage, ArtifactDescriptor artifact) {
+	return artifact_ownership(storage, artifact.identity) + artifact_seal(storage, artifact);
 }
 } // namespace detail
 
@@ -99,7 +116,7 @@ public:
 		if (!active_ || owner_->failed) { throw std::logic_error("artifact preparation unavailable"); }
 		try {
 			descriptor_.checksum = checksum_.value();
-			detail::write_all(*file_, 0, detail::artifact_header(storage_, descriptor_));
+			detail::write_all(*file_, detail::artifact_ownership_size, detail::artifact_seal(storage_, descriptor_));
 			file_->sync(); io_.sync_directory();
 			file_.reset(); active_ = false; --owner_->preparing; owner_->preparing_identity.reset();
 			return PreparedArtifact(descriptor_, owner_);
@@ -112,9 +129,10 @@ private:
 		if (owner_->preparing || owner_->prepared >= detail::maximum_prepared_artifacts) { throw std::logic_error("artifact preparation slots exhausted"); }
 		try {
 			descriptor_.identity = detail::random_identity(); owner_->preparing_identity = descriptor_.identity; file_ = io_.create_exclusive(artifact_name(descriptor_));
-			// The placeholder is never authoritative and cannot validate until
-			// finish seals its length and checksum.
-			detail::write_all(*file_, 0, std::string(detail::artifact_header_size, '\0'));
+			// Establish immutable ownership before accepting any payload. Only
+			// the separate seal is replaced by finish; it starts unpublished.
+			detail::write_all(*file_, 0, detail::artifact_ownership(storage_, descriptor_.identity) + std::string(detail::artifact_seal_size, '\0'));
+			file_->sync();
 			++owner_->preparing; active_ = true;
 		} catch (...) { owner_->failed = true; throw; }
 	}
@@ -133,7 +151,7 @@ public:
 	ArtifactReader(ArtifactReader&&) noexcept = default;
 	ArtifactReader& operator=(ArtifactReader&& other) noexcept {
 		if (this != &other) {
-			file_.reset(); pin_ = std::move(other.pin_); owner_ = std::move(other.owner_); file_ = std::move(other.file_); descriptor_ = other.descriptor_;
+			file_.reset(); pin_ = std::move(other.pin_); owner_ = std::move(other.owner_); file_ = std::move(other.file_); descriptor_ = other.descriptor_; payload_offset_ = other.payload_offset_;
 		}
 		return *this;
 	}
@@ -144,7 +162,7 @@ public:
 			throw std::length_error("artifact read exceeds chunk or payload bound");
 		}
 		try {
-			auto count = file_->read_at(detail::artifact_header_size + offset, bytes);
+			auto count = file_->read_at(payload_offset_ + offset, bytes);
 			if ((!bytes.empty() && count == 0) || count > bytes.size()) { throw Corruption("artifact read made invalid progress"); }
 			return count;
 		}
@@ -154,14 +172,19 @@ private:
 	friend class Journal;
 	ArtifactReader(IO& io, std::shared_ptr<detail::OwnerSession> owner, Identity storage, ArtifactDescriptor descriptor)
 		: owner_(std::move(owner)), file_(io.open_existing(artifact_name(descriptor))), descriptor_(descriptor) {
-		if (file_->size() != detail::artifact_header_size + descriptor.length) { throw Corruption("artifact size mismatch"); }
-		std::array<char, detail::artifact_header_size> header{}; detail::read_all(*file_, 0, header);
-		if (std::string_view(header.data(), header.size()) != detail::artifact_header(storage, descriptor)) { throw Corruption("artifact header mismatch"); }
+		std::array<char, 8> magic_bytes{}; detail::read_all(*file_, 0, magic_bytes);
+		std::string_view magic_view(magic_bytes.data(), magic_bytes.size()); auto magic = get64(magic_view);
+		if (magic != detail::artifact_magic && magic != detail::artifact_v2_magic) { throw Corruption("unsupported artifact format"); }
+		payload_offset_ = magic == detail::artifact_magic ? detail::artifact_v1_header_size : detail::artifact_header_size;
+		if (file_->size() != payload_offset_ + descriptor.length) { throw Corruption("artifact size mismatch"); }
+		std::array<char, detail::artifact_header_size> header{}; detail::read_all(*file_, 0, std::span<char>(header.data(), payload_offset_));
+		auto expected = magic == detail::artifact_magic ? detail::artifact_header_v1(storage, descriptor) : detail::artifact_header(storage, descriptor);
+		if (std::string_view(header.data(), payload_offset_) != expected) { throw Corruption("artifact header mismatch"); }
 		std::array<char, detail::artifact_chunk_size> buffer{}; Checksum checksum;
 		std::uint64_t offset = 0;
 		while (offset < descriptor.length) {
 			auto count = static_cast<std::size_t>(std::min<std::uint64_t>(buffer.size(), descriptor.length - offset));
-			detail::read_all(*file_, detail::artifact_header_size + offset, std::span<char>(buffer.data(), count));
+			detail::read_all(*file_, payload_offset_ + offset, std::span<char>(buffer.data(), count));
 			checksum.update(std::string_view(buffer.data(), count)); offset += count;
 		}
 		if (checksum.value() != descriptor.checksum) { throw Corruption("artifact payload checksum mismatch"); }
@@ -171,5 +194,6 @@ private:
 	std::shared_ptr<detail::ArtifactPin> pin_;
 	std::unique_ptr<File> file_;
 	ArtifactDescriptor descriptor_;
+	std::size_t payload_offset_ = 0;
 };
 } // namespace kronuz::journal

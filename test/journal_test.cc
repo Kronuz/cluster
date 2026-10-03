@@ -1,5 +1,6 @@
 #include "journal/journal.h"
 #include "journal/posix.h"
+#include <set>
 #include <algorithm>
 #include <filesystem>
 #include <iostream>
@@ -279,26 +280,28 @@ void preparation_ownership_and_failures() {
 	}
 	artifact.reset(); check(replay(model) == std::vector<std::string>{"first"}, "closing preparations allows ordinary recovery");
 
-	auto baseline = initialized(); std::size_t operations;
-	{
-		auto complete = baseline.clone(); MemoryIO complete_io(complete); Journal complete_journal(complete_io, 1024);
-		complete_journal.recover([](auto, auto) {}); complete.operations = 0; prepare(complete_journal, "first"); operations = complete.operations;
-	}
-	for (std::size_t operation = 1; operation <= operations; ++operation) {
-		for (bool after : {false, true}) {
-			auto failed = baseline.clone();
-			{
-				MemoryIO failed_io(failed); Journal failed_journal(failed_io, 1024); failed_journal.recover([](auto, auto) {});
-				failed.operations = 0; failed.fail_operation = operation; failed.fail_after = after;
-				check(throws([&] { prepare(failed_journal, "first"); }) && failed_journal.fenced(), "every uncertain preparation operation fences writer");
-			}
-			for (bool visible : {false, true}) {
-				auto crashed = failed.clone(); crashed.power_loss(visible);
-				check(replay(crashed) == std::vector<std::string>{"first"}, "unfinished preparation cannot replace active history");
+	for (auto chunk : {std::numeric_limits<std::size_t>::max(), std::size_t{3}}) {
+		auto baseline = initialized(); baseline.chunk = chunk; std::size_t operations;
+		{
+			auto complete = baseline.clone(); MemoryIO complete_io(complete); Journal complete_journal(complete_io, 1024);
+			complete_journal.recover([](auto, auto) {}); complete.operations = 0; prepare(complete_journal, "first"); operations = complete.operations;
+		}
+		for (std::size_t operation = 1; operation <= operations; ++operation) {
+			for (bool after : {false, true}) {
+				auto failed = baseline.clone();
+				{
+					MemoryIO failed_io(failed); Journal failed_journal(failed_io, 1024); failed_journal.recover([](auto, auto) {});
+					failed.operations = 0; failed.fail_operation = operation; failed.fail_after = after;
+					check(throws([&] { prepare(failed_journal, "first"); }) && failed_journal.fenced(), "every uncertain preparation operation fences writer");
+				}
+				for (bool visible : {false, true}) {
+					auto crashed = failed.clone(); crashed.power_loss(visible);
+					check(replay(crashed) == std::vector<std::string>{"first"}, "unfinished preparation cannot replace active history");
+				}
 			}
 		}
+		std::cout << "artifact preparation operations tested: " << operations << '\n';
 	}
-	std::cout << "artifact preparation operations tested: " << operations << '\n';
 	{
 		auto bounded = initialized(); MemoryIO bounded_io(bounded); Journal writer(bounded_io, 1024, 3);
 		writer.recover([](auto, auto) {});
@@ -373,9 +376,10 @@ void reclamation_roots_and_unknowns() {
 	std::string prepared_name, active_name;
 	{
 		auto held = prepare(journal, "held"); prepared_name = artifact_name(held.descriptor());
+		std::set<std::string> previous_names;
+		for (const auto& [name, inode] : model.visible) { previous_names.insert(name); }
 		auto builder = journal.prepare_artifact(); builder.append_chunk("active");
-		// Only one new name is active, distinct from the sealed prepared pin.
-		for (const auto& [name, inode] : model.visible) { if (name.starts_with("artifact-") && inode->visible.starts_with(std::string(56, '\0'))) { active_name = name; } }
+		for (const auto& [name, inode] : model.visible) { if (!previous_names.contains(name)) { active_name = name; } }
 		reclaim_all(journal);
 		check(model.visible.contains(prepared_name) && model.visible.contains(active_name), "prepared handles and active builder protect their names");
 		auto finished = builder.finish();
@@ -414,6 +418,60 @@ void reclamation_roots_and_unknowns() {
 	check(stats.complete && stats.unknown_files == 3 && stats.removed == 0 && !journal.fenced(), "unknown ownership is reported without deleting or fencing");
 	check(model.visible.contains(unclassified) && model.visible.contains(mismatch) && model.visible.contains(foreign_name) && model.visible.contains("notes.txt"), "unknown and unrelated files remain untouched");
 }
+
+void durable_staging_ownership() {
+	auto model = initialized(); std::string abandoned;
+	{
+		MemoryIO io(model); Journal journal(io, 1024); journal.recover([](auto, auto) {});
+		auto builder = journal.prepare_artifact();
+		for (const auto& [name, inode] : model.visible) { if (name.starts_with("artifact-")) { abandoned = name; } }
+		auto& inode = model.visible.at(abandoned);
+		check(inode->durable.size() == detail::artifact_header_size && inode->durable.substr(0, 44) == inode->visible.substr(0, 44), "builder synchronizes ownership before accepting payload");
+		auto prefix = inode->visible.substr(0, 44);
+		for (unsigned chunk = 0; chunk < 8; ++chunk) { builder.append_chunk(std::string(64 * 1024, 'x')); }
+		check(inode->visible.substr(0, 44) == prefix, "payload writes cannot overwrite immutable ownership");
+		// Model spontaneous payload writeback and a directory barrier from an
+		// interleaved append, without sealing the abandoned preparation.
+		inode->durable = inode->visible; journal.append_batch("second");
+	}
+	model.power_loss(false);
+	{
+		MemoryIO io(model); Journal journal(io, 1024); std::vector<std::string> replayed;
+		journal.recover([&](auto, auto bytes) { replayed.emplace_back(bytes); });
+		auto stats = journal.reclaim_step(4096);
+		check(stats.removed == 1 && stats.logical_bytes == detail::artifact_header_size + 8 * 64 * 1024 && !model.visible.contains(abandoned), "restart reclaims large unsealed artifact from durable ownership only");
+		check(replayed == std::vector<std::string>{"first", "second"}, "large orphan cleanup preserves every acknowledged append");
+		auto builder = journal.prepare_artifact(); std::string name;
+		for (const auto& [candidate, inode] : model.visible) { if (candidate.starts_with("artifact-")) { name = candidate; } }
+		auto prefix = model.visible.at(name)->visible.substr(0, 44); builder.append_chunk("sealed"); auto artifact = builder.finish();
+		check(model.visible.at(name)->visible.substr(0, 44) == prefix, "finish replaces only the seal and preserves ownership bytes");
+	}
+}
+void mixed_artifact_formats() {
+	auto model = reclaim_fixture(); auto copy = model.clone(); auto selected = replay_checkpoint(copy).first;
+	auto legacy = selected.dependencies.at(0); auto legacy_name = artifact_name(legacy);
+	auto& inode = model.visible.at(legacy_name); inode->visible = detail::artifact_header_v1(selected.identity, legacy) + "application"; inode->durable = inode->visible;
+	{
+		MemoryIO io(model); std::optional<ArtifactReader> old_reader, new_reader; Journal journal(io, 1024);
+		journal.recover([](auto, auto) {}, [&](auto&, auto& bundle, auto dependencies) { new_reader.emplace(std::move(bundle)); old_reader.emplace(std::move(dependencies[0])); });
+		check(read_artifact(*old_reader) == "application" && read_artifact(*new_reader) == "first", "mixed v1 dependency and v2 bundle recover with distinct payload offsets");
+		*new_reader = std::move(*old_reader);
+		check(read_artifact(*new_reader) == "application", "reader move assignment preserves detected legacy offset"); old_reader.reset(); new_reader.reset();
+		auto pinned = journal.pin_artifact(legacy); auto bundle = prepare(journal, "first"); journal.publish_checkpoint(bundle, std::array{pinned}, 1);
+	}
+	model.power_loss(false); check(replay_checkpoint(model).second == std::vector<std::string>{"first"}, "new publication can reuse an immutable legacy dependency");
+	{
+		MemoryIO io(model); Journal journal(io, 1024); journal.recover([](auto, auto) {}, [](auto&, auto&, auto) {});
+		{ auto bundle = prepare(journal, "first"); auto app = prepare(journal, "application"); journal.publish_checkpoint(bundle, std::array{app}, 1); }
+		reclaim_all(journal); check(!model.visible.contains(legacy_name), "obsolete sealed legacy artifact remains reclaimable");
+	}
+	for (std::size_t length : {44u, 67u, 68u}) {
+		auto missing_seal = model.clone(); auto state = replay_checkpoint(missing_seal).first;
+		auto& required = missing_seal.visible.at(artifact_name(*state.checkpoint)); required->visible.resize(length); required->durable = required->visible;
+		check(throws([&] { replay_checkpoint(missing_seal); }), "referenced artifacts reject incomplete seals or payloads");
+	}
+}
+
 void reclamation_failures() {
 	auto baseline = reclaim_fixture(); std::size_t operations;
 	auto proof = baseline.clone(); auto expected = replay_checkpoint(proof).first;
@@ -685,7 +743,7 @@ void posix() {
 		std::filesystem::create_directory(directory / reserved_name());
 		ArtifactDescriptor foreign{detail::random_identity(), 0, crc32c("")}; auto foreign_store = identity(); foreign_store[0] = 'Z';
 		preserved.push_back(artifact_name(foreign)); auto foreign_file = io.create_exclusive(artifact_name(foreign)); detail::write_all(*foreign_file, 0, detail::artifact_header(foreign_store, foreign)); foreign_file->sync(); foreign_file.reset();
-		ArtifactDescriptor corrupt{detail::random_identity(), 0, crc32c("")}; auto corrupt_header = detail::artifact_header(identity(), corrupt); corrupt_header.back() ^= 1;
+		ArtifactDescriptor corrupt{detail::random_identity(), 0, crc32c("")}; auto corrupt_header = detail::artifact_header(identity(), corrupt); corrupt_header[40] ^= 1;
 		preserved.push_back(artifact_name(corrupt)); auto corrupt_file = io.create_exclusive(artifact_name(corrupt)); detail::write_all(*corrupt_file, 0, corrupt_header); corrupt_file->sync(); corrupt_file.reset();
 		io.sync_directory();
 		auto stats = journal.reclaim_step(4096);
@@ -704,7 +762,7 @@ void posix() {
 } // namespace
 
 int main() {
-	try { basics(); append_failures(); append_failures(3); append_failures(std::numeric_limits<std::size_t>::max(), true); append_failures(3, true); recovery_failures(); recovery_failures(true); recovery_failures(false, true); recovery_failures(true, true); corruption(); initialization_failures(); checkpoint_basics(); checkpoint_successive_generations(); artifact_verification(); preparation_ownership_and_failures(); checkpoint_publication_failures(); checkpoint_corruption(); reclamation_roots_and_unknowns(); reclamation_failures(); posix(); }
+	try { basics(); append_failures(); append_failures(3); append_failures(std::numeric_limits<std::size_t>::max(), true); append_failures(3, true); recovery_failures(); recovery_failures(true); recovery_failures(false, true); recovery_failures(true, true); corruption(); initialization_failures(); checkpoint_basics(); checkpoint_successive_generations(); artifact_verification(); preparation_ownership_and_failures(); checkpoint_publication_failures(); checkpoint_corruption(); reclamation_roots_and_unknowns(); reclamation_failures(); durable_staging_ownership(); mixed_artifact_formats(); posix(); }
 	catch (const std::exception& error) { check(false, error.what()); }
 	std::cout << checks << " journal checks, " << failures << " failures\n";
 	return failures ? 1 : 0;
