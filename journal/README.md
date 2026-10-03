@@ -82,6 +82,8 @@ This module does not intercept journal mutations. End-to-end enforcement still r
 
 `Journal` supplies checked footprint plans beside its format encoders. `bootstrap_plan()` assumes an empty directory and the IO creation contract of one zero-length `owner.lock`; it covers the reserved manifest, journal and temporary manifest coexisting. `append_plan(payload_bound)` reserves record growth plus the maximum supported temporary manifest footprint and one entry, so its reservation remains sufficient across checkpoint migration. Successful append settlement charges actual record growth and no net entry change.
 
+Static `append_footprint(payload_bound)` computes the format-only bound before storage opens and rejects payload sizes beyond the 32-bit wire representation. The live `append_plan()` delegates to it while retaining configured-size, availability and frontier-exhaustion checks. Store exposes trusted `fence_storage()` so its owning worker can stop storage after an application or protocol failure even without a pending IO operation.
+
 `checkpoint_plan(payload_bounds)` describes an all-new bundle and dependency set. It includes every artifact header/payload, a new generation and the replacement manifest; only the old manifest is credited at publication. Payload bounds establish peak admission, not exact final charges. Recompute with actual payload lengths immediately before publishing, because the removed manifest footprint belongs to the current generation and can change across another checkpoint. Canceled staging files and obsolete generations remain charged until durable cleanup. The resource value types and checked arithmetic live in `resources.h`, independently of admission policy.
 
 ## Private mutation Store

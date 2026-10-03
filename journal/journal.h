@@ -61,15 +61,21 @@ public:
 		auto bytes = std::uint64_t(file_header_size) + encode_manifest(Frontier{}).size();
 		return {{bytes, 4}, {bytes, 3}, {}};
 	}
+	static MutationPlan append_footprint(std::size_t payload_bound) {
+		if (payload_bound > std::numeric_limits<std::uint32_t>::max()) { throw std::length_error("journal batch wire bound"); }
+		auto growth = std::uint64_t(batch_header_size) + payload_bound;
+		return {{growth + maximum_manifest_size, 1}, {growth, 0}, {}};
+	}
 	MutationPlan append_plan(std::size_t payload_bound) const {
 		available();
 		if (payload_bound > maximum_batch_) { throw std::length_error("journal batch exceeds configured bound"); }
-		auto growth = std::uint64_t(batch_header_size) + payload_bound;
+		auto plan = append_footprint(payload_bound);
+		auto growth = plan.added.logical_bytes;
 		if (frontier_.sequence == std::numeric_limits<std::uint64_t>::max() || frontier_.offset > maximum_offset - growth) {
 			throw std::length_error("journal frontier exhausted");
 		}
 		// A reservation may wait across migration or dependency-count changes.
-		return {{growth + maximum_manifest_size, 1}, {growth, 0}, {}};
+		return plan;
 	}
 	StorageResources artifact_footprint(std::uint64_t payload) const {
 		available();

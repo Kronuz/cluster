@@ -52,6 +52,7 @@ public:
 		}
 	}
 	bool fenced() const noexcept { return failed_ || journal_.fenced(); }
+	void fence_storage() noexcept { fence(); }
 	std::optional<AdmissionStats> accounting() const noexcept {
 		if (!admission_) { return std::nullopt; }
 		return admission_->stats();

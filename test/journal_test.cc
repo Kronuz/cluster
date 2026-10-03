@@ -493,6 +493,10 @@ template <class Operation> void check_plan(Model& model, MutationPlan plan, Oper
 	check(visible_resources(model) == detail::resources_subtract(detail::resources_add(before, plan.added), plan.removed), "successful mutation matches planned additions and removed manifest only");
 }
 void footprint_plans() {
+	check(Journal::append_footprint(5).peak == StorageResources{361, 1}, "format-only append bound is available before journal startup");
+	if constexpr (sizeof(std::size_t) > sizeof(std::uint32_t)) {
+		check(throws([] { Journal::append_footprint(static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max()) + 1); }), "format-only planner rejects unrepresentable payloads without IO");
+	}
 	for (auto chunk : {std::numeric_limits<std::size_t>::max(), std::size_t{3}}) {
 		Model model; model.chunk = chunk; MemoryIO io(model); Journal journal(io, 1024);
 		check_plan(model, Journal::bootstrap_plan(), [&] { journal.create(identity()); });
