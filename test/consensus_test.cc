@@ -158,6 +158,36 @@ void persistence_barriers() {
 	check(follower.step(Receive{99, VoteRequest{10, 0, 0}}).empty() && follower.term() == 3, "nonvoter cannot inflate term");
 }
 
+void delayed_completions_do_not_campaign() {
+	Core candidate(config(1), empty(1)); candidate.step(Start{});
+	auto election = candidate.step(Tick{100, 100}); auto ballot = find<Persist>(election);
+	if (!ballot) { check(false, "delayed candidate has an election ballot"); return; }
+	candidate.step(Tick{1000, 100}); auto completed = candidate.step(Persisted{ballot->token});
+	check(candidate.term() == 1 && !candidate.busy() && !find<Persist>(completed) && find<Send>(completed), "delayed candidate completion releases votes without another campaign");
+	auto next = candidate.step(Tick{1000, 100});
+	check(find<Persist>(next) && candidate.term() == 2, "separately admitted tick at the same time may start the next campaign");
+	Core follower(config(2), empty(2)); follower.step(Start{});
+	auto voted = follower.step(Receive{1, VoteRequest{3, 0, 0}}); auto vote = find<Persist>(voted);
+	if (!vote) { check(false, "delayed follower has a durable vote transition"); return; }
+	follower.step(Tick{1000, 100}); auto response = follower.step(Persisted{vote->token});
+	check(follower.term() == 3 && follower.role() == Role::Follower && !find<Persist>(response) && find<Send>(response), "delayed follower completion cannot opportunistically campaign");
+	check(find<Persist>(follower.step(Tick{1000, 100})) && follower.term() == 4, "next admitted tick campaigns after delayed follower persistence");
+	Core single(config(1, 1), empty(1, 1)); single.step(Start{});
+	auto actions = single.step(Tick{100, 100}); unsigned completions = 0;
+	while (auto persist = find<Persist>(actions)) {
+		if (++completions > 4) { check(false, "single-voter continuation chain is bounded"); return; }
+		auto token = persist->token; single.step(Tick{1000 + completions * 1000, 100}); actions = single.step(Persisted{token});
+	}
+	check(completions == 3 && single.role() == Role::Leader && single.committed() == 1 && find<Committed>(actions), "slow single-voter ballot no-op and commit finish without an extra tick");
+	single.step(Applied{1});
+	check(find<ReadReady>(single.step(Read{99})), "application delivery and fresh single-voter reads still complete immediately");
+	Core leader(config(1), empty(1)); leader.step(Start{});
+	auto initial = leader.step(Tick{100, 100}); leader.step(Persisted{find<Persist>(initial)->token});
+	auto elected = leader.step(Receive{2, VoteResponse{1, true}}); auto noop = find<Persist>(elected);
+	leader.step(Tick{1000, 100}); auto replication = leader.step(Persisted{noop->token});
+	check(find<Send>(replication) && leader.role() == Role::Leader, "leader replication still drives immediately after slow no-op persistence");
+}
+
 void replication_and_restart() {
 	Network cluster; cluster.start(); cluster.elect();
 	check(cluster.host(1).core->committed() == 1 && cluster.host(1).core->applied() == 1, "leader no-op commits and applies through durable majority");
@@ -723,7 +753,7 @@ void reordered_crash_schedules(std::size_t voters, std::uint64_t seed) {
 } // namespace
 
 int main() {
-	try { persistence_barriers(); replication_and_restart(); affirmative_majority_and_inheritance(); simultaneous_completions(); reads_and_partitions(); overlapping_reads_preserve_data(); application_lag_does_not_spin_reads(); stale_rpc_and_failure_transitions(); bounds_and_semantic_recovery(); local_checkpoint_core(); compacted_index_exhaustion(); compacted_replication(); checkpoint_semantic_recovery(); real_journal_integration(); real_store_integration(); reordered_crash_schedules(3, 0x52414654); reordered_crash_schedules(5, 0x434c5553); }
+	try { persistence_barriers(); delayed_completions_do_not_campaign(); replication_and_restart(); affirmative_majority_and_inheritance(); simultaneous_completions(); reads_and_partitions(); overlapping_reads_preserve_data(); application_lag_does_not_spin_reads(); stale_rpc_and_failure_transitions(); bounds_and_semantic_recovery(); local_checkpoint_core(); compacted_index_exhaustion(); compacted_replication(); checkpoint_semantic_recovery(); real_journal_integration(); real_store_integration(); reordered_crash_schedules(3, 0x52414654); reordered_crash_schedules(5, 0x434c5553); }
 	catch (const std::exception& error) { check(false, error.what()); }
 	std::cout << checks << " consensus checks, " << failures << " failures\n";
 	return failures ? 1 : 0;

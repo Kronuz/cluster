@@ -14,7 +14,7 @@ The standalone `consensus_demo DIRECTORY create|open [COMMAND]` exercises a sing
 
 Construct the core with an exact `FixedConfiguration`, a semantically validated `RecoveredState`, resource limits, and timing bounds. Voter IDs are nonzero, unique, fixed, and include the local node. Three or five voters are the intended authority deployment. Discovery and observed liveness never change the voting denominator. Provision unique cluster/configuration identities externally; bind them to every authenticated transport session before passing `Receive` events.
 
-The host owns one protocol executor and supplies absolute monotonic `Tick` events, with election delays chosen externally within the configured range. Deliver current time before dispatching traffic or completions after slow I/O. While storage is pending, time continues to advance, and its matching completion reevaluates deadlines. Outdated ticks are ignored. Timing affects availability, not the voting or replication evidence required for commitment.
+The host owns one protocol executor and supplies absolute monotonic `Tick` events, with election delays chosen externally within the configured range. Deliver current time before dispatching traffic or completions after slow I/O. While storage is pending, time continues to advance. A matching completion immediately releases its dependent effects and drives leader replication, but never initiates another campaign. Campaigns require a separately admitted Tick after storage becomes available; it may use the same absolute time as a Tick received while busy. Outdated ticks are ignored. Timing affects availability, not the voting or replication evidence required for commitment.
 
 ```text
 Event → Core::step → Persist(token, batch) → ordered storage worker

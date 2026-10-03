@@ -116,7 +116,7 @@ private:
 	void handle(Tick tick, Actions& output) {
 		if (tick.now < now_ || tick.election_delay < timing_.election_min || tick.election_delay > timing_.election_max) { return; }
 		now_ = tick.now; election_delay_ = tick.election_delay;
-		if (started_ && !pending_) { drive(output); }
+		if (started_ && !pending_) { drive(output, true); }
 	}
 	void handle(Persisted completion, Actions& output) {
 		if (!pending_ || completion.token != pending_->token) { return; }
@@ -132,7 +132,7 @@ private:
 		if (completed.elected) { become_leader(output); }
 		if (!pending_) {
 			advance_commit(output);
-			if (!pending_) { deliver(output); ready_reads(output); drive(output); }
+			if (!pending_) { deliver(output); ready_reads(output); drive(output, false); }
 		}
 	}
 	void handle(StorageFault failure, Actions& output) { fence(std::move(failure.error), output); }
@@ -331,10 +331,12 @@ private:
 			replicate(source, peer, output, needed);
 		}
 	}
-	void drive(Actions& output) {
+	void drive(Actions& output, bool allow_campaign) {
 		if (!started_ || pending_) { return; }
 		if (role_ != Role::Leader) {
-			if (now_ < election_deadline_ || hard_.term == maximum) { return; }
+			// Campaigns require a separately admitted Tick. Slow persistence
+			// must not start another election from its completion callback.
+			if (!allow_campaign || now_ < election_deadline_ || hard_.term == maximum) { return; }
 			++hard_.term; hard_.voted_for = configuration_.local;
 			role_ = Role::Candidate; leader_ = 0; grants_ = {configuration_.local}; reset_election();
 			Actions deferred; deferred.emplace_back(RoleChanged{role_, hard_.term, 0});
