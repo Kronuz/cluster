@@ -20,8 +20,8 @@ namespace detail {
 [[noreturn]] inline void system_failure(const char* operation) {
 	throw std::system_error(errno, std::generic_category(), operation);
 }
-inline void validate_name(std::string_view name) {
-	if (name.empty() || name.size() > 128 || name == "." || name == ".." ||
+inline void validate_name(std::string_view name, std::size_t maximum = 128) {
+	if (name.empty() || name.size() > maximum || name == "." || name == ".." ||
 		name.find('/') != name.npos || name.find('\0') != name.npos) {
 		throw std::invalid_argument("invalid journal filename");
 	}
@@ -160,6 +160,20 @@ public:
 		if (!S_ISREG(status.st_mode) || status.st_uid != ::geteuid() || status.st_nlink != 1 || (status.st_mode & 0022) ||
 			(status.st_mode & 0600) != 0600 || status.st_dev != device_) { return nullptr; }
 		return file(name, false);
+	}
+	std::optional<EntryFootprint> entry_footprint(std::string_view name) override {
+		// Census foreign names too, beyond the journal's own 128-byte bound.
+		detail::validate_name(name, 255); std::string component(name); struct stat status{};
+		if (::fstatat(directory_, component.c_str(), &status, AT_SYMLINK_NOFOLLOW)) {
+			if (errno == ENOENT) { return std::nullopt; } detail::system_failure("inspect storage footprint");
+		}
+		if (status.st_size < 0 || status.st_blocks < 0 ||
+			static_cast<std::uint64_t>(status.st_blocks) > std::numeric_limits<std::uint64_t>::max() / 512) {
+			throw std::overflow_error("invalid storage footprint");
+		}
+		auto kind = S_ISREG(status.st_mode) ? EntryKind::Regular : (S_ISDIR(status.st_mode) ? EntryKind::Directory :
+			(S_ISLNK(status.st_mode) ? EntryKind::Symlink : EntryKind::Other));
+		return EntryFootprint{kind, static_cast<std::uint64_t>(status.st_size), static_cast<std::uint64_t>(status.st_blocks) * 512};
 	}
 	void sync_directory() override {
 		int result;

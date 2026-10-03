@@ -56,6 +56,14 @@ Returned statistics count scanned, protected, removed and unidentifiable candida
 
 For version 2 artifacts, the separately synchronized ownership prefix proves eligibility even when preparation never sealed the payload. Initial creation failures can leave at most 68 unidentifiable bytes before payload admission. Interrupted version 1 preparation leaves zero placeholder headers, which cannot prove store ownership; later ownership-prefix corruption can also make a large artifact unidentifiable. These files are retained and reported. Automatic scheduling and admission quotas remain required before claiming bounded accumulated storage. An explicit cleanup API alone does not establish a production disk bound.
 
+## Quiescent storage inventory
+
+`Inventory` in `inventory.h` establishes a flat-store census after successful journal recovery. The host must hold the journal's stable owner lock and pause every namespace mutation and file write throughout the census, before starting request admission, preparation, or reclamation. Its IO cursor must enumerate each direct entry exactly once while quiescent. This precondition is external to the helper; it cannot detect every external directory change, and the mutation-tolerant cleanup scan cannot establish exact accounting during writes.
+
+Call `step(budget)` with 1 through 4,096 entries per turn, then inspect `stats().ready()`. The helper retains one streaming cursor and aggregate counters, with no filename or inode table. It counts every direct entry regardless of ownership or filename grammar. POSIX footprint inspection uses `fstatat(AT_SYMLINK_NOFOLLOW)` without opening targets, so foreign files, sparse files, symlinks, and special files contribute without following links or opening devices/FIFOs. Hardlinked entries are counted separately, conservatively including their allocated sizes.
+
+Logical bytes and allocated bytes are separate aggregates; unavailable allocation metrics make only that aggregate unknown. Missing entries, counter overflow, and unexpected subdirectories prevent readiness. Subdirectory contents are not traversed or guessed. An IO failure leaves the inventory terminally failed; discard it and restart a census under quiescence after resolving the failure. Partial totals never authorize admission. This helper provides accounting observations, not enforced quotas, free-volume reservations, or automatic scheduling.
+
 ## POSIX backend
 
 `PosixIO` opens an existing directory and resolves validated single-component filenames relative to its descriptor. It rejects final-component symlinks, special files, shared regular-file inodes, files on another device, and ownership or permissions that permit another user to modify the store. Trusted ancestor directories remain a caller precondition. Ownership is exclusive across cooperating processes through a stable `owner.lock`, which is never replaced or removed by manifest publication.

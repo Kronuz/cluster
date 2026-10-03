@@ -36,6 +36,13 @@ public:
 	virtual std::optional<std::string> next() = 0;
 };
 
+enum class EntryKind { Regular, Directory, Symlink, Other };
+struct EntryFootprint {
+	EntryKind kind = EntryKind::Other;
+	std::uint64_t logical_bytes = 0;
+	std::optional<std::uint64_t> allocated_bytes;
+};
+
 class IO {
 public:
 	virtual ~IO() = default;
@@ -48,6 +55,10 @@ public:
 	// Missing files are an idempotent success.
 	virtual void remove(std::string_view name) = 0;
 	virtual std::unique_ptr<DirectoryCursor> scan_directory() { throw std::logic_error("directory scanning unsupported"); }
+	// Inspect the directory entry itself without following symlinks or opening
+	// its target. Missing names return null; genuine errors throw. A quiescent
+	// inventory requires exact-once enumeration with no concurrent mutations.
+	virtual std::optional<EntryFootprint> entry_footprint(std::string_view) { throw std::logic_error("entry accounting unsupported"); }
 	// Null means absent or unsafe/nonregular: preserve it. Genuine I/O
 	// failures throw. A backend supporting reclamation overrides both hooks.
 	virtual std::unique_ptr<File> open_reclaim_candidate(std::string_view name) { return open_existing(name); }

@@ -61,7 +61,7 @@ CMakeLists.txt     Header-only INTERFACE target cluster::cluster; FetchContents 
 
 `journal/` is an additive generic storage module with its own CMake entry point and no reactor dependency. Read [journal/README.md](journal/README.md) before changing durability or recovery semantics. Its owner lock is stable across manifest publication, and failures fence until close/recovery; do not delete acknowledged history when replacing a Raft suffix. `test/journal_test.cc` injects filesystem failures and checks the POSIX backend. This module does not alter the legacy Raft persistence contract.
 
-`consensus/` is the additive strict fixed-voter core and semantic journal adapter. Read [consensus/README.md](consensus/README.md) before changing events/actions or recovery. Send/application effects depend on durable completions, local Applied events remain reliable while busy, and read quorum probes must not preempt data or create fixed-time feedback loops. `test/consensus_test.cc` covers deterministic and seeded host schedules plus real journal reopening. No production transport or checkpoint API is present yet.
+`consensus/` is the additive strict fixed-voter core and semantic journal adapter. Read [consensus/README.md](consensus/README.md) before changing events/actions or recovery. Send/application effects depend on durable completions, local Applied events remain reliable while busy, and read quorum probes must not preempt data or create fixed-time feedback loops. `test/consensus_test.cc` covers deterministic and seeded host schedules plus real journal reopening and local checkpoints. Production transport and network snapshot installation remain pending.
 
 ## Invariants — do not regress these
 
