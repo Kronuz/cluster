@@ -342,6 +342,9 @@ private:
 				if (persist_ || completion_ || pack_next_ >= pack_count_ || !pack_[pack_next_]) { throw std::logic_error("persistence lacks preowned reservation"); }
 				persist_ = std::move(*value);
 			} else if (auto value = std::get_if<Fenced>(&action)) { fail(value->reason); }
+			else if (std::holds_alternative<PersistInstall>(action) || std::holds_alternative<ActivateInstall>(action)) {
+				throw std::logic_error("snapshot installation requires worker transfer API");
+			}
 			else if (auto value = std::get_if<PersistCheckpoint>(&action)) {
 				if (!checkpoint_ || checkpoint_->phase != Phase::Cutover || value->capture != checkpoint_->token) { throw std::logic_error("checkpoint lacks owned replacement"); }
 				checkpoint_->sequence = store_.frontier().sequence; checkpoint_->persistence_token = value->token;

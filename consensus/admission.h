@@ -28,7 +28,8 @@ inline EventAdmissionPlan plan_event(const Event& event, bool busy, Limits limit
 	std::visit([&](const auto& value) {
 		using T = std::decay_t<decltype(value)>;
 		if constexpr (std::is_same_v<T, Persisted> || std::is_same_v<T, LocalCheckpoint> ||
-			std::is_same_v<T, Applied> || std::is_same_v<T, StorageFault> || std::is_same_v<T, Failed>) {
+			std::is_same_v<T, Applied> || std::is_same_v<T, StorageFault> || std::is_same_v<T, Failed> ||
+			std::is_same_v<T, InstallPrepared> || std::is_same_v<T, InstallActivated> || std::is_same_v<T, InstallActivationFailed>) {
 			throw std::invalid_argument("internal worker event cannot be submitted");
 		} else if constexpr (std::is_same_v<T, Tick>) {
 			if (!busy) { add(AdmissionClass::Control, hard); add(AdmissionClass::Control, noop); add(AdmissionClass::Control, hard); }

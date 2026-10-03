@@ -852,8 +852,114 @@ void portable_snapshot_descriptors() {
 	check(decode_snapshot(encode_snapshot(invalid, policy), policy) == invalid, "explicit wide payload policy does not allocate declared application bytes");
 }
 
+void portable_snapshot_installation() {
+	auto fixture = [] {
+		auto state = empty(1); state.hard = {3, 2, 2};
+		state.entries = {{1, 1, EntryKind::Command, "first"}, {2, 1, EntryKind::Command, "second"}, {3, 2, EntryKind::Command, "boundary"}, {4, 3, EntryKind::Command, "suffix"}};
+		return state;
+	};
+	auto request = [] {
+		auto fixed = config(1); return InstallPrepared{13, 77, 2, 3, fixed.cluster, fixed.configuration, {3, 2}};
+	};
+	for (bool before : {false, true}) { for (bool retain : {false, true}) { for (bool higher : {false, true}) {
+		Core core(config(1), fixture()); auto initial = core.step(Start{});
+		check(find<Committed>(initial) && find<Committed>(initial)->entries.back().index == 2, "install fixture has an outstanding committed application range");
+		auto prepared = request(); prepared.leader_term += higher; if (!retain) { prepared.boundary.term = 3; }
+		auto actions = core.step(prepared); auto persist = find<PersistInstall>(actions);
+		check(persist && !find<ActivateInstall>(actions) && !find<InstallCompleted>(actions) && core.busy(), "prepared installation exposes persistence only");
+		if (!persist) { continue; } auto token = persist->token;
+		check(persist->prepared == 77 && persist->state.configuration == config(1) && persist->state.hard.term == prepared.leader_term &&
+			persist->state.hard.voted_for == (higher ? std::optional<NodeId>{} : std::optional<NodeId>{2}) && persist->state.hard.commit_index == 3 &&
+			persist->state.base_index == 3 && persist->state.base_term == prepared.boundary.term && persist->state.applied_index == 3 &&
+			persist->state.entries.size() == (retain ? 1 : 0), "installation derives receiver identity, ballot and boundary-matched suffix");
+		Recovery validator(config(1)); validator.validate_checkpoint_state(persist->state);
+		check(core.step(Persisted{token + 100}).empty() && core.step(InstallActivated{token}).empty() && core.committed() == 2 && core.base_index() == 0, "wrong persistence and premature activation release no installation effects");
+		check(core.step(Tick{1000, 100}).empty() && core.step(Receive{3, VoteRequest{9, 4, 3}}).empty(), "busy installation advances time without campaigning or peer processing");
+		if (before) { check(core.step(Applied{2}).empty() && core.applied() == 2, "outstanding application completion remains reliable before installation persistence"); }
+		auto published = core.step(Persisted{token}); auto activate = find<ActivateInstall>(published);
+		check(activate && activate->token == token && activate->prepared == 77 && activate->boundary.index == 3 &&
+			!find<InstallCompleted>(published) && !find<Committed>(published) && !find<Send>(published) && core.busy() && core.base_index() == 3 &&
+			core.committed() == 3 && core.last_index() == (retain ? 4 : 3) && core.applied() == (before ? 2 : 0), "durable publication requests activation while isolating the transitional application cursor");
+		check(core.step(Persisted{token}).empty() && core.step(Tick{1100, 100}).empty() && core.step(InstallActivated{token + 100}).empty(), "published installation cannot complete or campaign from duplicate, stale or timer events");
+		auto blocked = core.step(Propose{14, "blocked"}); auto blocked_read = core.step(Read{15});
+		check(find<Reject>(blocked) && find<Reject>(blocked)->reason == RejectReason::Busy && find<Reject>(blocked_read) && find<Reject>(blocked_read)->reason == RejectReason::Busy, "ordinary proposals and reads stay gated through activation");
+		if (!before) { check(core.step(Applied{2}).empty() && core.applied() == 2, "outstanding application completion remains reliable after installation persistence"); }
+		auto completed = core.step(InstallActivated{token}); auto success = find<InstallCompleted>(completed);
+		check(success && success->request == 13 && success->prepared == 77 && success->boundary.index == 3 && !core.busy() && core.applied() == 3 && core.role() == Role::Follower, "matching activation alone publishes installation success and releases admission");
+		check(core.step(InstallActivated{token}).empty() && core.step(Tick{1100, 100}).empty(), "activation resets the follower deadline and duplicates are harmless");
+		Entry next{4, 3, EntryKind::Command, retain ? "suffix" : "new suffix"};
+		auto resumed = core.step(Receive{2, AppendRequest{prepared.leader_term, 11, 3, prepared.boundary.term, 4, 0, {next}}});
+		auto append = find<Persist>(resumed);
+		check(append && append->batch.hard && append->batch.hard->commit_index == 4 && !find<Committed>(resumed), "resumed replication persists the next commitment before delivery");
+		if (append) {
+			auto delivered = core.step(Persisted{append->token}); auto committed = find<Committed>(delivered);
+			check(committed && committed->first == 4 && committed->entries.size() == 1 && committed->entries.front() == next, "resumed application receives the retained or newly appended suffix payload");
+			core.step(Applied{4}); check(core.committed() == 4 && core.applied() == 4 && core.base_index() == 3, "resumed follower durably commits and applies beyond the installed image");
+		}
+		auto election = core.step(Tick{1200, 100}); check(find<Persist>(election), "a separately admitted expired Tick may campaign after installation activation");
+	} } }
+	for (bool higher : {false, true}) {
+		Core core(config(1), fixture()); core.step(Start{}); auto prepared = request(); prepared.boundary = {2, 1}; prepared.leader_term += higher;
+		auto stale = core.step(prepared);
+		if (higher) {
+			auto hard = find<Persist>(stale); check(hard && hard->batch.hard && !find<InstallRejected>(stale) && !find<PersistInstall>(stale), "caught-up higher-term snapshot persists its receiver term before rejection");
+			if (!hard) { continue; } stale = core.step(Persisted{hard->token});
+		}
+		auto rejected = find<InstallRejected>(stale);
+		check(rejected && rejected->reason == InstallRejectReason::CaughtUp && core.base_index() == 0 && core.committed() == 2 && core.applied() == 0 &&
+			core.durable_hard_state().voted_for == (higher ? std::optional<NodeId>{} : std::optional<NodeId>{2}), "caught-up images preserve application state and the proper receiver ballot");
+	}
+	for (unsigned invalid = 0; invalid < 12; ++invalid) {
+		Core core(config(1), fixture()); core.step(Start{}); auto prepared = request();
+		switch (invalid) {
+		case 0: prepared.request = 0; break; case 1: prepared.prepared = 0; break;
+		case 2: prepared.authenticated_peer = 1; break; case 3: prepared.authenticated_peer = 4; break;
+		case 4: prepared.cluster[0] ^= 1; break; case 5: prepared.configuration[0] ^= 1; break;
+		case 6: prepared.leader_term = 0; break; case 7: prepared.leader_term = 2; break;
+		case 8: prepared.boundary.index = 0; break; case 9: prepared.boundary.index = std::numeric_limits<Index>::max(); break;
+		case 10: prepared.boundary.term = 0; break; case 11: prepared.boundary.term = 4; break;
+		}
+		auto actions = core.step(prepared); auto rejected = find<InstallRejected>(actions);
+		check(rejected && rejected->reason == (invalid == 7 ? InstallRejectReason::StaleTerm : InstallRejectReason::Invalid) && !core.busy() && core.term() == 3 && core.committed() == 2, "invalid or stale sender context changes no receiver state");
+	}
+	{
+		Core unstarted(config(1), fixture()); auto rejected = unstarted.step(request());
+		check(find<InstallRejected>(rejected) && find<InstallRejected>(rejected)->reason == InstallRejectReason::Busy && !unstarted.busy(), "unstarted Core does not admit installation");
+		Core core(config(1), fixture()); core.step(Start{}); core.step(Tick{100, 100}); auto term = core.term();
+		auto prepared = request(); prepared.leader_term = 9; rejected = core.step(prepared);
+		check(find<InstallRejected>(rejected) && find<InstallRejected>(rejected)->reason == InstallRejectReason::Busy && core.busy() && core.term() == term, "ordinary pending persistence rejects installation without observing another term");
+	}
+	{
+		Core core(config(1), fixture()); core.step(Start{}); core.step(Applied{2}); auto prepared = request();
+		prepared.boundary.index = std::numeric_limits<Index>::max() - 1;
+		prepared.boundary.term = prepared.leader_term = std::numeric_limits<Term>::max();
+		auto actions = core.step(prepared); auto persist = find<PersistInstall>(actions);
+		check(persist && persist->state.entries.empty() && !persist->state.hard.voted_for, "maximum legal installed boundary and term preserve no incompatible suffix or ballot");
+		if (persist) {
+			auto token = persist->token; core.step(Persisted{token}); core.step(InstallActivated{token});
+			check(core.last_index() == prepared.boundary.index && core.applied() == prepared.boundary.index && core.step(Tick{1000, 100}).empty() && core.role() == Role::Follower, "installed index and term exhaustion cannot wrap into a campaign");
+		}
+	}
+	for (unsigned failure = 0; failure < 5; ++failure) {
+		Core core(config(1), fixture()); core.step(Start{}); auto actions = core.step(request()); auto token = find<PersistInstall>(actions)->token;
+		check(core.step(Failed{FailureSource::Storage, token + 100, "stale"}).empty(), "stale install storage failure cannot fence another operation");
+		if (failure != 0 && failure != 4) { core.step(Persisted{token}); }
+		Actions failed;
+		if (failure == 0) { failed = core.step(Failed{FailureSource::Storage, token, "disk"}); }
+		else if (failure == 1) { failed = core.step(InstallActivated{token}); }
+		else if (failure == 2) {
+			check(core.step(InstallActivationFailed{token + 100, "stale"}).empty(), "stale activation failure is ignored");
+			failed = core.step(InstallActivationFailed{token, "application"});
+		} else { failed = core.step(Failed{FailureSource::Application, 2, "old application"}); }
+		check(find<Fenced>(failed) && core.role() == Role::Fenced && !core.busy(), "storage, early activation, activation failure and old application failure fence installation");
+	}
+	for (const Event& internal : std::vector<Event>{request(), InstallActivated{1}, InstallActivationFailed{1, "failure"}}) {
+		check(throws([&] { plan_event(internal, false); }) && throws([&] { plan_event(internal, true); }), "trusted installation events reject through ordinary worker admission");
+	}
+}
+
 int main() {
-	try { portable_snapshot_descriptors(); event_admission_plans(); storage_footprint_plans(); persistence_barriers(); delayed_completions_do_not_campaign(); replication_and_restart(); affirmative_majority_and_inheritance(); simultaneous_completions(); reads_and_partitions(); overlapping_reads_preserve_data(); application_lag_does_not_spin_reads(); stale_rpc_and_failure_transitions(); bounds_and_semantic_recovery(); local_checkpoint_core(); compacted_index_exhaustion(); compacted_replication(); checkpoint_semantic_recovery(); real_journal_integration(); real_store_integration(); reordered_crash_schedules(3, 0x52414654); reordered_crash_schedules(5, 0x434c5553); }
+	try { portable_snapshot_installation(); portable_snapshot_descriptors(); event_admission_plans(); storage_footprint_plans(); persistence_barriers(); delayed_completions_do_not_campaign(); replication_and_restart(); affirmative_majority_and_inheritance(); simultaneous_completions(); reads_and_partitions(); overlapping_reads_preserve_data(); application_lag_does_not_spin_reads(); stale_rpc_and_failure_transitions(); bounds_and_semantic_recovery(); local_checkpoint_core(); compacted_index_exhaustion(); compacted_replication(); checkpoint_semantic_recovery(); real_journal_integration(); real_store_integration(); reordered_crash_schedules(3, 0x52414654); reordered_crash_schedules(5, 0x434c5553); }
 	catch (const std::exception& error) { check(false, error.what()); }
 	std::cout << checks << " consensus checks, " << failures << " failures\n";
 	return failures ? 1 : 0;

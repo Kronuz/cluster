@@ -51,7 +51,7 @@ public:
 	Index applied() const noexcept { return applied_; }
 	Index last_index() const noexcept { return base_index_ + static_cast<Index>(entries_.size()); }
 	Index base_index() const noexcept { return base_index_; }
-	bool busy() const noexcept { return pending_.has_value(); }
+	bool busy() const noexcept { return pending_.has_value() || install_.has_value(); }
 	const HardState& durable_hard_state() const noexcept { return durable_; }
 	const FixedConfiguration& configuration() const noexcept { return configuration_; }
 
@@ -65,6 +65,10 @@ public:
 
 private:
 	struct Pending { Token token; HardState hard; Actions deferred; bool elected = false; std::optional<std::pair<Index, Term>> checkpoint; };
+	struct PendingInstall {
+		Token token, prepared; RequestId request; LogBoundary boundary; HardState hard;
+		Actions deferred; bool retain_suffix, published = false;
+	};
 	struct Flight { Token rpc; Index previous, through; Token read_probe; std::uint64_t sent; };
 	struct Peer { Index next = 1, matched = 0; std::optional<Flight> flight; std::uint64_t retry_after = 0; bool snapshot_requested = false; };
 	struct PendingRead { RequestId request; Token probe; Term term; Index index; std::set<NodeId> acknowledgements; };
@@ -94,7 +98,7 @@ private:
 		return ++next_token_;
 	}
 	void fence(std::string reason, Actions& output) {
-		role_ = Role::Fenced; pending_.reset(); peers_.clear(); reads_.clear();
+		role_ = Role::Fenced; pending_.reset(); install_.reset(); peers_.clear(); reads_.clear();
 		output.clear(); output.emplace_back(Fenced{std::move(reason)});
 	}
 	void follower(NodeId leader, Actions& deferred) {
@@ -104,7 +108,7 @@ private:
 		reads_.clear(); reset_election();
 	}
 	void persist(StorageBatch batch, Actions deferred, Actions& output, bool elected = false) {
-		if (pending_) { throw std::logic_error("overlapping persistence"); }
+		if (busy()) { throw std::logic_error("overlapping persistence"); }
 		auto id = token();
 		pending_.emplace(Pending{id, hard_, std::move(deferred), elected, std::nullopt});
 		output.emplace_back(Persist{id, std::move(batch)});
@@ -116,9 +120,23 @@ private:
 	void handle(Tick tick, Actions& output) {
 		if (tick.now < now_ || tick.election_delay < timing_.election_min || tick.election_delay > timing_.election_max) { return; }
 		now_ = tick.now; election_delay_ = tick.election_delay;
-		if (started_ && !pending_) { drive(output, true); }
+		if (started_ && !busy()) { drive(output, true); }
 	}
 	void handle(Persisted completion, Actions& output) {
+		if (install_) {
+			if (install_->published || completion.token != install_->token) { return; }
+			auto& operation = *install_;
+			if (operation.retain_suffix) {
+				auto count = static_cast<std::size_t>(operation.boundary.index - base_index_);
+				for (std::size_t i = 0; i < count; ++i) { log_bytes_ -= entries_[i].payload.size(); }
+				entries_.erase(entries_.begin(), entries_.begin() + static_cast<std::ptrdiff_t>(count));
+			} else { entries_.clear(); log_bytes_ = 0; }
+			base_index_ = operation.boundary.index; base_term_ = operation.boundary.term;
+			hard_ = durable_ = operation.hard; operation.published = true;
+			output = std::move(operation.deferred);
+			output.emplace_back(ActivateInstall{operation.token, operation.prepared, operation.boundary});
+			return; // Application activation still owns the exclusive busy gate.
+		}
 		if (!pending_ || completion.token != pending_->token) { return; }
 		auto completed = std::move(*pending_); pending_.reset(); durable_ = completed.hard;
 		if (completed.checkpoint) {
@@ -136,8 +154,45 @@ private:
 		}
 	}
 	void handle(StorageFault failure, Actions& output) { fence(std::move(failure.error), output); }
+	void handle(InstallPrepared request, Actions& output) {
+		auto reject = [&](InstallRejectReason reason) { output.emplace_back(InstallRejected{request.request, request.prepared, reason}); };
+		if (!started_ || busy()) { reject(InstallRejectReason::Busy); return; }
+		if (request.request == 0 || request.prepared == 0 || request.authenticated_peer == configuration_.local || !member(request.authenticated_peer) ||
+			request.cluster != configuration_.cluster || request.configuration != configuration_.configuration ||
+			request.leader_term == 0 || request.boundary.index == 0 || request.boundary.index == maximum ||
+			request.boundary.term == 0 || request.boundary.term > request.leader_term) { reject(InstallRejectReason::Invalid); return; }
+		if (request.leader_term < hard_.term) { reject(InstallRejectReason::StaleTerm); return; }
+		auto next_hard = durable_;
+		if (request.leader_term > next_hard.term) { next_hard.term = request.leader_term; next_hard.voted_for.reset(); }
+		if (request.boundary.index <= durable_.commit_index) {
+			Actions deferred; hard_ = next_hard; follower(request.authenticated_peer, deferred);
+			deferred.emplace_back(InstallRejected{request.request, request.prepared, InstallRejectReason::CaughtUp});
+			if (hard_ != durable_) { persist(StorageBatch{hard_, std::nullopt}, std::move(deferred), output); }
+			else { output = std::move(deferred); }
+			return;
+		}
+		bool retain = request.boundary.index <= last_index() && log_term(request.boundary.index) == request.boundary.term;
+		next_hard.commit_index = request.boundary.index;
+		RecoveredState state{configuration_, next_hard, request.boundary.index, request.boundary.term, {}, request.boundary.index};
+		if (retain) {
+			auto first = static_cast<std::size_t>(request.boundary.index - base_index_);
+			state.entries.assign(entries_.begin() + static_cast<std::ptrdiff_t>(first), entries_.end());
+		}
+		Actions deferred; hard_ = next_hard; follower(request.authenticated_peer, deferred);
+		auto id = token(); install_.emplace(PendingInstall{id, request.prepared, request.request, request.boundary, next_hard, std::move(deferred), retain});
+		output.emplace_back(PersistInstall{id, request.prepared, std::move(state)});
+	}
+	void handle(InstallActivated completion, Actions& output) {
+		if (!install_ || !install_->published || completion.token != install_->token) { return; }
+		if (delivered_through_) { fence("snapshot activation precedes outstanding application completion", output); return; }
+		auto operation = std::move(*install_); install_.reset(); applied_ = operation.boundary.index; reset_election();
+		output.emplace_back(InstallCompleted{operation.request, operation.prepared, operation.boundary});
+	}
+	void handle(InstallActivationFailed failure, Actions& output) {
+		if (install_ && install_->published && failure.token == install_->token) { fence(std::move(failure.error), output); }
+	}
 	void handle(LocalCheckpoint request, Actions& output) {
-		if (!started_ || pending_) { output.emplace_back(Reject{request.request, RejectReason::Busy}); return; }
+		if (!started_ || busy()) { output.emplace_back(Reject{request.request, RejectReason::Busy}); return; }
 		if (request.capture == 0 || request.cluster != configuration_.cluster || request.configuration != configuration_.configuration ||
 			request.through <= base_index_ || request.through > applied_ || applied_ > durable_.commit_index ||
 			log_term(request.through) != request.term) {
@@ -153,7 +208,8 @@ private:
 	}
 	void handle(Failed failure, Actions& output) {
 		if (failure.source == FailureSource::Storage) {
-			if (!pending_ || failure.token != pending_->token) { return; }
+			if (install_) { if (install_->published || failure.token != install_->token) { return; } }
+			else if (!pending_ || failure.token != pending_->token) { return; }
 		} else if (failure.token != delivered_through_ || delivered_through_ == 0) { return; }
 		fence(std::move(failure.error), output);
 	}
@@ -163,10 +219,10 @@ private:
 			fence("invalid application completion", output); return;
 		}
 		applied_ = completion.through; delivered_through_ = 0;
-		if (!pending_) { deliver(output); ready_reads(output); }
+		if (!busy()) { deliver(output); ready_reads(output); }
 	}
 	void handle(Propose proposal, Actions& output) {
-		if (pending_) { output.emplace_back(Reject{proposal.request, RejectReason::Busy}); return; }
+		if (busy()) { output.emplace_back(Reject{proposal.request, RejectReason::Busy}); return; }
 		if (!started_ || role_ != Role::Leader) { output.emplace_back(Reject{proposal.request, RejectReason::NotLeader}); return; }
 		if (proposal.command.size() > limits_.command_bytes) { output.emplace_back(Reject{proposal.request, RejectReason::TooLarge}); return; }
 		if (last_index() - durable_.commit_index >= limits_.uncommitted_entries) {
@@ -181,7 +237,7 @@ private:
 		persist(StorageBatch{std::nullopt, LogMutation{entry.index, {std::move(entry)}}}, std::move(deferred), output);
 	}
 	void handle(Read read, Actions& output) {
-		if (pending_) { output.emplace_back(Reject{read.request, RejectReason::Busy}); return; }
+		if (busy()) { output.emplace_back(Reject{read.request, RejectReason::Busy}); return; }
 		if (!started_ || role_ != Role::Leader) { output.emplace_back(Reject{read.request, RejectReason::NotLeader}); return; }
 		if (durable_.commit_index == 0 || log_term(durable_.commit_index) != hard_.term) {
 			output.emplace_back(Reject{read.request, RejectReason::NotReady}); return;
@@ -201,7 +257,7 @@ private:
 		ready_reads(output);
 	}
 	void handle(Receive receive, Actions& output) {
-		if (!started_ || pending_ || receive.authenticated_peer == configuration_.local || !member(receive.authenticated_peer)) { return; }
+		if (!started_ || busy() || receive.authenticated_peer == configuration_.local || !member(receive.authenticated_peer)) { return; }
 		if (!std::visit([&](const auto& message) { return valid(message); }, receive.message)) { return; }
 		auto incoming_term = std::visit([](const auto& message) { return message.term; }, receive.message);
 		bool changed = incoming_term > hard_.term;
@@ -332,7 +388,7 @@ private:
 		}
 	}
 	void drive(Actions& output, bool allow_campaign) {
-		if (!started_ || pending_) { return; }
+		if (!started_ || busy()) { return; }
 		if (role_ != Role::Leader) {
 			// Campaigns require a separately admitted Tick. Slow persistence
 			// must not start another election from its completion callback.
@@ -356,7 +412,7 @@ private:
 		if (heartbeat) { heartbeat_deadline_ = deadline(timing_.heartbeat); }
 	}
 	void become_leader(Actions& output) {
-		if (pending_) { throw std::logic_error("leader election before vote persistence"); }
+		if (busy()) { throw std::logic_error("leader election before vote persistence"); }
 		if (last_index() >= maximum - 1 || entries_.size() >= limits_.log_entries) {
 			follower(0, output); return; // Control reserve exhausted: fail closed.
 		}
@@ -385,7 +441,7 @@ private:
 		output.emplace_back(Send{id, AppendRequest{hard_.term, rpc, previous, log_term(previous), durable_.commit_index, probe, std::move(batch)}});
 	}
 	void advance_commit(Actions& output) {
-		if (pending_ || role_ != Role::Leader) { return; }
+		if (busy() || role_ != Role::Leader) { return; }
 		std::vector<Index> matches{last_index()};
 		for (const auto& [id, peer] : peers_) { matches.push_back(peer.matched); }
 		std::sort(matches.begin(), matches.end(), std::greater<Index>());
@@ -395,7 +451,7 @@ private:
 		persist(StorageBatch{hard_, std::nullopt}, {}, output);
 	}
 	void deliver(Actions& output) {
-		if (pending_ || delivered_through_ || applied_ >= durable_.commit_index) { return; }
+		if (busy() || delivered_through_ || applied_ >= durable_.commit_index) { return; }
 		std::vector<Entry> batch; std::size_t bytes = 0;
 		for (Index index = applied_ + 1; index <= durable_.commit_index && batch.size() < limits_.rpc_entries; ++index) {
 			const auto& entry = log_entry(index);
@@ -406,7 +462,7 @@ private:
 		output.emplace_back(Committed{applied_ + 1, std::move(batch)});
 	}
 	void ready_reads(Actions& output) {
-		if (pending_ || role_ != Role::Leader) { return; }
+		if (busy() || role_ != Role::Leader) { return; }
 		for (auto read = reads_.begin(); read != reads_.end();) {
 			if (read->term == hard_.term && read->acknowledgements.size() >= quorum() && applied_ >= read->index) {
 				output.emplace_back(ReadReady{read->request, read->index}); read = reads_.erase(read);
@@ -429,6 +485,7 @@ private:
 	Index applied_ = 0, delivered_through_ = 0;
 	bool started_ = false;
 	std::optional<Pending> pending_;
+	std::optional<PendingInstall> install_;
 	std::map<NodeId, Peer> peers_;
 	std::set<NodeId> grants_;
 	std::vector<PendingRead> reads_;

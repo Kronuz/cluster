@@ -100,15 +100,27 @@ struct Persisted { Token token; };
 struct Applied { Index through; };
 // The host owns the immutable application capture identified by capture.
 struct LocalCheckpoint { RequestId request; Token capture; Index through; Term term; Identity cluster, configuration; };
+// Trusted adapter: prepared identifies a staged, semantically validated image.
+struct InstallPrepared {
+	RequestId request; Token prepared; NodeId authenticated_peer; Term leader_term;
+	Identity cluster, configuration; LogBoundary boundary;
+};
+struct InstallActivated { Token token; };
+struct InstallActivationFailed { Token token; std::string error; };
 struct StorageFault { std::string error; };
 enum class FailureSource { Storage, Application };
 struct Failed { FailureSource source; Token token; std::string error; };
-using Event = std::variant<Start, Tick, Receive, Propose, Read, Persisted, Applied, Failed, LocalCheckpoint, StorageFault>;
+using Event = std::variant<Start, Tick, Receive, Propose, Read, Persisted, Applied, Failed, LocalCheckpoint, StorageFault, InstallPrepared, InstallActivated, InstallActivationFailed>;
 
 enum class Role { Follower, Candidate, Leader, Fenced };
 enum class RejectReason { Busy, NotLeader, NotReady, LogFull, TooLarge, DuplicateRequest, InvalidCheckpoint };
 struct Persist { Token token; StorageBatch batch; };
 struct PersistCheckpoint { Token token; Token capture; RecoveredState state; };
+struct PersistInstall { Token token, prepared; RecoveredState state; };
+struct ActivateInstall { Token token, prepared; LogBoundary boundary; };
+enum class InstallRejectReason { Busy, Invalid, StaleTerm, CaughtUp };
+struct InstallRejected { RequestId request; Token prepared; InstallRejectReason reason; };
+struct InstallCompleted { RequestId request; Token prepared; LogBoundary boundary; };
 struct CheckpointPublished { RequestId request; Index through; };
 struct SnapshotNeeded { NodeId peer; Index through; Term term; };
 struct Send { NodeId peer; Message message; };
@@ -118,7 +130,7 @@ struct ReadReady { RequestId request; Index index; };
 struct RoleChanged { Role role; Term term; NodeId leader; };
 struct Reject { RequestId request; RejectReason reason; };
 struct Fenced { std::string reason; };
-using Action = std::variant<Persist, Send, ProposalPlaced, Committed, ReadReady, RoleChanged, Reject, Fenced, PersistCheckpoint, CheckpointPublished, SnapshotNeeded>;
+using Action = std::variant<Persist, Send, ProposalPlaced, Committed, ReadReady, RoleChanged, Reject, Fenced, PersistCheckpoint, CheckpointPublished, SnapshotNeeded, PersistInstall, ActivateInstall, InstallRejected, InstallCompleted>;
 using Actions = std::vector<Action>;
 
 } // namespace cluster::consensus
