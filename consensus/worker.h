@@ -10,6 +10,19 @@ namespace cluster::consensus {
 enum class SubmitResult { Accepted, Busy, Pressure, Fenced };
 enum class TurnResult { Idle, Blocked, Pressure, Inventory, Stored, Completed, Maintenance, Fenced };
 struct WorkerLimits { std::size_t foreground_burst = 16, scan_entries = 128; };
+struct CaptureMetadata { RequestId request; Index through; Term term; };
+enum class CancelResult { Canceled, TooLate, Stale };
+class Worker;
+class CheckpointId {
+public:
+	CheckpointId(const CheckpointId&) = default;
+	CheckpointId& operator=(const CheckpointId&) = default;
+private:
+	friend class Worker;
+	CheckpointId(std::shared_ptr<char> owner, Token token) : owner_(std::move(owner)), token_(token) {}
+	std::shared_ptr<char> owner_;
+	Token token_;
+};
 
 // One owning executor. IO is exclusive to this worker and outlives it.
 // There is no input queue; retryable work remains with the caller.
@@ -75,9 +88,12 @@ public:
 	bool ready() const noexcept { return core_ && initialization_.empty() && store_.accounting().has_value() && !fenced(); }
 	bool fenced() const noexcept { return failed_ || store_.fenced(); }
 	Role role() const noexcept { return core_ ? core_->role() : Role::Follower; }
+	bool busy() const noexcept { return core_ && core_->busy(); }
 	Term term() const noexcept { return core_ ? core_->term() : 0; }
 	Index committed() const noexcept { return core_ ? core_->committed() : 0; }
 	Index applied_index() const noexcept { return core_ ? core_->applied() : 0; }
+	Index base_index() const noexcept { return core_ ? core_->base_index() : 0; }
+	auto storage_frontier() const { return store_.frontier(); }
 	auto accounting() const noexcept { return store_.accounting(); }
 	SubmitResult try_submit(Event event) { return submit(std::move(event), false); }
 	Actions take_actions() {
@@ -100,6 +116,39 @@ public:
 		// A stale/duplicate report cannot fence unrelated application work.
 		if (!fenced() && core_ && through != 0 && through == delivered_) { fail(std::move(reason)); }
 	}
+	std::optional<CheckpointId> reserve_checkpoint(std::uint64_t application_cap) {
+		if (!ready() || checkpoint_) { return std::nullopt; }
+		if (next_checkpoint_ == std::numeric_limits<Token>::max()) { throw std::length_error("checkpoint identity exhausted"); }
+		auto replacement = store_.reserve_replacement(application_cap, checkpoint_detail::maximum_size(limits_));
+		if (!replacement) { return std::nullopt; }
+		auto token = ++next_checkpoint_;
+		try { checkpoint_ = std::make_unique<Checkpoint>(*replacement, token, application_cap); }
+		catch (...) { store_.cancel_replacement(*replacement); throw; }
+		return CheckpointId(checkpoint_owner_, token);
+	}
+	void attach_capture(const CheckpointId& id, CaptureMetadata capture) {
+		auto& operation = checkpoint(id);
+		if (operation.phase != Phase::Reserved || !capture.through || !capture.term) { throw std::invalid_argument("invalid checkpoint capture phase or boundary"); }
+		operation.capture = capture; operation.phase = Phase::BeginApplication;
+	}
+	SubmitResult offer_application_chunk(const CheckpointId& id, std::string_view bytes, bool final = false) {
+		auto& operation = checkpoint(id);
+		if ((operation.phase != Phase::BeginApplication && operation.phase != Phase::Application) || operation.final_offered) {
+			throw std::invalid_argument("checkpoint no longer accepts application chunks");
+		}
+		if (bytes.size() > 65536 || bytes.size() > operation.application_cap - operation.offered_bytes) { throw std::length_error("checkpoint application chunk bound"); }
+		if (operation.chunk) { return SubmitResult::Busy; }
+		operation.chunk.emplace(); std::copy(bytes.begin(), bytes.end(), operation.chunk->bytes.begin());
+		operation.chunk->length = bytes.size(); operation.chunk->final = final;
+		operation.offered_bytes += bytes.size(); operation.final_offered = final;
+		return SubmitResult::Accepted;
+	}
+	CancelResult cancel_checkpoint(const CheckpointId& id) {
+		if (id.owner_ != checkpoint_owner_ || !checkpoint_ || id.token_ != checkpoint_->token) { return CancelResult::Stale; }
+		if (checkpoint_->phase >= Phase::EncodeBundle) { return CancelResult::TooLate; }
+		try { store_.cancel_replacement(checkpoint_->replacement); checkpoint_.reset(); cutover_debt_ = false; return CancelResult::Canceled; }
+		catch (const std::exception& error) { fail(error.what()); throw; }
+	}
 	TurnResult run_one(Tick current_time) {
 		if (store_.fenced() && !failed_) { fail("storage fenced outside worker"); }
 		if (fenced()) { return TurnResult::Fenced; }
@@ -112,20 +161,22 @@ public:
 				store_.append(*permit, initialization_); initialization_.clear(); return TurnResult::Stored;
 			}
 			if (maintenance_due()) {
-				if (timer_due_ && !core_->busy() && output_.empty() && !completion_ && !application_) {
+				if (timer_due_ && !cutover_debt_ && !core_->busy() && output_.empty() && !completion_ && !application_) {
 					auto result = submit(current_time, true);
 					if (result == SubmitResult::Accepted) { timer_due_ = false; return TurnResult::Idle; }
 					if (result == SubmitResult::Fenced) { return TurnResult::Fenced; }
 				}
-				store_.reclaim_step(scheduling_.scan_entries); foreground_ = 0; timer_blocked_ = timer_due_; timer_due_ = true;
-				return TurnResult::Maintenance;
+				maintenance(); return fenced() ? TurnResult::Fenced : TurnResult::Maintenance;
 			}
 			if (persist_) {
 				auto encoded = encode_storage_batch(persist_->batch);
 				store_.append(*pack_[pack_next_], encoded); pack_[pack_next_++].reset();
 				completion_ = Persisted{persist_->token}; persist_.reset(); ++foreground_; return TurnResult::Stored;
 			}
-			if (!output_.empty()) { return TurnResult::Blocked; }
+			if (!output_.empty()) {
+				if (preparation_runnable()) { maintenance(); return fenced() ? TurnResult::Fenced : TurnResult::Maintenance; }
+				return TurnResult::Blocked;
+			}
 			if (application_) {
 				auto value = *application_; application_.reset(); ingest(core_->step(value)); ++foreground_; return TurnResult::Completed;
 			}
@@ -133,13 +184,27 @@ public:
 				// Advance time while persistence still owns the Core slot. This
 				// cannot campaign and consumes no additional reservation.
 				ingest(core_->step(current_time));
-				auto value = *completion_; completion_.reset(); ingest(core_->step(value)); ++foreground_; return TurnResult::Completed;
+				auto value = *completion_; completion_.reset();
+				if (checkpoint_ && checkpoint_->phase == Phase::Completion && checkpoint_->persistence_token == value.token) {
+					checkpoint_.reset(); cutover_debt_ = false;
+				}
+				ingest(core_->step(value)); ++foreground_; return TurnResult::Completed;
 			}
-			if (timer_blocked_) {
+			if (timer_blocked_ && !cutover_debt_) {
 				auto result = submit(current_time, true);
 				if (result == SubmitResult::Accepted) { timer_blocked_ = false; timer_due_ = true; return TurnResult::Idle; }
 				if (result == SubmitResult::Fenced) { return TurnResult::Fenced; }
-				store_.reclaim_step(scheduling_.scan_entries); return TurnResult::Maintenance;
+				maintenance(); return fenced() ? TurnResult::Fenced : TurnResult::Maintenance;
+			}
+			if (preparation_runnable()) {
+				// Before freeze, sustained preparation cannot postpone protocol
+				// timers. Alternate an admitted timer opportunity with maintenance.
+				if (!cutover_debt_ && timer_due_) {
+					auto result = submit(current_time, true);
+					if (result == SubmitResult::Accepted) { timer_due_ = false; return TurnResult::Idle; }
+					if (result == SubmitResult::Fenced) { return TurnResult::Fenced; }
+				}
+				maintenance(); return fenced() ? TurnResult::Fenced : TurnResult::Maintenance;
 			}
 			auto result = try_submit(current_time);
 			return result == SubmitResult::Accepted ? TurnResult::Idle : result == SubmitResult::Pressure ? TurnResult::Pressure :
@@ -154,7 +219,7 @@ private:
 		if (core_ && core_->role() == Role::Leader && std::holds_alternative<Tick>(event)) { plan.count = 0; }
 		if (store_.fenced() && !failed_) { fail("storage fenced outside worker"); }
 		if (fenced()) { return SubmitResult::Fenced; }
-		if (!ready() || !output_.empty() || ((maintenance_due() || timer_blocked_) && !maintenance_tick) || core_->busy() || completion_ || application_) { return SubmitResult::Busy; }
+		if (!ready() || !output_.empty() || ((maintenance_due() || timer_blocked_) && !maintenance_tick) || cutover_debt_ || core_->busy() || completion_ || application_) { return SubmitResult::Busy; }
 		try {
 			std::array<std::optional<kronuz::journal::AppendReservation>, 3> acquired;
 			for (std::size_t i = 0; i < plan.count; ++i) {
@@ -165,6 +230,84 @@ private:
 			ingest(core_->step(std::move(event))); if (!maintenance_tick) { ++foreground_; }
 			return fenced() ? SubmitResult::Fenced : SubmitResult::Accepted;
 		} catch (const std::exception& error) { fail(error.what()); return SubmitResult::Fenced; }
+	}
+	enum class Phase { Reserved, BeginApplication, Application, SealApplication, Cutover, EncodeBundle, BeginBundle, Bundle, SealBundle, Publish, Completion };
+	struct Chunk { std::array<char, 65536> bytes{}; std::size_t length = 0; bool final = false; };
+	struct Checkpoint {
+		Checkpoint(kronuz::journal::ReplacementId id, Token identity, std::uint64_t cap)
+			: replacement(std::move(id)), token(identity), application_cap(cap) {}
+		kronuz::journal::ReplacementId replacement;
+		Token token, persistence_token = 0;
+		std::uint64_t application_cap, offered_bytes = 0, sequence = 0;
+		Phase phase = Phase::Reserved;
+		std::optional<CaptureMetadata> capture;
+		std::optional<Chunk> chunk;
+		std::optional<kronuz::journal::ArtifactDescriptor> application;
+		std::optional<PersistCheckpoint> action;
+		std::string bundle;
+		std::size_t offset = 0;
+		bool final_offered = false;
+	};
+	Checkpoint& checkpoint(const CheckpointId& id) {
+		if (fenced()) { throw std::logic_error("worker fenced"); }
+		if (id.owner_ != checkpoint_owner_ || !checkpoint_ || id.token_ != checkpoint_->token) { throw std::invalid_argument("stale or foreign checkpoint identity"); }
+		return *checkpoint_;
+	}
+	bool preparation_runnable() const noexcept {
+		if (!checkpoint_) { return false; }
+		auto phase = checkpoint_->phase;
+		if (phase == Phase::Reserved || phase == Phase::Completion) { return false; }
+		if (phase == Phase::Application) { return checkpoint_->chunk.has_value(); }
+		if (phase == Phase::Cutover) { return !core_->busy() && output_.empty() && !application_ && !completion_; }
+		return true;
+	}
+	void maintenance() {
+		auto owed_timer = timer_due_;
+		if (preparation_next_ && preparation_runnable()) { prepare_one(); preparation_next_ = false; }
+		else { store_.reclaim_step(scheduling_.scan_entries); preparation_next_ = true; }
+		foreground_ = 0; // Cutover debt is independent of this fairness counter.
+		timer_blocked_ = owed_timer; timer_due_ = true;
+	}
+	void prepare_one() {
+		auto& operation = *checkpoint_;
+		using kronuz::journal::ArtifactPart;
+		switch (operation.phase) {
+		case Phase::BeginApplication:
+			store_.begin_artifact(operation.replacement, ArtifactPart::Application); operation.phase = Phase::Application; break;
+		case Phase::Application: {
+			auto& chunk = *operation.chunk;
+			store_.write_chunk(operation.replacement, std::string_view(chunk.bytes.data(), chunk.length));
+			if (chunk.final) { operation.phase = Phase::SealApplication; }
+			operation.chunk.reset(); break;
+		}
+		case Phase::SealApplication:
+			operation.application = store_.finish_artifact(operation.replacement);
+			operation.phase = Phase::Cutover; cutover_debt_ = true; break;
+		case Phase::Cutover: {
+			auto capture = *operation.capture;
+			ingest(core_->step(LocalCheckpoint{capture.request, operation.token, capture.through, capture.term, configuration_.cluster, configuration_.configuration}));
+			if (fenced()) { break; }
+			if (!core_->busy()) { store_.cancel_replacement(operation.replacement); checkpoint_.reset(); cutover_debt_ = false; }
+			break;
+		}
+		case Phase::EncodeBundle:
+			operation.bundle = encode_checkpoint(operation.action->state, operation.sequence, *operation.application, limits_);
+			operation.action.reset(); operation.phase = Phase::BeginBundle; break;
+		case Phase::BeginBundle:
+			store_.begin_artifact(operation.replacement, ArtifactPart::Bundle); operation.phase = Phase::Bundle; break;
+		case Phase::Bundle: {
+			auto count = std::min(operation.bundle.size() - operation.offset, std::size_t{65536});
+			store_.write_chunk(operation.replacement, std::string_view(operation.bundle).substr(operation.offset, count)); operation.offset += count;
+			if (operation.offset == operation.bundle.size()) { operation.phase = Phase::SealBundle; }
+			break;
+		}
+		case Phase::SealBundle:
+			store_.finish_artifact(operation.replacement); operation.bundle.clear(); operation.phase = Phase::Publish; break;
+		case Phase::Publish:
+			if (completion_) { throw std::logic_error("checkpoint completion slot occupied"); }
+			store_.publish(operation.replacement, operation.sequence); completion_ = Persisted{operation.persistence_token}; operation.phase = Phase::Completion; break;
+		default: throw std::logic_error("checkpoint preparation phase not runnable");
+		}
 	}
 	static std::size_t checked_add(std::size_t left, std::size_t right) {
 		if (right > std::numeric_limits<std::size_t>::max() - left) { throw std::length_error("worker bound overflow"); }
@@ -199,7 +342,11 @@ private:
 				if (persist_ || completion_ || pack_next_ >= pack_count_ || !pack_[pack_next_]) { throw std::logic_error("persistence lacks preowned reservation"); }
 				persist_ = std::move(*value);
 			} else if (auto value = std::get_if<Fenced>(&action)) { fail(value->reason); }
-			else if (std::holds_alternative<PersistCheckpoint>(action)) { throw std::logic_error("checkpoint requires worker capture API"); }
+			else if (auto value = std::get_if<PersistCheckpoint>(&action)) {
+				if (!checkpoint_ || checkpoint_->phase != Phase::Cutover || value->capture != checkpoint_->token) { throw std::logic_error("checkpoint lacks owned replacement"); }
+				checkpoint_->sequence = store_.frontier().sequence; checkpoint_->persistence_token = value->token;
+				checkpoint_->action = std::move(*value); checkpoint_->phase = Phase::EncodeBundle;
+			}
 			else {
 				if (!output_.empty()) { throw std::logic_error("worker output batch occupied"); }
 				// Build the one output batch below after validating all actions.
@@ -207,7 +354,7 @@ private:
 		}
 		Actions external;
 		for (auto& action : actions) {
-			if (!std::holds_alternative<Persist>(action) && !std::holds_alternative<Fenced>(action)) { external.push_back(std::move(action)); }
+			if (!std::holds_alternative<Persist>(action) && !std::holds_alternative<PersistCheckpoint>(action) && !std::holds_alternative<Fenced>(action)) { external.push_back(std::move(action)); }
 		}
 		if (!external.empty()) { output_ = std::move(external); }
 		if (!core_->busy()) { release_pack(); }
@@ -215,7 +362,7 @@ private:
 	void fail(std::string reason) {
 		if (failed_) { return; } failed_ = true;
 		store_.fence_storage(); if (core_) { core_->step(StorageFault{reason}); }
-		persist_.reset(); completion_.reset(); application_.reset(); release_pack(); terminal_ = Fenced{std::move(reason)};
+		persist_.reset(); completion_.reset(); application_.reset(); checkpoint_.reset(); release_pack(); terminal_ = Fenced{std::move(reason)};
 	}
 	FixedConfiguration configuration_;
 	Limits limits_;
@@ -230,9 +377,12 @@ private:
 	std::optional<Persisted> completion_;
 	std::optional<Applied> application_;
 	std::optional<Fenced> terminal_;
+	std::shared_ptr<char> checkpoint_owner_ = std::make_shared<char>();
+	std::unique_ptr<Checkpoint> checkpoint_;
+	Token next_checkpoint_ = 0;
 	Actions output_;
 	Index delivered_ = 0;
-	bool failed_ = false, timer_due_ = true, timer_blocked_ = false;
+	bool failed_ = false, cutover_debt_ = false, preparation_next_ = true, timer_due_ = true, timer_blocked_ = false;
 };
 
 } // namespace cluster::consensus

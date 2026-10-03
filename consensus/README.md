@@ -40,7 +40,7 @@ Only one bounded committed range awaits `Applied`. Completions must acknowledge 
 
 `plan_event()` in `admission.h` returns a fixed pack of at most three append bounds. Tick campaigning reserves ballot, no-op and commit continuations; proposals reserve Normal command storage and a Control commit continuation. Any Command in an append RPC, including an empty payload, classifies the entire atomic batch as Normal. Internal persistence/application completions, faults and raw checkpoint events reject through this external-event planner. The worker owns their reliable delivery and checkpoint capture separately. Planning validates typed RPC payload/count bounds even while busy and uses exhaustive visitors to require a policy for future event variants. It performs no IO or Core mutation and is not itself enforcement.
 
-## Ordinary persistence worker
+## Persistence worker
 
 `Worker` in `worker.h` privately owns Core, Store, semantic recovery and scheduling state on one executor. Its IO backend is exclusive and outlives the worker and escaped recovery readers. `create()` establishes generic storage and queues typed initialization; `recover(restore_application)` verifies history and reconstructs unpublished state. `run_one(Tick)` advances bounded startup inventory and initialization before `ready()` allows protocol admission. A verified empty version 1 frontier can resume interrupted typed initialization; missing or damaged bootstrap metadata still fails closed. A restore callback builds unpublished application state, which becomes usable only after recovery succeeds.
 
@@ -50,7 +50,17 @@ Configure at least three protected Control slots, five total permits, and a Cont
 
 If occupied output or pending persistence prevents that Tick, GC retains timer debt. Ordinary admission cannot take the next idle opening until the private timer path services it. Timer-first and GC-first orderings both preserve the next ordinary foreground budget; maintenance-owned ticks do not consume that budget. Reliable completions, output draining, application failures and bounded reclamation remain available while this admission gate is active.
 
-The isolated ordinary-worker tests cover actual POSIX persistence/recovery, interrupted initialization, all-or-nothing partial pack failure, busy application completion, multiple actions in one output batch, failure while output is occupied, leader ticks under Control pressure and continuous foreground reads. Worker-owned checkpoint capture/preparation/cutover, portable snapshot installation, transport authentication and production capacity qualification remain pending. The worker is not yet used by the legacy Raft API or Detent daemons.
+The isolated worker tests cover actual POSIX persistence/recovery, interrupted initialization, all-or-nothing partial pack failure, busy application completion, multiple actions in one output batch, failure while output is occupied, leader ticks under Control pressure and continuous foreground reads. Portable snapshot installation, transport authentication and production capacity qualification remain pending. The worker is not yet used by the legacy Raft API or Detent daemons.
+
+### Worker-owned checkpoint lifecycle
+
+Call `reserve_checkpoint(application_cap)` before capturing immutable application state. It reserves the complete application artifact, maximum consensus bundle and publication footprint as one replacement. The returned `CheckpointId` belongs to this worker session; stale or foreign IDs cannot attach state or cancel another replacement. Attach `CaptureMetadata{request, through, term}` exactly once, with the image pinned at committed, applied index `through`.
+
+Stream that image with `offer_application_chunk(id, bytes, final)`. Each chunk is at most 64 KiB and copied into one fixed mailbox. `Busy` leaves the offered bytes unaccepted; retry them after pumping `run_one()`. Aggregate bytes cannot exceed the reserved cap. An empty final chunk is valid, and accepting the final marker immediately closes the stream. The caller retains the immutable capture until staging finishes or cancellation succeeds.
+
+Preparation alternates with bounded reclamation and preserves owed timer service, including while external output is occupied. Application sealing records cutover debt: ordinary admission pauses until the existing persistence chain, output and application completion drain, then Core captures the checkpoint. GC cannot erase that debt. Core stays busy while the worker encodes the bounded suffix, writes the bundle in 64 KiB slices and publishes both artifacts at its exact journal sequence. A fresh Tick precedes delivery of the matching durable completion. Reliable `Applied` remains available throughout.
+
+`cancel_checkpoint()` returns `Canceled` before Core checkpoint persistence, `TooLate` afterward, or `Stale` for another session or completed operation. Known cancellation retains the charges for written artifacts until durable reclamation removes them. Uncertain preparation or publication fences Core and Store. Staging seals artifacts without a separate full readback; reopening verifies every referenced payload and semantic bundle before publishing recovered state. A crash after publication but before Core completion restores the checkpoint and committed suffix. Tests also exercise the first durable proposal and application after publication.
 
 Create a journal explicitly, append `encode_initialization(configuration)`, and construct the empty core only after that append succeeds. Reopen by passing each verified journal batch to `Recovery::replay`, then call `finish(frontier.sequence)` only after `Journal::recover` returns successfully. Semantic replay checks configuration identity, contiguous indexes, monotonic terms and commitment, ballot lifetime, log bounds, and committed-prefix protection. Same-index/same-term entries with different content fail closed. Journal checksums alone do not establish these invariants.
 
@@ -68,13 +78,13 @@ Recover with the journal's restore callback: require the declared application de
 
 A compacted follower reports its boundary index and term. A correlated matching hint can choose the next prefix probe but never counts as an acknowledgement. A leader needing unavailable history emits one `SnapshotNeeded` for that peer; the host must keep it pending until the separate installation protocol exists. There is no implied successful catch-up. Legacy wire shapes remain unchanged.
 
-The full retained suffix is copied and encoded after freeze. Payload and entry limits bound this work, but production timing must budget its measured pause. Checkpoint publication alone does not bound accumulated disk usage; reclamation remains pending.
+The full retained suffix is copied and encoded after freeze. Payload and entry limits bound this work, but production timing must budget its measured pause. Worker-owned Store admission reserves replacement capacity before capture and charges obsolete generations until bounded, durable reclamation removes them. Backend mutation outside the exclusive Store contract invalidates these accounting guarantees.
 
 ## Bounds and current limitations
 
 Limits cap voters, entry counts, individual command payloads, aggregate retained payloads, RPC entry counts and payloads, uncommitted entry count, and pending reads. `log_bytes` and `rpc_bytes` are payload budgets; entry counts separately bound object/framing overhead. The storage decoder caps payload and framing before allocation. A future wire decoder must independently cap the complete encoded and decompressed message before building these typed events, and the transport must bound its own queues.
 
-Admission stops before the retained-log entry limit, reserving control entries for elections. Exhausting that finite reserve prevents publishing another leader without its no-op. Term exhaustion never wraps. Checkpoint recovery requires an exact included index/term and an application cursor at that included index. Log reclamation, snapshot installation, configuration changes, authenticated transport, and production capacity remain later gates. Continuously available writes at retained-history capacity are not yet supported.
+Admission stops before the retained-log entry limit, reserving control entries for elections. Exhausting that finite reserve prevents publishing another leader without its no-op. Term exhaustion never wraps. Checkpoint recovery requires an exact included index/term and an application cursor at that included index. Portable snapshot installation, configuration changes, authenticated transport and production capacity remain later gates. Checkpoints reclaim retained history; continuously available fleet writes still require those integration and qualification gates.
 
 ## Qualification
 
@@ -101,3 +111,17 @@ Const-reference semantic validation and encoding now avoid two unnecessary suffi
 | 65,535 | 0.062530 | 0.062465 | 0.326839 | 0.240048 | 0.389764 | 286,265,344 |
 
 For the large fixture, process peak RSS falls from approximately 546 MiB to 273 MiB, and the measured full freeze from 635 ms to 390 ms. The encoded bundle remains exactly 68,484,227 bytes; validation and durable ordering remain intact. The same single-sample and process-lifetime limitations apply, and 390 ms still needs an explicit production timing budget.
+
+## Worker checkpoint measurement
+
+`consensus_worker_checkpoint_bench` measures the complete owned lifecycle with a 1 MiB immutable application image and a retained command suffix at the default Core limits. Setup seeds real durable journal batches of at most 256 entries and recovers them through Worker. This exercises a maximum legal recovered log, not ordinary proposal throughput. Run the Release executable from the repository root; its dedicated scratch directories are removed after each case.
+
+Single samples on the same Intel/macOS/AppleClang Release setup on October 3, 2026 were:
+
+| Suffix commands | Bundle bytes | Whole checkpoint wall s | CPU s | Core freeze wall s | CPU s | Longest frozen turn wall s | CPU s | Process peak RSS bytes |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 64 | 67,032 | 0.154070 | 0.008895 | 0.104915 | 0.002567 | 0.062957 | 0.001341 | 2,670,592 |
+| 4,096 | 4,280,472 | 0.181037 | 0.031619 | 0.133159 | 0.026329 | 0.064627 | 0.004445 | 24,391,680 |
+| 65,535 | 68,484,227 | 0.587517 | 0.371868 | 0.519703 | 0.367490 | 0.082745 | 0.079962 | 291,508,224 |
+
+Whole-checkpoint time includes streamed application preparation. Core freeze starts immediately before the capture turn and ends after matching completion and compaction; ordinary admission pauses earlier when application sealing records cutover debt. The longest frozen turn exposes whole-suffix capture/encoding and durability-call pauses despite chunked bundle writes. RSS is process-lifetime peak, including fixture construction and earlier cases. These samples establish neither tails nor production capacity, and do not support energy or dollar savings claims. They are not a paired comparison with the earlier adapter benchmark.
