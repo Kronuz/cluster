@@ -72,6 +72,32 @@ public:
 			limits.log_bytes < limits.rpc_bytes || limits.log_entries == 0) { throw std::invalid_argument("invalid storage recovery configuration or limits"); }
 		state_.configuration = expected_;
 	}
+	// Only the checkpoint adapter supplies this state, after validating the
+	// bundle's storage sequence and explicit application dependency.
+	void restore(RecoveredState state, std::uint64_t covered_sequence) {
+		if (finished_ || failed_ || sequence_ != 0) { throw std::logic_error("checkpoint restoration unavailable"); }
+		try {
+			if (covered_sequence == 0 || state.configuration != expected_ || state.base_index == 0 ||
+				state.base_index >= std::numeric_limits<Index>::max() || state.base_term == 0 || state.base_term > state.hard.term ||
+				state.applied_index != state.base_index || state.hard.commit_index < state.base_index ||
+				state.entries.size() > limits_.log_entries || state.entries.size() >= std::numeric_limits<Index>::max() - state.base_index ||
+				state.hard.commit_index > state.base_index + state.entries.size() ||
+				(state.hard.voted_for && std::find(expected_.voters.begin(), expected_.voters.end(), *state.hard.voted_for) == expected_.voters.end())) {
+				throw storage_detail::Corruption("invalid consensus checkpoint state");
+			}
+			Term previous = state.base_term; std::size_t bytes = 0;
+			for (std::size_t i = 0; i < state.entries.size(); ++i) {
+				const auto& entry = state.entries[i];
+				if (entry.index != state.base_index + i + 1 || entry.term == 0 || entry.term < previous || entry.term > state.hard.term ||
+					entry.payload.size() > limits_.command_bytes || entry.payload.size() > limits_.log_bytes - bytes ||
+					(entry.kind != EntryKind::Command && entry.kind != EntryKind::NoOp) || (entry.kind == EntryKind::NoOp && !entry.payload.empty())) {
+					throw storage_detail::Corruption("invalid consensus checkpoint suffix");
+				}
+				previous = entry.term; bytes += entry.payload.size();
+			}
+			state_ = std::move(state); bytes_ = bytes; sequence_ = covered_sequence;
+		} catch (...) { failed_ = true; throw; }
+	}
 	void replay(std::uint64_t sequence, std::string_view bytes) {
 		using namespace storage_detail;
 		if (finished_ || failed_) { throw std::logic_error("recovery unavailable"); }
@@ -143,25 +169,25 @@ private:
 		auto new_count = state_.entries.size(); auto new_bytes = bytes_;
 		if (batch.log) {
 			auto from = batch.log->replace_from;
-			if (from == 0 || from <= state_.hard.commit_index || from - 1 > state_.entries.size() ||
-				batch.log->entries.size() > limits_.log_entries - static_cast<std::size_t>(from - 1)) { throw Corruption("invalid logical log replacement"); }
-			new_count = static_cast<std::size_t>(from - 1) + batch.log->entries.size();
-			for (std::size_t i = static_cast<std::size_t>(from - 1); i < state_.entries.size(); ++i) { new_bytes -= state_.entries[i].payload.size(); }
-			Term term = from == 1 ? 0 : state_.entries[from - 2].term;
+			if (from == 0 || from <= state_.hard.commit_index || from <= state_.base_index || from - state_.base_index - 1 > state_.entries.size() ||
+				batch.log->entries.size() > limits_.log_entries - static_cast<std::size_t>(from - state_.base_index - 1)) { throw Corruption("invalid logical log replacement"); }
+			new_count = static_cast<std::size_t>(from - state_.base_index - 1) + batch.log->entries.size();
+			for (std::size_t i = static_cast<std::size_t>(from - state_.base_index - 1); i < state_.entries.size(); ++i) { new_bytes -= state_.entries[i].payload.size(); }
+			Term term = from == state_.base_index + 1 ? state_.base_term : state_.entries[from - state_.base_index - 2].term;
 			Index index = from;
 			for (const auto& entry : batch.log->entries) {
 				if (entry.index != index++ || entry.index >= std::numeric_limits<Index>::max() || entry.term == 0 || entry.term < term ||
 					entry.term > hard.term || (entry.kind == EntryKind::NoOp && !entry.payload.empty()) ||
 					entry.payload.size() > limits_.log_bytes - new_bytes) { throw Corruption("invalid logical replacement entry"); }
-				if (entry.index <= state_.entries.size() && state_.entries[entry.index - 1].term == entry.term && state_.entries[entry.index - 1] != entry) {
+				if (entry.index <= state_.base_index + state_.entries.size() && state_.entries[entry.index - state_.base_index - 1].term == entry.term && state_.entries[entry.index - state_.base_index - 1] != entry) {
 					throw Corruption("same-index same-term storage content conflict");
 				}
 				new_bytes += entry.payload.size(); term = entry.term;
 			}
 		}
-		if (hard.commit_index > new_count) { throw Corruption("commit beyond recovered log"); }
+		if (hard.commit_index > state_.base_index + new_count) { throw Corruption("commit beyond recovered log"); }
 		if (batch.log) {
-			state_.entries.resize(static_cast<std::size_t>(batch.log->replace_from - 1));
+			state_.entries.resize(static_cast<std::size_t>(batch.log->replace_from - state_.base_index - 1));
 			for (auto& entry : batch.log->entries) { state_.entries.push_back(std::move(entry)); }
 		}
 		state_.hard = hard; bytes_ = new_bytes;

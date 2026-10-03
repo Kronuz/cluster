@@ -40,14 +40,39 @@ Create a journal explicitly, append `encode_initialization(configuration)`, and 
 
 The restarted application rebuilds state only through the durable commit index. External effects need their own idempotency. Do not erase a voter's state and rejoin under its old identity: its forgotten ballot invalidates crash-recovery assumptions. Node replacement and restore epochs require explicit provisioning.
 
+## Local immutable checkpoints
+
+The host pins an immutable application capture at committed, applied index `A`, prepares its artifact on the storage executor, and optionally verifies it before requesting cutover. `LocalCheckpoint` carries that host-owned capture token, `A`, its term, and cluster/configuration identities. The core admits a started, idle request only when its included boundary matches the retained committed log. Followers can checkpoint too. Serialization must use the pinned image at `A`, not mutable application state that has advanced since capture.
+
+`PersistCheckpoint` reserves the same exclusive persistence slot as ordinary storage batches. It captures current durable HardState and every entry after `A`, including uncommitted entries, with the persisted application cursor set to `A`. The ordered storage worker records its exact current journal sequence `S`, encodes a `CheckpointBundle` binding `S` and the application descriptor, prepares the bundle, then publishes both through the journal. `A` is a log/application index; `S` is a storage-operation sequence.
+
+Matching `Persisted` alone compacts the live prefix through `A`. Newer live application progress, outstanding delivered ranges, pending reads, and genuine peer matches survive. Reliable `Applied` completions remain accepted during cutover. Any preparation or readback failure that fences the journal requires trusted local `StorageFault`, which fences the core even without a pending batch. Correlated `Failed` remains appropriate for the current persistence operation.
+
+Recover with the journal's restore callback: require the declared application dependency, decode the bundle against that exact descriptor and `frontier.base_sequence`, call `Recovery::restore`, then replay suffix batches. Call `finish` only after the entire journal recovery succeeds. Recover the application image at `A` and apply committed entries above it again. Never import these local hard-state/configuration bundles as network snapshots; portable installation is a separate protocol.
+
+A compacted follower reports its boundary index and term. A correlated matching hint can choose the next prefix probe but never counts as an acknowledgement. A leader needing unavailable history emits one `SnapshotNeeded` for that peer; the host must keep it pending until the separate installation protocol exists. There is no implied successful catch-up. Legacy wire shapes remain unchanged.
+
+The full retained suffix is copied and encoded after freeze. Payload and entry limits bound this work, but production timing must budget its measured pause. Checkpoint publication alone does not bound accumulated disk usage; reclamation remains pending.
+
 ## Bounds and current limitations
 
 Limits cap voters, entry counts, individual command payloads, aggregate retained payloads, RPC entry counts and payloads, uncommitted entry count, and pending reads. `log_bytes` and `rpc_bytes` are payload budgets; entry counts separately bound object/framing overhead. The storage decoder caps payload and framing before allocation. A future wire decoder must independently cap the complete encoded and decompressed message before building these typed events, and the transport must bound its own queues.
 
-Admission stops before the retained-log entry limit, reserving control entries for elections. Exhausting that finite reserve prevents publishing another leader without its no-op. Term exhaustion never wraps. Checkpoint recovery is deliberately rejected in this milestone: base index, base term, and recovered application index must be zero. Durable checkpoints, log reclamation, snapshot installation, configuration changes, authenticated transport, and production capacity remain later gates. Continuously available writes at retained-history capacity are not yet supported.
+Admission stops before the retained-log entry limit, reserving control entries for elections. Exhausting that finite reserve prevents publishing another leader without its no-op. Term exhaustion never wraps. Checkpoint recovery requires an exact included index/term and an application cursor at that included index. Log reclamation, snapshot installation, configuration changes, authenticated transport, and production capacity remain later gates. Continuously available writes at retained-history capacity are not yet supported.
 
 ## Qualification
 
 Native AppleClang 17 and Clang 23 AddressSanitizer/UndefinedBehaviorSanitizer Release tests pass the recorded schedules. The deterministic host tests actual persistence/application completions and semantic operation replay. A POSIX integration test writes through the journal, reopens it, and reconstructs committed consensus state. Focused cases cover barriers, wrong completion tokens, affirmative majorities, inherited-prefix commitment through a no-op, simultaneous disk/application work, isolated-leader reads, overlapping reads, blocked application, partial quorum, capacity backoff, stale RPCs, failed storage transitions, semantic corruption, control reserve exhaustion, and maximum terms.
 
 Two reproducible 1,000-step schedules use three voters (seed `1380009556`) and five voters (seed `1129076051`). They vary loss, duplication, reordering, partitions, and durable restarts, check agreement of applied prefixes, and require convergence after healing. These are schedule coverage, not exhaustive model checking or production consensus certification. The standalone build fetches neither Asio nor reactor. [Raft's specification](https://raft.github.io/raft.pdf) is the algorithm reference; [the journal contract](../journal/README.md) records filesystem and hardware assumptions.
+
+## Local checkpoint measurement
+
+`consensus_checkpoint_bench` establishes its fixture through bounded durable batches, then measures the freeze from `LocalCheckpoint` through matching `Persisted` and compaction. Application-artifact preparation and verification are excluded. On the Intel Core i9-9980HK/macOS 15.8.1/AppleClang 17 Release setup, single samples on October 2, 2026 were:
+
+| Retained entries | Payload bytes | Encoded bundle bytes | Capture wall s | Capture CPU s | Encode/write/publish wall s | CPU s | Full frozen wall s | Process peak RSS bytes |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | 1,024 | 1,197 | 0.000006 | 0.000011 | 0.085114 | 0.002370 | 0.085141 | 946,176 |
+| 65,535 | 67,107,840 | 68,484,227 | 0.064412 | 0.064330 | 0.570458 | 0.477923 | 0.635166 | 572,751,872 |
+
+The largest fixture reserves one retained slot for its included no-op; its command suffix approaches the default 64 MiB payload bound. Process peak RSS comes from `getrusage`, includes fixture initialization and earlier cases, and is not incremental daemon memory. The suffix capture, owning bundle argument, validation state, and encoded buffer coexist, so bounded payloads still require a larger memory budget. These single samples do not establish tail latency, fleet capacity, energy, or cost. Run `.scratch/consensus/consensus_checkpoint_bench` from the repository root; its dedicated scratch directories are removed after each case. Production integration must budget this pause or change the mechanism.

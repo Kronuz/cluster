@@ -77,6 +77,7 @@ struct AppendRequest {
 	Token read_probe;
 	std::vector<Entry> entries;
 };
+struct LogBoundary { Index index; Term term; };
 struct AppendResponse {
 	Term term;
 	Token rpc;
@@ -84,6 +85,7 @@ struct AppendResponse {
 	Index matched;
 	Index next_hint;
 	Token read_probe;
+	std::optional<LogBoundary> compacted{};
 };
 using Message = std::variant<VoteRequest, VoteResponse, AppendRequest, AppendResponse>;
 
@@ -96,13 +98,19 @@ struct Propose { RequestId request; std::string command; };
 struct Read { RequestId request; };
 struct Persisted { Token token; };
 struct Applied { Index through; };
+// The host owns the immutable application capture identified by capture.
+struct LocalCheckpoint { RequestId request; Token capture; Index through; Term term; Identity cluster, configuration; };
+struct StorageFault { std::string error; };
 enum class FailureSource { Storage, Application };
 struct Failed { FailureSource source; Token token; std::string error; };
-using Event = std::variant<Start, Tick, Receive, Propose, Read, Persisted, Applied, Failed>;
+using Event = std::variant<Start, Tick, Receive, Propose, Read, Persisted, Applied, Failed, LocalCheckpoint, StorageFault>;
 
 enum class Role { Follower, Candidate, Leader, Fenced };
-enum class RejectReason { Busy, NotLeader, NotReady, LogFull, TooLarge, DuplicateRequest };
+enum class RejectReason { Busy, NotLeader, NotReady, LogFull, TooLarge, DuplicateRequest, InvalidCheckpoint };
 struct Persist { Token token; StorageBatch batch; };
+struct PersistCheckpoint { Token token; Token capture; RecoveredState state; };
+struct CheckpointPublished { RequestId request; Index through; };
+struct SnapshotNeeded { NodeId peer; Index through; Term term; };
 struct Send { NodeId peer; Message message; };
 struct ProposalPlaced { RequestId request; Term term; Index index; };
 struct Committed { Index first; std::vector<Entry> entries; };
@@ -110,7 +118,7 @@ struct ReadReady { RequestId request; Index index; };
 struct RoleChanged { Role role; Term term; NodeId leader; };
 struct Reject { RequestId request; RejectReason reason; };
 struct Fenced { std::string reason; };
-using Action = std::variant<Persist, Send, ProposalPlaced, Committed, ReadReady, RoleChanged, Reject, Fenced>;
+using Action = std::variant<Persist, Send, ProposalPlaced, Committed, ReadReady, RoleChanged, Reject, Fenced, PersistCheckpoint, CheckpointPublished, SnapshotNeeded>;
 using Actions = std::vector<Action>;
 
 } // namespace cluster::consensus

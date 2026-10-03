@@ -1,5 +1,6 @@
 #include "consensus/core.h"
 #include "consensus/storage.h"
+#include "consensus/checkpoint.h"
 #include "journal/journal.h"
 #include "journal/posix.h"
 #include <deque>
@@ -350,6 +351,157 @@ void bounds_and_semantic_recovery() {
 		"strict election terms cannot wrap after exhaustion");
 }
 
+
+void local_checkpoint_core() {
+	auto state = empty(1); state.hard = HardState{1, 2, 3};
+	for (Index index = 1; index <= 4; ++index) { state.entries.push_back(Entry{index, 1, EntryKind::Command, "value"}); }
+	Limits limits; limits.rpc_entries = 1;
+	Core core(config(1), state, limits);
+	core.step(Start{}); auto second = core.step(Applied{1});
+	check(find<Committed>(second) && find<Committed>(second)->first == 2, "checkpoint fixture has an outstanding application range");
+	auto invalid = core.step(LocalCheckpoint{10, 7, 2, 1, config(1).cluster, config(1).configuration});
+	check(find<Reject>(invalid) && !core.busy(), "checkpoint cannot include unapplied state");
+	auto action = core.step(LocalCheckpoint{11, 7, 1, 1, config(1).cluster, config(1).configuration});
+	auto checkpoint = find<PersistCheckpoint>(action);
+	check(checkpoint && checkpoint->state.base_index == 1 && checkpoint->state.applied_index == 1 && checkpoint->state.entries.size() == 3 && checkpoint->state.entries.back().index == 4,
+		"checkpoint captures the full suffix including uncommitted entries");
+	if (!checkpoint) { return; }
+	auto token = checkpoint->token;
+	check(core.step(Persisted{token + 1}).empty() && core.base_index() == 0, "wrong checkpoint completion cannot compact");
+	auto rejected = core.step(Propose{12, "busy"}); check(find<Reject>(rejected), "checkpoint cutover reserves persistence admission");
+	core.step(Applied{2}); check(core.applied() == 2 && core.base_index() == 0, "reliable application completion survives pending checkpoint");
+	auto completion = core.step(Persisted{token});
+	check(core.base_index() == 1 && core.applied() == 2 && core.last_index() == 4 && find<CheckpointPublished>(completion), "checkpoint completion preserves newer live application state");
+	check(find<Committed>(completion) && find<Committed>(completion)->first == 3, "checkpoint completion delivers only remaining unapplied entries");
+	core.step(Applied{3});
+	check(core.step(Persisted{token}).empty() && core.base_index() == 1, "duplicate checkpoint completion cannot compact twice");
+	auto prefix = core.step(Receive{2, AppendRequest{1, 90, 0, 0, 3, 0, {}}});
+	auto reply = find<Send>(prefix);
+	check(reply && std::get<AppendResponse>(reply->message).compacted && std::get<AppendResponse>(reply->message).compacted->index == 1, "compacted follower reports its explicit boundary");
+	Core restored(config(1), checkpoint->state, limits); auto replay = restored.step(Start{});
+	check(restored.applied() == 1 && find<Committed>(replay) && find<Committed>(replay)->first == 2, "checkpoint restart replays committed suffix above application boundary");
+	auto failure = restored.step(StorageFault{"artifact preparation failed"});
+	check(restored.role() == Role::Fenced && find<Fenced>(failure), "out-of-band storage failure fences without pending persistence");
+}
+
+
+void compacted_index_exhaustion() {
+	for (Index base : {std::numeric_limits<Index>::max() - 1, std::numeric_limits<Index>::max() - 2}) {
+		auto state = empty(1, 1); state.base_index = state.applied_index = state.hard.commit_index = base;
+		state.base_term = state.hard.term = 1;
+		Core core(config(1, 1), state); core.step(Start{}); auto election = core.step(Tick{100, 100});
+		auto vote = find<Persist>(election); check(vote, "near-exhausted voter durably records its ballot"); if (!vote) { continue; }
+		auto elected = core.step(Persisted{vote->token});
+		if (base == std::numeric_limits<Index>::max() - 1) {
+			check(core.role() == Role::Follower && !find<Persist>(elected) && core.last_index() == base, "index exhaustion prevents an unrepresentable election no-op");
+		} else {
+			auto noop = find<Persist>(elected); check(noop && noop->batch.log->entries.back().index == base + 1, "final representable election no-op remains admissible");
+			if (!noop) { continue; } auto commit = core.step(Persisted{noop->token}); auto persist_commit = find<Persist>(commit);
+			if (persist_commit) { core.step(Persisted{persist_commit->token}); }
+			auto proposal = core.step(Propose{1, "cannot wrap"});
+			check(find<Reject>(proposal) && !find<Persist>(proposal) && core.last_index() == base + 1, "index exhaustion rejects proposal without wraparound");
+		}
+	}
+}
+
+
+
+const AppendRequest* append_to(const Actions& actions, NodeId peer) {
+	for (const auto& action : actions) {
+		if (auto send = std::get_if<Send>(&action); send && send->peer == peer) {
+			if (auto request = std::get_if<AppendRequest>(&send->message)) { return request; }
+		}
+	}
+	return nullptr;
+}
+Actions elect_checkpoint_fixture(Core& core) {
+	core.step(Start{}); if (core.committed() > core.applied()) { core.step(Applied{core.committed()}); }
+	auto election = core.step(Tick{100, 100}); auto vote = find<Persist>(election);
+	if (!vote) { throw std::runtime_error("fixture election ballot"); }
+	core.step(Persisted{vote->token}); auto majority = core.step(Receive{2, VoteResponse{core.term(), true}});
+	auto noop = find<Persist>(majority); if (!noop) { throw std::runtime_error("fixture no-op"); }
+	return core.step(Persisted{noop->token});
+}
+void compacted_replication() {
+	auto state = empty(1); state.hard = HardState{1, 1, 2};
+	for (Index index = 1; index <= 3; ++index) { state.entries.push_back(Entry{index, 1, EntryKind::Command, "value"}); }
+	Core core(config(1), state); auto traffic = elect_checkpoint_fixture(core); auto first = append_to(traffic, 2);
+	if (!first) { throw std::runtime_error("fixture first flight"); }
+	auto rewind = core.step(Receive{2, AppendResponse{2, first->rpc, false, 0, 1, 0}}); auto old = append_to(rewind, 2);
+	if (!old) { throw std::runtime_error("fixture prefix flight"); }
+	auto hint = core.step(Receive{2, AppendResponse{2, old->rpc, false, 0, 3, 0, LogBoundary{2, 1}}});
+	check(core.committed() == 2 && !find<Persist>(hint), "compacted boundary hint grants no commitment evidence");
+	auto retry = core.step(Tick{140, 100}); auto verified = append_to(retry, 2);
+	check(verified && verified->previous == 2, "compacted boundary selects a fresh Append prefix to verify");
+	if (!verified) { return; }
+	auto advance = core.step(Receive{2, AppendResponse{2, verified->rpc, true, 4, 5, verified->read_probe}});
+	auto commit = find<Persist>(advance); check(commit && core.committed() == 2, "verified fresh Append stages commitment behind durability");
+	if (!commit) { return; } core.step(Persisted{commit->token}); core.step(Applied{4});
+	auto read = core.step(Read{80}); auto probe = append_to(read, 2); if (!probe) { throw std::runtime_error("fixture read probe"); }
+	auto no_quorum = core.step(Receive{2, AppendResponse{2, probe->rpc, false, 0, 5, probe->read_probe, LogBoundary{4, 2}}});
+	check(!find<ReadReady>(no_quorum), "compacted hint contributes no fresh read quorum");
+	auto retries = core.step(Tick{180, 100}); auto fresh = append_to(retries, 2);
+	if (!fresh) { throw std::runtime_error("fixture fresh read probe"); }
+	auto ready = core.step(Receive{2, AppendResponse{2, fresh->rpc, true, 4, 5, fresh->read_probe}});
+	check(find<ReadReady>(ready), "fresh verified Append establishes the pending read quorum");
+
+	state.base_index = state.applied_index = 2; state.base_term = 1; state.entries.erase(state.entries.begin(), state.entries.begin() + 2);
+	Core compacted(config(1), state); auto election = elect_checkpoint_fixture(compacted); auto append = append_to(election, 2);
+	if (!append) { throw std::runtime_error("compacted fixture flight"); }
+	auto needed = compacted.step(Receive{2, AppendResponse{2, append->rpc, false, 0, 1, 0}});
+	check(find<SnapshotNeeded>(needed), "leader requests snapshot when a peer needs compacted history");
+	for (std::uint64_t tick = 140; tick <= 340; tick += 40) {
+		auto actions = compacted.step(Tick{tick, 100});
+		check(!find<SnapshotNeeded>(actions) && compacted.role() == Role::Leader, "lagging peer cannot spin snapshot requests or fence leader");
+	}
+
+
+	auto empty_suffix = empty(1); empty_suffix.base_index = empty_suffix.applied_index = empty_suffix.hard.commit_index = 2;
+	empty_suffix.base_term = empty_suffix.hard.term = 1;
+	Core boundary_only(config(1), empty_suffix); auto boundary_traffic = elect_checkpoint_fixture(boundary_only); auto boundary_append = append_to(boundary_traffic, 2);
+	if (!boundary_append) { throw std::runtime_error("empty suffix flight"); }
+	check(boundary_append->previous == 2 && boundary_append->previous_term == 1, "empty retained suffix election uses checkpoint boundary term");
+	auto boundary_ack = boundary_only.step(Receive{2, AppendResponse{2, boundary_append->rpc, true, 3, 4, 0}}); auto boundary_commit = find<Persist>(boundary_ack);
+	if (!boundary_commit) { throw std::runtime_error("empty suffix commit"); } boundary_only.step(Persisted{boundary_commit->token}); boundary_only.step(Applied{3});
+	auto boundary_read = boundary_only.step(Read{81}); auto boundary_probe = append_to(boundary_read, 2);
+	if (!boundary_probe) { throw std::runtime_error("empty suffix read"); }
+	auto boundary_ready = boundary_only.step(Receive{2, AppendResponse{2, boundary_probe->rpc, true, 3, 4, boundary_probe->read_probe}});
+	check(find<ReadReady>(boundary_ready), "empty recovered suffix supports election replication and fresh quorum reads");
+
+	state = empty(1); state.hard = HardState{1, 1, 2};
+	for (Index index = 1; index <= 3; ++index) { state.entries.push_back(Entry{index, 1, EntryKind::Command, "value"}); }
+	Core crossing(config(1), state); traffic = elect_checkpoint_fixture(crossing); first = append_to(traffic, 2);
+	rewind = crossing.step(Receive{2, AppendResponse{2, first->rpc, false, 0, 1, 0}}); old = append_to(rewind, 2);
+	if (!old) { throw std::runtime_error("crossing fixture flight"); } auto rpc = old->rpc;
+	auto publication = crossing.step(LocalCheckpoint{90, 1, 2, 1, config(1).cluster, config(1).configuration}); auto checkpoint = find<PersistCheckpoint>(publication);
+	if (!checkpoint) { throw std::runtime_error("crossing fixture checkpoint"); } crossing.step(Persisted{checkpoint->token});
+	auto acknowledged = crossing.step(Receive{2, AppendResponse{2, rpc, true, 4, 5, 0}});
+	check(crossing.base_index() == 2 && crossing.role() == Role::Leader && find<Persist>(acknowledged), "pre-cutover flight verifies its original suffix after local compaction");
+}
+
+void checkpoint_semantic_recovery() {
+	auto state = empty(1); state.base_index = state.applied_index = 5; state.base_term = state.hard.term = 2; state.hard.commit_index = 260;
+	for (Index index = 6; index <= 265; ++index) { state.entries.push_back(Entry{index, 2, EntryKind::Command, "retained"}); }
+	kronuz::journal::ArtifactDescriptor application{}; application.identity[0] = 'A'; application.length = 17; application.checksum = 42;
+	auto bytes = encode_checkpoint(CheckpointBundle{40, application, state});
+	auto decoded = decode_checkpoint(bytes, config(1), 40, application);
+	check(decoded.state.entries.size() == 260, "checkpoint decoder uses retained-log bound rather than Append RPC entry bound");
+	Recovery recovery(config(1)); recovery.restore(std::move(decoded.state), 40);
+	recovery.replay(41, encode_storage_batch(StorageBatch{HardState{3, 2, 260}, LogMutation{261, {{261, 3, EntryKind::Command, "replacement"}}}}));
+	auto restored = recovery.finish(41);
+	check(restored.base_index == 5 && restored.applied_index == 5 && restored.entries.back().index == 261 && restored.hard.commit_index == 260,
+		"checkpoint semantic replay replaces only the uncommitted suffix with base-aware offsets");
+	for (std::size_t length = 0; length < bytes.size(); ++length) {
+		check(throws([&] { decode_checkpoint(std::string_view(bytes).substr(0, length), config(1), 40, application); }), "every truncated checkpoint bundle fails closed");
+	}
+	check(throws([&] { decode_checkpoint(bytes, config(2), 40, application); }), "checkpoint cannot import another local voter identity");
+	check(throws([&] { decode_checkpoint(bytes, config(1), 41, application); }), "checkpoint cannot substitute covered storage sequence");
+	auto different = application; ++different.length;
+	check(throws([&] { decode_checkpoint(bytes, config(1), 40, different); }), "checkpoint application reference must match manifest dependency");
+	state.hard.commit_index = 4;
+	check(throws([&] { encode_checkpoint(CheckpointBundle{40, application, state}); }), "checkpoint cannot exceed durable commitment");
+}
+
 void real_journal_integration() {
 	auto directory = std::filesystem::current_path() / ".scratch" / ("consensus-journal-" + std::to_string(::getpid()));
 	std::filesystem::create_directories(directory); ::chmod(directory.c_str(), 0700);
@@ -360,6 +512,7 @@ void real_journal_integration() {
 		kronuz::journal::Identity identity{}; identity[0] = 'J'; journal.create(identity);
 		journal.append_batch(encode_initialization(config(1, 1)));
 		Core core(config(1, 1), empty(1, 1));
+		std::optional<kronuz::journal::PreparedArtifact> application;
 		std::deque<Action> actions;
 		auto enqueue = [&](Actions next) { for (auto& action : next) { actions.push_back(std::move(action)); } };
 		auto pump = [&] {
@@ -368,6 +521,17 @@ void real_journal_integration() {
 				if (auto persist = std::get_if<Persist>(&action)) {
 					journal.append_batch(encode_storage_batch(persist->batch));
 					enqueue(core.step(Persisted{persist->token}));
+				} else if (auto checkpoint = std::get_if<PersistCheckpoint>(&action)) {
+					if (!application) { throw std::logic_error("missing immutable capture"); }
+					auto sequence = journal.frontier().sequence;
+					auto bytes = encode_checkpoint(CheckpointBundle{sequence, application->descriptor(), checkpoint->state});
+					auto builder = journal.prepare_artifact();
+					while (!bytes.empty()) {
+						auto count = std::min(bytes.size(), std::size_t(64 * 1024)); builder.append_chunk(std::string_view(bytes).substr(0, count)); bytes.erase(0, count);
+					}
+					auto bundle = builder.finish(); journal.publish_checkpoint(bundle, std::array{*application}, sequence);
+					// Simulate process death after durable publication but before
+					// delivering the completion to the old protocol executor.
 				} else if (auto committed = std::get_if<Committed>(&action)) {
 					for (const auto& entry : committed->entries) { if (entry.kind == EntryKind::Command) { commands.push_back(entry.payload); } }
 					enqueue(core.step(Applied{committed->entries.back().index}));
@@ -378,16 +542,39 @@ void real_journal_integration() {
 		enqueue(core.step(Propose{1, "durable command"})); pump();
 		check(core.committed() == 2 && core.applied() == 2 && commands == std::vector<std::string>{"durable command"},
 			"real POSIX journal establishes every consensus persistence completion");
+		// Pin nonempty application state at A=2, then advance the live state
+		// before publishing the older image and its retained command suffix.
+		auto builder = journal.prepare_artifact(); builder.append_chunk("durable command"); application = builder.finish();
+		enqueue(core.step(Propose{2, "after snapshot"})); pump();
+		enqueue(core.step(LocalCheckpoint{3, 1, 2, 1, config(1, 1).cluster, config(1, 1).configuration})); pump();
+		check(core.base_index() == 0 && core.applied() == 3 && core.busy(), "durable checkpoint cannot compact the old core without its completion");
 	}
 	{
 		kronuz::journal::PosixIO io(directory); kronuz::journal::Journal journal(io, 1024 * 1024);
-		Recovery recovery(config(1, 1));
-		auto frontier = journal.recover([&](auto sequence, std::string_view batch) { recovery.replay(sequence, batch); });
+		Recovery recovery(config(1, 1)); std::vector<std::string> restored_commands;
+		auto frontier = journal.recover([&](auto sequence, std::string_view batch) { recovery.replay(sequence, batch); },
+			[&](const auto& selected, auto& bundle, auto dependencies) {
+				if (dependencies.size() != 1 || selected.dependencies.size() != 1) { throw std::runtime_error("checkpoint dependency count"); }
+				std::string bytes(static_cast<std::size_t>(bundle.descriptor().length), '\0'); std::size_t offset = 0;
+				while (offset < bytes.size()) { auto count = std::min(bytes.size() - offset, std::size_t(64 * 1024)); offset += bundle.read_at(offset, std::span<char>(bytes.data() + offset, count)); }
+				auto decoded = decode_checkpoint(bytes, config(1, 1), selected.base_sequence, selected.dependencies[0]);
+				recovery.restore(std::move(decoded.state), decoded.storage_sequence);
+				std::string image(static_cast<std::size_t>(dependencies[0].descriptor().length), '\0');
+				std::size_t read = 0;
+				while (read < image.size()) { read += dependencies[0].read_at(read, std::span<char>(image.data() + read, image.size() - read)); }
+				restored_commands.push_back(std::move(image));
+			});
 		auto state = recovery.finish(frontier.sequence);
-		check(state.hard.commit_index == 2 && state.entries.size() == 2, "actual journal reopening reconstructs strict committed state");
+		check(state.base_index == 2 && state.hard.commit_index == 3 && state.entries.size() == 1, "actual journal reopening reconstructs strict committed state");
 		Core restored(config(1, 1), std::move(state)); auto committed = restored.step(Start{});
 		auto delivery = find<Committed>(committed);
-		check(delivery && delivery->entries.back().payload == "durable command", "restored application delivery includes durable command");
+		check(delivery && delivery->entries.back().payload == "after snapshot", "restored application delivery includes only committed suffix command");
+		if (delivery) {
+			for (const auto& entry : delivery->entries) { if (entry.kind == EntryKind::Command) { restored_commands.push_back(entry.payload); } }
+			restored.step(Applied{delivery->entries.back().index});
+		}
+		check(restored_commands == std::vector<std::string>{"durable command", "after snapshot"} && restored.applied() == 3,
+			"crash between publication and completion restores nonempty application state and replays suffix exactly once");
 	}
 }
 
@@ -447,7 +634,7 @@ void reordered_crash_schedules(std::size_t voters, std::uint64_t seed) {
 } // namespace
 
 int main() {
-	try { persistence_barriers(); replication_and_restart(); affirmative_majority_and_inheritance(); simultaneous_completions(); reads_and_partitions(); overlapping_reads_preserve_data(); application_lag_does_not_spin_reads(); stale_rpc_and_failure_transitions(); bounds_and_semantic_recovery(); real_journal_integration(); reordered_crash_schedules(3, 0x52414654); reordered_crash_schedules(5, 0x434c5553); }
+	try { persistence_barriers(); replication_and_restart(); affirmative_majority_and_inheritance(); simultaneous_completions(); reads_and_partitions(); overlapping_reads_preserve_data(); application_lag_does_not_spin_reads(); stale_rpc_and_failure_transitions(); bounds_and_semantic_recovery(); local_checkpoint_core(); compacted_index_exhaustion(); compacted_replication(); checkpoint_semantic_recovery(); real_journal_integration(); reordered_crash_schedules(3, 0x52414654); reordered_crash_schedules(5, 0x434c5553); }
 	catch (const std::exception& error) { check(false, error.what()); }
 	std::cout << checks << " consensus checks, " << failures << " failures\n";
 	return failures ? 1 : 0;
