@@ -40,19 +40,45 @@ inline std::string encode_initialization(const FixedConfiguration& configuration
 	return result;
 }
 
+// The framing bound is shared by encoding and pre-event storage admission.
+inline std::size_t storage_batch_size(bool hard, bool log, std::size_t entries = 0, std::size_t payload_bytes = 0) {
+	if ((!log && (entries || payload_bytes)) || (!entries && payload_bytes) ||
+		entries > std::numeric_limits<std::uint32_t>::max()) {
+		throw std::length_error("invalid storage batch shape");
+	}
+	std::size_t result = 10 + (hard ? 24 : 0) + (log ? 12 : 0);
+	auto maximum = std::numeric_limits<std::size_t>::max();
+	if (entries > (maximum - result) / 21) { throw std::length_error("storage batch size overflow"); }
+	result += 21 * entries;
+	if (payload_bytes > maximum - result) { throw std::length_error("storage batch size overflow"); }
+	return result + payload_bytes;
+}
+
+inline std::size_t storage_batch_size(const StorageBatch& batch) {
+	std::size_t result = storage_batch_size(batch.hard.has_value(), batch.log.has_value(), batch.log ? batch.log->entries.size() : 0);
+	if (batch.log) {
+		for (const auto& entry : batch.log->entries) {
+			if (entry.payload.size() > std::numeric_limits<std::uint32_t>::max() ||
+				entry.payload.size() > std::numeric_limits<std::size_t>::max() - result) {
+				throw std::length_error("storage payload overflow");
+			}
+			result += entry.payload.size();
+		}
+	}
+	return result;
+}
+
 inline std::string encode_storage_batch(const StorageBatch& batch) {
 	using namespace storage_detail;
-	std::string result; put64(result, batch_magic);
+	std::string result; result.reserve(storage_batch_size(batch)); put64(result, batch_magic);
 	result.push_back(batch.hard ? 1 : 0);
 	if (batch.hard) {
 		put64(result, batch.hard->term); put64(result, batch.hard->voted_for.value_or(0)); put64(result, batch.hard->commit_index);
 	}
 	result.push_back(batch.log ? 1 : 0);
 	if (batch.log) {
-		if (batch.log->entries.size() > std::numeric_limits<std::uint32_t>::max()) { throw std::length_error("storage entry count overflow"); }
 		put64(result, batch.log->replace_from); put32(result, static_cast<std::uint32_t>(batch.log->entries.size()));
 		for (const auto& entry : batch.log->entries) {
-			if (entry.payload.size() > std::numeric_limits<std::uint32_t>::max()) { throw std::length_error("storage payload overflow"); }
 			put64(result, entry.index); put64(result, entry.term); result.push_back(static_cast<char>(entry.kind));
 			put32(result, static_cast<std::uint32_t>(entry.payload.size())); result.append(entry.payload);
 		}

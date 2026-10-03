@@ -36,6 +36,8 @@ Only one bounded committed range awaits `Applied`. Completions must acknowledge 
 
 `storage.h` encodes exact configuration initialization and opaque `StorageBatch` operations for the generic journal. Related hard-state and logical suffix changes fit in one atomic batch. Replacing an uncommitted Raft suffix appends a storage operation; it never physically truncates acknowledged journal history.
 
+`storage_batch_size()` provides checked framing bounds without allocation or IO, and its batch overload measures the actual encoded size. Encoding uses the same helper before reserving output capacity. Admission can plan hard-state and log continuation batches without duplicating their format constants. These helpers do not reserve capacity or admit Core events; the worker supplies that enforcement.
+
 Create a journal explicitly, append `encode_initialization(configuration)`, and construct the empty core only after that append succeeds. Reopen by passing each verified journal batch to `Recovery::replay`, then call `finish(frontier.sequence)` only after `Journal::recover` returns successfully. Semantic replay checks configuration identity, contiguous indexes, monotonic terms and commitment, ballot lifetime, log bounds, and committed-prefix protection. Same-index/same-term entries with different content fail closed. Journal checksums alone do not establish these invariants.
 
 The restarted application rebuilds state only through the durable commit index. External effects need their own idempotency. Do not erase a voter's state and rejoin under its old identity: its forgotten ballot invalidates crash-recovery assumptions. Node replacement and restore epochs require explicit provisioning.

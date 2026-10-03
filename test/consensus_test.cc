@@ -752,8 +752,32 @@ void reordered_crash_schedules(std::size_t voters, std::uint64_t seed) {
 }
 } // namespace
 
+void storage_footprint_plans() {
+	using namespace cluster::consensus;
+	for (bool hard : {false, true}) {
+		for (bool log : {false, true}) {
+			for (unsigned count : {0u, 1u, 256u}) {
+				if (!log && count) { continue; }
+				StorageBatch batch;
+				if (hard) { batch.hard = HardState{3, 1, 0}; }
+				if (log) {
+					batch.log = LogMutation{1, {}};
+					for (unsigned i = 0; i < count; ++i) { batch.log->entries.push_back({i + 1, 3, EntryKind::Command, std::string(i % 7, 'x')}); }
+				}
+				check(storage_batch_size(batch) == encode_storage_batch(batch).size(), "planned storage footprint equals actual mixed-payload encoding");
+			}
+		}
+	}
+	check(storage_batch_size(true, false) == 34 && storage_batch_size(false, true, 1) == 43, "control continuation framing bounds match codec");
+	check(throws([] { storage_batch_size(false, false, 1); }) && throws([] { storage_batch_size(false, true, 0, 1); }), "invalid planning shapes reject without IO");
+	check(throws([] { storage_batch_size(true, true, 1, std::numeric_limits<std::size_t>::max()); }), "payload aggregate overflow rejects without allocation");
+	if constexpr (sizeof(std::size_t) > sizeof(std::uint32_t)) {
+		check(throws([] { storage_batch_size(false, true, static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max()) + 1); }), "entry count beyond wire representation rejects");
+	}
+}
+
 int main() {
-	try { persistence_barriers(); delayed_completions_do_not_campaign(); replication_and_restart(); affirmative_majority_and_inheritance(); simultaneous_completions(); reads_and_partitions(); overlapping_reads_preserve_data(); application_lag_does_not_spin_reads(); stale_rpc_and_failure_transitions(); bounds_and_semantic_recovery(); local_checkpoint_core(); compacted_index_exhaustion(); compacted_replication(); checkpoint_semantic_recovery(); real_journal_integration(); real_store_integration(); reordered_crash_schedules(3, 0x52414654); reordered_crash_schedules(5, 0x434c5553); }
+	try { storage_footprint_plans(); persistence_barriers(); delayed_completions_do_not_campaign(); replication_and_restart(); affirmative_majority_and_inheritance(); simultaneous_completions(); reads_and_partitions(); overlapping_reads_preserve_data(); application_lag_does_not_spin_reads(); stale_rpc_and_failure_transitions(); bounds_and_semantic_recovery(); local_checkpoint_core(); compacted_index_exhaustion(); compacted_replication(); checkpoint_semantic_recovery(); real_journal_integration(); real_store_integration(); reordered_crash_schedules(3, 0x52414654); reordered_crash_schedules(5, 0x434c5553); }
 	catch (const std::exception& error) { check(false, error.what()); }
 	std::cout << checks << " consensus checks, " << failures << " failures\n";
 	return failures ? 1 : 0;
