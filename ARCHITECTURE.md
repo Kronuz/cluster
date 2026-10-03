@@ -141,3 +141,7 @@ The app provides, and the substrate never bakes in:
   this committed command". These are where an app's state machine plugs into consensus.
 
 Consensus and gossip mechanics stay here; domain policy stays in the app.
+
+## Additive durable storage
+
+The separately buildable `journal/` module stores bounded opaque batches behind an injected filesystem interface. It has no reactor, membership, Raft, or application-state dependency. Its checksummed durable frontier separates acknowledged storage history from an incomplete tail; recovery validates that frontier before discarding extra bytes. Raft hard-state encoding and suffix-replacement interpretation belong in a future consensus adapter. See [the journal contract and qualification limits](journal/README.md). Legacy `cluster::Raft` retains its volatile semantics.

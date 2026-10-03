@@ -64,6 +64,8 @@ never races the receive.
 
 **[reactor](https://github.com/Kronuz/reactor)** (which brings standalone **asio**), via CMake `FetchContent`; otherwise header-only. The node type, its state hooks / `apply(command)`, the message codec, and logging are **injected seams**, not dependencies.
 
+The additive [durable opaque batch journal](journal/README.md) has no reactor or consensus dependency. Build it separately with `cmake -S journal -B .scratch/journal`; its append/recovery protocol, POSIX backend, deterministic I/O tests, example, and initial measurements are documented there. It does not add persistence to legacy Raft.
+
 ## Build
 
 ```sh
@@ -85,10 +87,4 @@ multicast, cluster-token scoping, and version rejection).
 
 See [Legacy Raft safety corrections](SAFETY.md) for corrected replication progress, mixed-version limits, and deterministic regressions. These are separately validated behavior corrections after extraction. Terms, votes, and logs are still volatile, and the legacy module is not a durable write authority.
 
-`cluster::Bus` and `cluster::Raft` are implemented; membership gossip (the node table)
-is not yet. Raft is a faithful, generic port of a proven multicast Raft, validated
-standalone — `test/raft_test.cc` runs N in-memory nodes over a fake bus and elects a
-stable leader, replicates + applies a command on every node, and re-elects after the
-leader is killed (3 and 5 nodes); `examples/raft_election.cc` demos it and
-`benchmarks/raft_bench.cc` measures election latency (~40 ms with a 20–60 ms election
-window).
+`cluster::Bus` and `cluster::Raft` are implemented; membership gossip stays application-side. Raft was extracted from Xapiand and now includes the separately reviewed corrections above. `test/raft_test.cc` exercises election, application, and re-election in three- and five-node in-memory clusters; `test/raft_safety_test.cc` exercises deterministic safety regressions. These schedules do not constitute a general consensus proof. `examples/raft_election.cc` demonstrates the API, and `benchmarks/raft_bench.cc` measures election latency (approximately 40 ms with a 20–60 ms election window in the recorded benchmark).

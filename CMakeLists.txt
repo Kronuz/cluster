@@ -34,6 +34,9 @@ target_compile_features(cluster INTERFACE cxx_std_20)
 target_link_libraries(cluster INTERFACE reactor::reactor)
 add_library(cluster::cluster ALIAS cluster)
 
+# Generic durable storage has no reactor, socket, or consensus dependency.
+add_subdirectory(journal)
+
 # --- example + benchmark + tests (built only when this repo is top-level) ---
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	enable_testing()
@@ -69,4 +72,9 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	target_link_libraries(cluster_raft_safety_test PRIVATE cluster)
 	add_test(NAME cluster_raft_safety COMMAND cluster_raft_safety_test)
 	set_tests_properties(cluster_raft_safety PROPERTIES TIMEOUT 10)
+
+	add_executable(cluster_journal_test test/journal_test.cc)
+	target_link_libraries(cluster_journal_test PRIVATE cluster::journal)
+	add_test(NAME cluster_journal COMMAND cluster_journal_test)
+	set_tests_properties(cluster_journal PROPERTIES TIMEOUT 30)
 endif()

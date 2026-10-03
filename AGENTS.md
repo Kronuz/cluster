@@ -59,6 +59,8 @@ CMakeLists.txt     Header-only INTERFACE target cluster::cluster; FetchContents 
                    only top-level.
 ```
 
+`journal/` is an additive generic storage module with its own CMake entry point and no reactor dependency. Read [journal/README.md](journal/README.md) before changing durability or recovery semantics. Its owner lock is stable across manifest publication, and failures fence until close/recovery; do not delete acknowledged history when replacing a Raft suffix. `test/journal_test.cc` injects filesystem failures and checks the POSIX backend. This module does not alter the legacy Raft persistence contract.
+
 ## Invariants — do not regress these
 
 - **The wire frame is fixed** (`[major][minor][type][serialise_string(token)][content]`) and

@@ -1,0 +1,22 @@
+cmake_minimum_required(VERSION 3.16)
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+	project(kronuz_journal LANGUAGES CXX)
+endif()
+
+add_library(cluster_journal INTERFACE)
+target_include_directories(cluster_journal INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/..")
+target_compile_features(cluster_journal INTERFACE cxx_std_20)
+add_library(cluster::journal ALIAS cluster_journal)
+
+# This module can be built without fetching Asio or reactor.
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+	enable_testing()
+	add_executable(journal_demo demo.cc)
+	target_link_libraries(journal_demo PRIVATE cluster::journal)
+	add_executable(journal_bench bench.cc)
+	target_link_libraries(journal_bench PRIVATE cluster::journal)
+	add_executable(cluster_journal_test ../test/journal_test.cc)
+	target_link_libraries(cluster_journal_test PRIVATE cluster::journal)
+	add_test(NAME cluster_journal COMMAND cluster_journal_test)
+	set_tests_properties(cluster_journal PROPERTIES TIMEOUT 30)
+endif()
