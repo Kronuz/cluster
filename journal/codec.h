@@ -13,8 +13,8 @@ public:
 	using std::runtime_error::runtime_error;
 };
 
-inline std::uint32_t crc32c(std::string_view bytes) {
-	static constexpr auto table = [] {
+namespace detail {
+	inline constexpr auto crc_table = [] {
 		std::array<std::uint32_t, 256> result{};
 		for (std::uint32_t i = 0; i < result.size(); ++i) {
 			auto value = i;
@@ -25,9 +25,18 @@ inline std::uint32_t crc32c(std::string_view bytes) {
 		}
 		return result;
 	}();
-	std::uint32_t value = ~0u;
-	for (unsigned char byte : bytes) { value = table[(value ^ byte) & 255] ^ (value >> 8); }
-	return ~value;
+}
+class Checksum {
+public:
+	void update(std::string_view bytes) {
+		for (unsigned char byte : bytes) { value_ = detail::crc_table[(value_ ^ byte) & 255] ^ (value_ >> 8); }
+	}
+	std::uint32_t value() const noexcept { return ~value_; }
+private:
+	std::uint32_t value_ = ~0u;
+};
+inline std::uint32_t crc32c(std::string_view bytes) {
+	Checksum checksum; checksum.update(bytes); return checksum.value();
 }
 
 inline void put32(std::string& bytes, std::uint32_t value) {
