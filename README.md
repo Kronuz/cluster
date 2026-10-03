@@ -66,6 +66,8 @@ never races the receive.
 
 The additive [durable opaque batch journal](journal/README.md) has no reactor or consensus dependency. Build it separately with `cmake -S journal -B .scratch/journal`; its append/recovery protocol, POSIX backend, deterministic I/O tests, example, and initial measurements are documented there. It does not add persistence to legacy Raft.
 
+The additive [strict fixed-voter core](consensus/README.md) provides deterministic events/actions and semantic storage replay without transport or filesystem calls. Build it separately with `cmake -S consensus -B .scratch/consensus`. Its persistence barriers and qualification schedules are documented separately; checkpoints and production transport remain pending.
+
 ## Build
 
 ```sh
