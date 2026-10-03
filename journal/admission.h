@@ -54,7 +54,11 @@ struct AdmissionState {
 	AdmissionStats stats() const noexcept {
 		auto result = value;
 		result.over_limit = !resources_fit(value.used, limits.hard);
-		result.normal_ready = !value.tainted && !result.over_limit && value.control_available == limits.control_pool && value.replacement_available == limits.replacement_pool;
+		// Held protected permits remain funded through outstanding peaks.
+		// Preparation can interleave with normal work using only free capacity.
+		result.normal_ready = !value.tainted && !result.over_limit &&
+			StorageResources{value.control_available.logical_bytes + control_held.logical_bytes, value.control_available.entries + control_held.entries} == limits.control_pool &&
+			StorageResources{value.replacement_available.logical_bytes + replacement_held.logical_bytes, value.replacement_available.entries + replacement_held.entries} == limits.replacement_pool;
 		return result;
 	}
 };

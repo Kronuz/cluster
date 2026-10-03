@@ -21,7 +21,7 @@ void pools() {
 	auto normal = ledger.reserve(AdmissionClass::Normal, {500, 50}); check(normal.has_value(), "normal may exhaust unprotected capacity");
 	auto control = ledger.reserve(AdmissionClass::Control, {100, 10}); auto replacement = ledger.reserve(AdmissionClass::Replacement, {300, 30});
 	check(control && replacement && !ledger.reserve(AdmissionClass::Replacement, {1, 1}), "exhausted normal work preserves distinct control and one replacement cycle"); bounded(ledger);
-	check(!ledger.stats().normal_ready, "held protected pools stop new normal admission");
+	check(ledger.stats().normal_ready && !ledger.reserve(AdmissionClass::Normal, {1, 1}), "held protection remains funded but leaves no unprotected capacity here");
 	normal->mark_started(); normal->settle({500, 50}); control->mark_started(); control->settle({20, 2}); replacement->mark_started(); replacement->settle({100, 10}, {100, 10});
 	check(ledger.stats().used == StorageResources{620, 62} && !ledger.stats().normal_ready, "actual additions stay charged and only known removals receive credit"); bounded(ledger);
 	ledger.credit_durable_reclaim({120, 12}); check(ledger.stats().normal_ready, "durable deletion refills both protected pools"); bounded(ledger);
@@ -56,9 +56,7 @@ void uncertainty() {
 	Admission moved(census({100, 10}), limits);
 	{
 		auto first = moved.reserve(AdmissionClass::Control, {20, 2}); auto second = moved.reserve(AdmissionClass::Normal, {20, 2});
-		// Normal admission pauses with the control pool held; use another
-		// protected reservation as the move-assignment destination instead.
-		check(!second, "normal admission pauses while a control permit owns its pool");
+		check(second.has_value(), "held control protection allows normal work from unprotected capacity"); second.reset();
 		auto destination = moved.reserve(AdmissionClass::Control, {20, 2}); *destination = std::move(*first);
 		check(moved.stats().tickets == 1 && moved.stats().outstanding == StorageResources{20, 2}, "move assignment cancels old pre-IO reservation once");
 	}
@@ -93,6 +91,18 @@ void slots() {
 	check(replacement && ledger.stats().tickets == 3, "replacement retains its slot after control saturation"); replacement.reset();
 	check(!ledger.reserve(AdmissionClass::Control, {1, 1}) && ledger.reserve(AdmissionClass::Replacement, {1, 1}), "released replacement slot cannot be stolen by another control ticket");
 }
+void interleaved_replacement() {
+	Admission ledger(census({100, 10}), limits);
+	auto replacement = ledger.reserve(AdmissionClass::Replacement, {300, 30});
+	check(replacement && ledger.stats().normal_ready, "fully reserved replacement remains funded during preparation");
+	auto normal = ledger.reserve(AdmissionClass::Normal, {500, 50});
+	check(normal && !ledger.reserve(AdmissionClass::Normal, {1, 1}), "interleaved appends consume only remaining unprotected capacity"); bounded(ledger);
+	replacement->mark_started(); replacement->settle({300, 30});
+	check(!ledger.stats().normal_ready && !ledger.reserve(AdmissionClass::Normal, {1, 1}), "settled replacement pauses normal work when consumed protection cannot refill"); bounded(ledger);
+	normal->mark_started(); normal->settle({500, 50});
+	ledger.credit_durable_reclaim({300, 30});
+	check(ledger.stats().normal_ready && ledger.stats().replacement_available == limits.replacement_pool, "durable cleanup restores replacement protection after interleaving"); bounded(ledger);
+}
 void schedules() {
 	Admission ledger(census({100, 10}), limits); std::mt19937 random(0x504f4f4c); std::vector<StoragePermit> held;
 	for (unsigned step = 0; step < 2000; ++step) {
@@ -111,6 +121,6 @@ void schedules() {
 }
 }
 int main() {
-	try { pools(); uncertainty(); slots(); schedules(); } catch (const std::exception& error) { check(false, error.what()); }
+	try { pools(); uncertainty(); slots(); interleaved_replacement(); schedules(); } catch (const std::exception& error) { check(false, error.what()); }
 	std::cout << checks << " admission checks, " << failures << " failures\n"; return failures ? 1 : 0;
 }
