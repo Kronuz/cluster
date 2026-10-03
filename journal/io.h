@@ -48,6 +48,8 @@ public:
 	virtual ~IO() = default;
 	// Creation is exclusive. Recovery opens the existing stable lock; neither
 	// manifest replacement nor fencing releases or replaces this lock.
+	// Successful creation adds exactly one zero-length owner.lock and no
+	// other entries; format-layer bootstrap accounting relies on this.
 	virtual std::unique_ptr<OwnerLock> acquire_owner(bool create) = 0;
 	virtual std::unique_ptr<File> open_existing(std::string_view name) = 0;
 	virtual std::unique_ptr<File> create_exclusive(std::string_view name) = 0;

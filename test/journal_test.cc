@@ -3,6 +3,7 @@
 #include <set>
 #include <algorithm>
 #include <filesystem>
+#include <functional>
 #include <iostream>
 #include <map>
 #include <vector>
@@ -25,12 +26,14 @@ struct Model {
 	bool locked = false;
 	std::size_t operations = 0, fail_operation = 0;
 	bool fail_after = false, zero_write = false;
+	std::function<void()> observe;
 	std::size_t chunk = std::numeric_limits<std::size_t>::max();
 	void before() {
 		++operations;
 		if (operations == fail_operation && !fail_after) { throw std::runtime_error("injected I/O failure before effect"); }
 	}
 	void after() {
+		if (observe) { observe(); }
 		if (operations == fail_operation && fail_after) { throw std::runtime_error("injected I/O failure after effect"); }
 	}
 	Model clone() const {
@@ -472,6 +475,44 @@ void mixed_artifact_formats() {
 	}
 }
 
+StorageResources visible_resources(const Model& model) {
+	StorageResources resources{0, model.visible.size()};
+	for (const auto& [name, inode] : model.visible) { resources.logical_bytes += inode->visible.size(); }
+	return resources;
+}
+template <class Operation> void check_plan(Model& model, MutationPlan plan, Operation operation) {
+	auto before = visible_resources(model); auto peak = detail::resources_add(before, plan.peak);
+	model.observe = [&] { check(detail::resources_fit(visible_resources(model), peak), "every primitive filesystem state is covered by the planned simultaneous peak"); };
+	operation(); model.observe = {};
+	check(visible_resources(model) == detail::resources_subtract(detail::resources_add(before, plan.added), plan.removed), "successful mutation matches planned additions and removed manifest only");
+}
+void footprint_plans() {
+	for (auto chunk : {std::numeric_limits<std::size_t>::max(), std::size_t{3}}) {
+		Model model; model.chunk = chunk; MemoryIO io(model); Journal journal(io, 1024);
+		check_plan(model, Journal::bootstrap_plan(), [&] { journal.create(identity()); });
+		check_plan(model, journal.append_plan(5), [&] { journal.append_batch("first"); });
+		auto waiting_append = journal.append_plan(5);
+		for (std::size_t count : {2u, 9u, 1u}) {
+			std::vector<std::uint64_t> lengths(count, 3);
+			auto plan = journal.checkpoint_plan(lengths);
+			check_plan(model, plan, [&] {
+				std::vector<PreparedArtifact> artifacts;
+				for (std::size_t artifact = 0; artifact < count; ++artifact) { artifacts.push_back(prepare(journal, "app")); }
+				journal.publish_checkpoint(artifacts[0], std::span<const PreparedArtifact>(artifacts.data() + 1, artifacts.size() - 1), journal.frontier().sequence);
+			});
+		}
+		check_plan(model, waiting_append, [&] { journal.append_batch("later"); });
+		auto footprint = journal.artifact_footprint(5);
+		check_plan(model, {footprint, footprint, {}}, [&] { auto builder = journal.prepare_artifact(); builder.append_chunk("known"); });
+		check(throws([&] { journal.append_plan(1025); }) && throws([&] { journal.checkpoint_plan({}); }) && !journal.fenced(), "invalid footprint admission is rejected before mutation without fencing");
+	}
+	auto model = initialized(); MemoryIO io(model);
+	auto maximum = static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()) - detail::artifact_header_size;
+	Journal journal(io, 1024, maximum); journal.recover([](auto, auto) {});
+	std::array<std::uint64_t, 3> lengths{maximum, maximum, maximum};
+	check(throws([&] { journal.checkpoint_plan(lengths); }) && !journal.fenced(), "aggregate checkpoint plan overflow rejects before any IO");
+}
+
 void reclamation_failures() {
 	auto baseline = reclaim_fixture(); std::size_t operations;
 	auto proof = baseline.clone(); auto expected = replay_checkpoint(proof).first;
@@ -762,7 +803,7 @@ void posix() {
 } // namespace
 
 int main() {
-	try { basics(); append_failures(); append_failures(3); append_failures(std::numeric_limits<std::size_t>::max(), true); append_failures(3, true); recovery_failures(); recovery_failures(true); recovery_failures(false, true); recovery_failures(true, true); corruption(); initialization_failures(); checkpoint_basics(); checkpoint_successive_generations(); artifact_verification(); preparation_ownership_and_failures(); checkpoint_publication_failures(); checkpoint_corruption(); reclamation_roots_and_unknowns(); reclamation_failures(); durable_staging_ownership(); mixed_artifact_formats(); posix(); }
+	try { basics(); append_failures(); append_failures(3); append_failures(std::numeric_limits<std::size_t>::max(), true); append_failures(3, true); recovery_failures(); recovery_failures(true); recovery_failures(false, true); recovery_failures(true, true); corruption(); initialization_failures(); checkpoint_basics(); checkpoint_successive_generations(); artifact_verification(); preparation_ownership_and_failures(); checkpoint_publication_failures(); checkpoint_corruption(); reclamation_roots_and_unknowns(); reclamation_failures(); durable_staging_ownership(); mixed_artifact_formats(); footprint_plans(); posix(); }
 	catch (const std::exception& error) { check(false, error.what()); }
 	std::cout << checks << " journal checks, " << failures << " failures\n";
 	return failures ? 1 : 0;

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "artifact.h"
+#include "resources.h"
 #include <array>
 #include <limits>
 #include <random>
@@ -28,6 +29,10 @@ struct ReclaimStats {
 	bool logical_bytes_saturated = false, complete = false;
 };
 
+struct MutationPlan {
+	StorageResources peak, added, removed;
+};
+
 // Synchronous, single-owner opaque storage batches. IO outlives the journal
 // and every artifact builder, prepared handle, and reader.
 // Successful append returns only after the manifest's directory barrier.
@@ -47,6 +52,38 @@ public:
 	Journal& operator=(const Journal&) = delete;
 	bool fenced() const noexcept { return owner_->failed; }
 	Frontier frontier() const { available(); return frontier_; }
+	// Plans live beside the format encoder. Peak includes simultaneous
+	// temporary names/bytes; successful settlement credits only removed names.
+	static MutationPlan bootstrap_plan() {
+		auto bytes = std::uint64_t(file_header_size) + encode_manifest(Frontier{}).size();
+		return {{bytes, 4}, {bytes, 3}, {}};
+	}
+	MutationPlan append_plan(std::size_t payload_bound) const {
+		available();
+		if (payload_bound > maximum_batch_) { throw std::length_error("journal batch exceeds configured bound"); }
+		auto growth = std::uint64_t(batch_header_size) + payload_bound;
+		// A reservation may wait across migration or dependency-count changes.
+		return {{growth + maximum_manifest_size, 1}, {growth, 0}, {}};
+	}
+	StorageResources artifact_footprint(std::uint64_t payload) const {
+		available();
+		if (payload > maximum_artifact_) { throw std::length_error("artifact exceeds configured bound"); }
+		return {std::uint64_t(detail::artifact_header_size) + payload, 1};
+	}
+	MutationPlan checkpoint_plan(std::span<const std::uint64_t> payload_bounds) const {
+		// All artifacts are new. Bounds describe peak admission, not exact
+		// settlement: recompute with actual lengths immediately before publish.
+		// The removed manifest footprint belongs to the CURRENT generation.
+		available();
+		if (payload_bounds.empty() || payload_bounds.size() > maximum_dependencies + 1) {
+			throw std::invalid_argument("invalid checkpoint artifact count");
+		}
+		Frontier target = frontier_; target.version = 2; target.checkpoint = ArtifactDescriptor{};
+		target.dependencies.assign(payload_bounds.size() - 1, ArtifactDescriptor{});
+		StorageResources added{std::uint64_t(file_header_v2_size) + encode_manifest(target).size(), 2};
+		for (auto bound : payload_bounds) { added = detail::resources_add(added, artifact_footprint(bound)); }
+		return {added, added, {encode_manifest(frontier_).size(), 1}};
+	}
 	ArtifactBuilder prepare_artifact() {
 		available(); return ArtifactBuilder(io_, owner_, frontier_.identity, maximum_artifact_);
 	}
@@ -199,14 +236,14 @@ public:
 
 	Frontier append_batch(std::string_view batch) {
 		available();
-		if (batch.size() > maximum_batch_) { throw std::length_error("journal batch exceeds configured bound"); }
+		auto growth = append_plan(batch.size()).added.logical_bytes;
 		if (frontier_.sequence == std::numeric_limits<std::uint64_t>::max() ||
-			frontier_.offset > maximum_offset - batch_header_size - batch.size()) {
+			frontier_.offset > maximum_offset - growth) {
 			throw std::length_error("journal frontier exhausted");
 		}
 		Frontier next = frontier_;
 		++next.sequence;
-		next.offset += std::uint64_t(batch_header_size) + batch.size();
+		next.offset += growth;
 		std::string header;
 		put32(header, batch_magic);
 		put32(header, static_cast<std::uint32_t>(batch.size()));
