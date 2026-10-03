@@ -13,12 +13,13 @@ class FaultIO final : public kronuz::journal::IO {
 public:
 	explicit FaultIO(const std::filesystem::path& directory) : backend(directory) {}
 	bool fail_sync = false;
+	unsigned scans = 0;
 	auto acquire_owner(bool create) -> std::unique_ptr<kronuz::journal::OwnerLock> override { return backend.acquire_owner(create); }
 	auto open_existing(std::string_view name) -> std::unique_ptr<kronuz::journal::File> override { return backend.open_existing(name); }
 	auto create_exclusive(std::string_view name) -> std::unique_ptr<kronuz::journal::File> override { return backend.create_exclusive(name); }
 	void replace(std::string_view source, std::string_view destination) override { backend.replace(source, destination); }
 	void remove(std::string_view name) override { backend.remove(name); }
-	auto scan_directory() -> std::unique_ptr<kronuz::journal::DirectoryCursor> override { return backend.scan_directory(); }
+	auto scan_directory() -> std::unique_ptr<kronuz::journal::DirectoryCursor> override { ++scans; return backend.scan_directory(); }
 	auto entry_footprint(std::string_view name) -> std::optional<kronuz::journal::EntryFootprint> override { return backend.entry_footprint(name); }
 	auto open_reclaim_candidate(std::string_view name) -> std::unique_ptr<kronuz::journal::File> override { return backend.open_reclaim_candidate(name); }
 	void sync_directory() override { if (fail_sync) { fail_sync = false; throw std::runtime_error("injected worker directory barrier failure"); } backend.sync_directory(); }
@@ -163,8 +164,43 @@ void interrupted_initialization() {
 		check(worker.take_actions().size() == 1 && worker.take_actions().empty(), "application failure retains one terminal notice");
 	}
 }
+void maintenance_preserves_protocol_timers() {
+	for (bool drain_before : {false, true}) {
+	auto directory = std::filesystem::current_path() / ".scratch" / ("worker-maintenance-timers-" + std::to_string(::getpid()) + "-" + std::to_string(drain_before));
+	std::filesystem::create_directories(directory); ::chmod(directory.c_str(), 0700);
+	struct Cleanup { std::filesystem::path path; ~Cleanup() { std::filesystem::remove_all(path); } } cleanup{directory};
+	FaultIO io(directory); auto fixed = configuration(); fixed.voters = {1, 2, 3};
+	auto bounded_reads = limits(); bounded_reads.reads = 1;
+	Worker worker(io, fixed, {{256 * 1024, 512}, {16 * 1024, 3}, {64 * 1024, 4}, 8, 3}, bounded_reads, {}, {1, 128});
+	kronuz::journal::Identity identity{}; identity[0] = 'T'; worker.create(identity); while (!worker.ready()) { worker.run_one({100, 100}); }
+	std::map<NodeId, Receive> responses; unsigned sends = 0;
+	auto drain = [&] {
+		for (const auto& action : worker.take_actions()) {
+			if (auto batch = std::get_if<Committed>(&action)) { worker.applied({batch->entries.back().index}); }
+			if (auto send = std::get_if<Send>(&action)) {
+				if (auto vote = std::get_if<VoteRequest>(&send->message)) { responses.insert_or_assign(send->peer, Receive{send->peer, VoteResponse{vote->term, true}}); }
+				if (auto append = std::get_if<AppendRequest>(&send->message)) {
+					++sends; auto matched = append->previous + append->entries.size();
+					responses.insert_or_assign(send->peer, Receive{send->peer, AppendResponse{append->term, append->rpc, true, matched, matched + 1, append->read_probe}});
+				}
+			}
+		}
+	};
+	auto respond = [&] { if (!responses.empty()) { auto next = responses.begin(); if (worker.try_submit(next->second) == SubmitResult::Accepted) { responses.erase(next); } } };
+	worker.try_submit(Start{}); worker.try_submit(Tick{100, 100});
+	for (unsigned turn = 0; turn < 100 && worker.applied_index() < 1; ++turn) { respond(); worker.run_one({100, 100}); drain(); }
+	check(worker.role() == Role::Leader && worker.applied_index() == 1, "timer fixture elects a three-voter leader with correlated peer replies");
+	responses.clear(); sends = 0; unsigned reads = 0; auto scans = io.scans;
+	for (unsigned turn = 0; turn < 80; ++turn) {
+		if (worker.try_submit(Read{100 + reads}) == SubmitResult::Accepted) { ++reads; }
+		if (drain_before) { drain(); }
+		worker.run_one({200 + 20 * turn, 100}); drain();
+	}
+	check(sends >= 4 && reads >= 8 && io.scans >= scans + 4 && !worker.fenced(), "mandatory maintenance preserves timer retries and ordinary admission under saturated reads");
+	}
+}
 }
 int main() {
-	try { real_worker(); partial_control_pack(); failures_and_multi_action_output(); interrupted_initialization(); } catch (const std::exception& error) { check(false, error.what()); }
+	try { maintenance_preserves_protocol_timers(); real_worker(); partial_control_pack(); failures_and_multi_action_output(); interrupted_initialization(); } catch (const std::exception& error) { check(false, error.what()); }
 	std::cout << checks << " worker checks, " << failures << " failures\n"; return failures ? 1 : 0;
 }

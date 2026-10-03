@@ -79,24 +79,7 @@ public:
 	Index committed() const noexcept { return core_ ? core_->committed() : 0; }
 	Index applied_index() const noexcept { return core_ ? core_->applied() : 0; }
 	auto accounting() const noexcept { return store_.accounting(); }
-	SubmitResult try_submit(Event event) {
-		// Validate even under backpressure; internal events never enter here.
-		auto plan = plan_event(event, core_ && core_->busy(), limits_);
-		if (core_ && core_->role() == Role::Leader && std::holds_alternative<Tick>(event)) { plan.count = 0; }
-		if (store_.fenced() && !failed_) { fail("storage fenced outside worker"); }
-		if (fenced()) { return SubmitResult::Fenced; }
-		if (!ready() || !output_.empty() || maintenance_due() || core_->busy() || completion_ || application_) { return SubmitResult::Busy; }
-		try {
-			std::array<std::optional<kronuz::journal::AppendReservation>, 3> acquired;
-			for (std::size_t i = 0; i < plan.count; ++i) {
-				acquired[i] = store_.reserve_append(plan.appends[i].kind, plan.appends[i].encoded_bytes);
-				if (!acquired[i]) { return SubmitResult::Pressure; }
-			}
-			pack_ = std::move(acquired); pack_count_ = plan.count; pack_next_ = 0;
-			ingest(core_->step(std::move(event))); ++foreground_;
-			return fenced() ? SubmitResult::Fenced : SubmitResult::Accepted;
-		} catch (const std::exception& error) { fail(error.what()); return SubmitResult::Fenced; }
-	}
+	SubmitResult try_submit(Event event) { return submit(std::move(event), false); }
 	Actions take_actions() {
 		Actions result = std::move(output_); output_.clear();
 		for (const auto& action : result) {
@@ -128,7 +111,15 @@ public:
 				if (!permit) { return TurnResult::Pressure; }
 				store_.append(*permit, initialization_); initialization_.clear(); return TurnResult::Stored;
 			}
-			if (maintenance_due()) { store_.reclaim_step(scheduling_.scan_entries); foreground_ = 0; return TurnResult::Maintenance; }
+			if (maintenance_due()) {
+				if (timer_due_ && !core_->busy() && output_.empty() && !completion_ && !application_) {
+					auto result = submit(current_time, true);
+					if (result == SubmitResult::Accepted) { timer_due_ = false; return TurnResult::Idle; }
+					if (result == SubmitResult::Fenced) { return TurnResult::Fenced; }
+				}
+				store_.reclaim_step(scheduling_.scan_entries); foreground_ = 0; timer_blocked_ = timer_due_; timer_due_ = true;
+				return TurnResult::Maintenance;
+			}
 			if (persist_) {
 				auto encoded = encode_storage_batch(persist_->batch);
 				store_.append(*pack_[pack_next_], encoded); pack_[pack_next_++].reset();
@@ -144,12 +135,37 @@ public:
 				ingest(core_->step(current_time));
 				auto value = *completion_; completion_.reset(); ingest(core_->step(value)); ++foreground_; return TurnResult::Completed;
 			}
+			if (timer_blocked_) {
+				auto result = submit(current_time, true);
+				if (result == SubmitResult::Accepted) { timer_blocked_ = false; timer_due_ = true; return TurnResult::Idle; }
+				if (result == SubmitResult::Fenced) { return TurnResult::Fenced; }
+				store_.reclaim_step(scheduling_.scan_entries); return TurnResult::Maintenance;
+			}
 			auto result = try_submit(current_time);
 			return result == SubmitResult::Accepted ? TurnResult::Idle : result == SubmitResult::Pressure ? TurnResult::Pressure :
 				result == SubmitResult::Fenced ? TurnResult::Fenced : TurnResult::Blocked;
 		} catch (const std::exception& error) { fail(error.what()); return TurnResult::Fenced; }
 	}
 private:
+	SubmitResult submit(Event event, bool maintenance_tick) {
+		if (maintenance_tick && !std::holds_alternative<Tick>(event)) { throw std::logic_error("maintenance admission requires Tick"); }
+		// Validate even under backpressure; internal events never enter here.
+		auto plan = plan_event(event, core_ && core_->busy(), limits_);
+		if (core_ && core_->role() == Role::Leader && std::holds_alternative<Tick>(event)) { plan.count = 0; }
+		if (store_.fenced() && !failed_) { fail("storage fenced outside worker"); }
+		if (fenced()) { return SubmitResult::Fenced; }
+		if (!ready() || !output_.empty() || ((maintenance_due() || timer_blocked_) && !maintenance_tick) || core_->busy() || completion_ || application_) { return SubmitResult::Busy; }
+		try {
+			std::array<std::optional<kronuz::journal::AppendReservation>, 3> acquired;
+			for (std::size_t i = 0; i < plan.count; ++i) {
+				acquired[i] = store_.reserve_append(plan.appends[i].kind, plan.appends[i].encoded_bytes);
+				if (!acquired[i]) { return SubmitResult::Pressure; }
+			}
+			pack_ = std::move(acquired); pack_count_ = plan.count; pack_next_ = 0;
+			ingest(core_->step(std::move(event))); if (!maintenance_tick) { ++foreground_; }
+			return fenced() ? SubmitResult::Fenced : SubmitResult::Accepted;
+		} catch (const std::exception& error) { fail(error.what()); return SubmitResult::Fenced; }
+	}
 	static std::size_t checked_add(std::size_t left, std::size_t right) {
 		if (right > std::numeric_limits<std::size_t>::max() - left) { throw std::length_error("worker bound overflow"); }
 		return left + right;
@@ -216,7 +232,7 @@ private:
 	std::optional<Fenced> terminal_;
 	Actions output_;
 	Index delivered_ = 0;
-	bool failed_ = false;
+	bool failed_ = false, timer_due_ = true, timer_blocked_ = false;
 };
 
 } // namespace cluster::consensus
