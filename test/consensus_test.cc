@@ -3,6 +3,7 @@
 #include "consensus/checkpoint.h"
 #include "journal/journal.h"
 #include "journal/posix.h"
+#include "journal/store.h"
 #include <deque>
 #include <functional>
 #include <iostream>
@@ -578,6 +579,94 @@ void real_journal_integration() {
 	}
 }
 
+void real_store_integration() {
+	auto directory = std::filesystem::current_path() / ".scratch" / ("consensus-store-" + std::to_string(::getpid()));
+	std::filesystem::create_directories(directory); ::chmod(directory.c_str(), 0700);
+	struct Cleanup { std::filesystem::path path; ~Cleanup() { std::filesystem::remove_all(path); } } cleanup{directory};
+	std::vector<std::string> commands;
+	{
+		kronuz::journal::PosixIO io(directory); kronuz::journal::Store journal(io, {{16 * 1024 * 1024, 256}, {16 * 1024, 4}, {2 * 1024 * 1024 + 1024, 4}, 32}, 1024 * 1024);
+		kronuz::journal::Identity identity{}; identity[0] = 'J'; journal.create(identity);
+		while (!journal.inventory_step(1).complete) {}
+		auto append = [&](kronuz::journal::AdmissionClass kind, std::string_view bytes) {
+			auto reservation = journal.reserve_append(kind, bytes.size());
+			if (!reservation) { throw std::runtime_error("unexpected Store pressure in integration fixture"); }
+			journal.append(*reservation, bytes);
+		};
+		append(kronuz::journal::AdmissionClass::Control, encode_initialization(config(1, 1)));
+		Core core(config(1, 1), empty(1, 1));
+		std::optional<kronuz::journal::ArtifactDescriptor> application;
+		std::optional<kronuz::journal::ReplacementId> replacement;
+		std::deque<Action> actions;
+		auto enqueue = [&](Actions next) { for (auto& action : next) { actions.push_back(std::move(action)); } };
+		auto pump = [&] {
+			while (!actions.empty()) {
+				auto action = std::move(actions.front()); actions.pop_front();
+				if (auto persist = std::get_if<Persist>(&action)) {
+					auto kind = kronuz::journal::AdmissionClass::Control;
+					if (persist->batch.log && std::any_of(persist->batch.log->entries.begin(), persist->batch.log->entries.end(), [](const Entry& entry) { return entry.kind == EntryKind::Command; })) { kind = kronuz::journal::AdmissionClass::Normal; }
+					append(kind, encode_storage_batch(persist->batch));
+					enqueue(core.step(Persisted{persist->token}));
+				} else if (auto checkpoint = std::get_if<PersistCheckpoint>(&action)) {
+					if (!application) { throw std::logic_error("missing immutable capture"); }
+					auto sequence = journal.frontier().sequence;
+					auto bytes = encode_checkpoint(checkpoint->state, sequence, *application);
+					journal.begin_artifact(*replacement, kronuz::journal::ArtifactPart::Bundle);
+					while (!bytes.empty()) {
+						auto count = std::min(bytes.size(), std::size_t(64 * 1024)); journal.write_chunk(*replacement, std::string_view(bytes).substr(0, count)); bytes.erase(0, count);
+					}
+					journal.finish_artifact(*replacement); journal.publish(*replacement, sequence);
+					// Simulate process death after durable publication but before
+					// delivering the completion to the old protocol executor.
+				} else if (auto committed = std::get_if<Committed>(&action)) {
+					for (const auto& entry : committed->entries) { if (entry.kind == EntryKind::Command) { commands.push_back(entry.payload); } }
+					enqueue(core.step(Applied{committed->entries.back().index}));
+				} else if (std::holds_alternative<Fenced>(action)) { check(false, "real Store host unexpectedly fenced"); }
+			}
+		};
+		enqueue(core.step(Start{})); enqueue(core.step(Tick{100, 100})); pump();
+		enqueue(core.step(Propose{1, "durable command"})); pump();
+		check(core.committed() == 2 && core.applied() == 2 && commands == std::vector<std::string>{"durable command"},
+			"real POSIX Store establishes every consensus persistence completion");
+		// Pin nonempty application state at A=2, then advance the live state
+		// before publishing the older image and its retained command suffix.
+		replacement = journal.reserve_replacement(1024, 1024 * 1024);
+		if (!replacement) { throw std::runtime_error("checkpoint capacity unavailable"); }
+		journal.begin_artifact(*replacement, kronuz::journal::ArtifactPart::Application); journal.write_chunk(*replacement, "durable command"); application = journal.finish_artifact(*replacement);
+		enqueue(core.step(Propose{2, "after snapshot"})); pump();
+		enqueue(core.step(LocalCheckpoint{3, 1, 2, 1, config(1, 1).cluster, config(1, 1).configuration})); pump();
+		check(core.base_index() == 0 && core.applied() == 3 && core.busy(), "durable checkpoint cannot compact the old core without its completion");
+	}
+	{
+		kronuz::journal::PosixIO io(directory); kronuz::journal::Store journal(io, {{16 * 1024 * 1024, 256}, {16 * 1024, 4}, {2 * 1024 * 1024 + 1024, 4}, 32}, 1024 * 1024);
+		Recovery recovery(config(1, 1)); std::vector<std::string> restored_commands;
+		auto frontier = journal.recover([&](auto sequence, std::string_view batch) { recovery.replay(sequence, batch); },
+			[&](const auto& selected, auto& bundle, auto dependencies) {
+				if (dependencies.size() != 1 || selected.dependencies.size() != 1) { throw std::runtime_error("checkpoint dependency count"); }
+				std::string bytes(static_cast<std::size_t>(bundle.descriptor().length), '\0'); std::size_t offset = 0;
+				while (offset < bytes.size()) { auto count = std::min(bytes.size() - offset, std::size_t(64 * 1024)); offset += bundle.read_at(offset, std::span<char>(bytes.data() + offset, count)); }
+				auto decoded = decode_checkpoint(bytes, config(1, 1), selected.base_sequence, selected.dependencies[0]);
+				recovery.restore(std::move(decoded.state), decoded.storage_sequence);
+				std::string image(static_cast<std::size_t>(dependencies[0].descriptor().length), '\0');
+				std::size_t read = 0;
+				while (read < image.size()) { read += dependencies[0].read_at(read, std::span<char>(image.data() + read, image.size() - read)); }
+				restored_commands.push_back(std::move(image));
+			});
+		while (!journal.inventory_step(1).complete) {}
+		auto state = recovery.finish(frontier.sequence);
+		check(state.base_index == 2 && state.hard.commit_index == 3 && state.entries.size() == 1, "actual journal reopening reconstructs strict committed state");
+		Core restored(config(1, 1), std::move(state)); auto committed = restored.step(Start{});
+		auto delivery = find<Committed>(committed);
+		check(delivery && delivery->entries.back().payload == "after snapshot", "restored application delivery includes only committed suffix command");
+		if (delivery) {
+			for (const auto& entry : delivery->entries) { if (entry.kind == EntryKind::Command) { restored_commands.push_back(entry.payload); } }
+			restored.step(Applied{delivery->entries.back().index});
+		}
+		check(restored_commands == std::vector<std::string>{"durable command", "after snapshot"} && restored.applied() == 3,
+			"crash between publication and completion restores nonempty application state and replays suffix exactly once");
+	}
+}
+
 void reordered_crash_schedules(std::size_t voters, std::uint64_t seed) {
 	Network cluster(voters); cluster.start(); std::mt19937_64 random(seed);
 	auto consistent_prefixes = [&] {
@@ -634,7 +723,7 @@ void reordered_crash_schedules(std::size_t voters, std::uint64_t seed) {
 } // namespace
 
 int main() {
-	try { persistence_barriers(); replication_and_restart(); affirmative_majority_and_inheritance(); simultaneous_completions(); reads_and_partitions(); overlapping_reads_preserve_data(); application_lag_does_not_spin_reads(); stale_rpc_and_failure_transitions(); bounds_and_semantic_recovery(); local_checkpoint_core(); compacted_index_exhaustion(); compacted_replication(); checkpoint_semantic_recovery(); real_journal_integration(); reordered_crash_schedules(3, 0x52414654); reordered_crash_schedules(5, 0x434c5553); }
+	try { persistence_barriers(); replication_and_restart(); affirmative_majority_and_inheritance(); simultaneous_completions(); reads_and_partitions(); overlapping_reads_preserve_data(); application_lag_does_not_spin_reads(); stale_rpc_and_failure_transitions(); bounds_and_semantic_recovery(); local_checkpoint_core(); compacted_index_exhaustion(); compacted_replication(); checkpoint_semantic_recovery(); real_journal_integration(); real_store_integration(); reordered_crash_schedules(3, 0x52414654); reordered_crash_schedules(5, 0x434c5553); }
 	catch (const std::exception& error) { check(false, error.what()); }
 	std::cout << checks << " consensus checks, " << failures << " failures\n";
 	return failures ? 1 : 0;

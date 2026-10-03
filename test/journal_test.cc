@@ -1,5 +1,6 @@
 #include "journal/journal.h"
 #include "journal/posix.h"
+#include "journal/store.h"
 #include <set>
 #include <algorithm>
 #include <filesystem>
@@ -130,6 +131,11 @@ public:
 		model_.before(); auto found = model_.visible.find(std::string(name));
 		auto file = found == model_.visible.end() ? nullptr : std::make_unique<MemoryFile>(model_, found->second);
 		model_.after(); return file;
+	}
+	std::optional<EntryFootprint> entry_footprint(std::string_view name) override {
+		model_.before(); auto found = model_.visible.find(std::string(name)); std::optional<EntryFootprint> result;
+		if (found != model_.visible.end()) { result = EntryFootprint{EntryKind::Regular, found->second->visible.size(), std::nullopt}; }
+		model_.after(); return result;
 	}
 	void sync_directory() override { model_.before(); model_.durable = model_.visible; model_.after(); }
 private:
@@ -513,6 +519,159 @@ void footprint_plans() {
 	check(throws([&] { journal.checkpoint_plan(lengths); }) && !journal.fenced(), "aggregate checkpoint plan overflow rejects before any IO");
 }
 
+const AdmissionLimits store_limits{{4096, 32}, {512, 2}, {1024, 4}, 8};
+void ready_store(Store& store) { while (!store.inventory_step(1).complete) {} check(store.accounting().has_value(), "store admits accounting only after complete inventory"); }
+void store_covered(Model& model, const Store& store) {
+	auto stats = store.accounting();
+	if (stats) { check(detail::resources_fit(visible_resources(model), detail::resources_add(stats->used, stats->outstanding)), "every primitive Store mutation is covered by charged usage plus outstanding reservations"); }
+	else { check(detail::resources_fit(visible_resources(model), store_limits.hard), "bootstrap remains within prechecked hard quota before census"); }
+}
+void store_exact(Model& model, const Store& store) {
+	check(store.accounting()->used == visible_resources(model) && !store.fenced(), "completed Store operation exactly accounts for all existing files");
+}
+void store_replacement(Store& store, const ReplacementId& replacement) {
+	store.begin_artifact(replacement, ArtifactPart::Application); store.write_chunk(replacement, "app"); store.finish_artifact(replacement);
+	store.begin_artifact(replacement, ArtifactPart::Bundle); store.write_chunk(replacement, "bundle"); store.finish_artifact(replacement);
+	store.publish(replacement, store.frontier().sequence);
+}
+void store_basics() {
+	Model model; model.chunk = 3; MemoryIO io(model);
+	{
+		Store store(io, store_limits, 1024); model.observe = [&] { store_covered(model, store); };
+		store.create(identity());
+		check(throws([&] { store.reserve_append(AdmissionClass::Normal, 5); }), "Store blocks writes until the census completes");
+		check(throws([&] { store.inventory_step(0); }) && !store.fenced(), "invalid inventory budgets have no uncertain mutation");
+		ready_store(store); auto append = store.reserve_append(AdmissionClass::Normal, 5); store.append(*append, "first"); store_exact(model, store);
+		check(throws([&] { store.append(*append, "again"); }) && !store.fenced(), "settled append reservation cannot be reused");
+		auto replacement = store.reserve_replacement(128, 128); check(replacement.has_value(), "Store reserves complete replacement before capture");
+		auto waiting = store.reserve_append(AdmissionClass::Normal, 5);
+		store.begin_artifact(*replacement, ArtifactPart::Application); store.write_chunk(*replacement, "app");
+		append = store.reserve_append(AdmissionClass::Normal, 5); check(append.has_value(), "Store interleaves append admission with active preparation"); store.append(*append, "later");
+		store.finish_artifact(*replacement); store.verify_artifact(*replacement, ArtifactPart::Application);
+		store.begin_artifact(*replacement, ArtifactPart::Bundle); store.write_chunk(*replacement, "bundle"); store.finish_artifact(*replacement);
+		check(throws([&] { store.publish(*replacement, 1); }) && !store.fenced(), "stale covered sequence rejects without fencing prepared state");
+		store.publish(*replacement, 2); store_exact(model, store);
+		store.append(*waiting, "after"); store_exact(model, store);
+		check(throws([&] { store.cancel_replacement(*replacement); }), "completed replacement IDs cannot mutate new work");
+		{
+			auto canceled = store.reserve_replacement(128, 128); store.begin_artifact(*canceled, ArtifactPart::Application); store.write_chunk(*canceled, "orphan");
+			check(throws([&] { store.write_chunk(*canceled, std::string(129, 'x')); }) && !store.fenced(), "chunk reservation rejects overflow before IO");
+			store.cancel_replacement(*canceled); store_exact(model, store);
+		}
+		while (!store.reclaim_step(1).complete) {} store_exact(model, store); model.observe = {};
+	}
+	model.power_loss(false);
+	{
+		Store reopened(io, store_limits, 1024); std::string bundle, application;
+		std::vector<std::string> suffix;
+		reopened.recover([&](auto, auto bytes) { suffix.emplace_back(bytes); }, [&](auto&, auto& reader, auto deps) { bundle = read_artifact(reader); application = read_artifact(deps[0]); });
+		ready_store(reopened); check(bundle == "bundle" && application == "app" && reopened.frontier().sequence == 3 && suffix == std::vector<std::string>{"after"}, "Store restart restores checkpoint and append reserved across manifest migration"); store_exact(model, reopened);
+	}
+}
+void store_failures() {
+	for (auto chunk : {std::numeric_limits<std::size_t>::max(), std::size_t{3}}) {
+		auto baseline = initialized(); std::size_t operations;
+		baseline.chunk = chunk;
+		{
+			auto model = baseline.clone(); MemoryIO io(model); Store store(io, store_limits, 1024); store.recover([](auto, auto) {}); ready_store(store);
+			auto replacement = store.reserve_replacement(128, 128); model.operations = 0; store_replacement(store, *replacement); operations = model.operations;
+		}
+		for (std::size_t operation = 1; operation <= operations; ++operation) {
+			for (bool after : {false, true}) {
+				auto model = baseline.clone();
+				{
+					MemoryIO io(model); Store store(io, store_limits, 1024); store.recover([](auto, auto) {}); ready_store(store);
+					auto replacement = store.reserve_replacement(128, 128); model.operations = 0; model.fail_operation = operation; model.fail_after = after;
+					check(throws([&] { store_replacement(store, *replacement); }) && store.fenced() && store.accounting()->tainted, "uncertain Store preparation or publication fences storage and accounting");
+				}
+				for (bool visible : {false, true}) {
+					auto crash = model.clone(); crash.power_loss(visible); MemoryIO io(crash); Store recovered(io, store_limits, 1024); std::vector<std::string> history;
+					recovered.recover([&](auto, auto bytes) { history.emplace_back(bytes); }, [&](auto&, auto& bundle, auto deps) {
+						check(read_artifact(bundle) == "bundle" && read_artifact(deps[0]) == "app", "published Store generation recovers complete required artifacts"); history.emplace_back("first");
+					}); ready_store(recovered);
+					check(history == std::vector<std::string>{"first"}, "Store uncertain result never loses previously acknowledged history"); store_exact(crash, recovered);
+				}
+			}
+		}
+		std::cout << "Store replacement operations tested: " << operations << '\n';
+	}
+}
+void store_append_and_cleanup_failures() {
+	for (bool cleanup : {false, true}) {
+		auto baseline = reclaim_fixture(); std::size_t operations;
+		{
+			auto model = baseline.clone(); MemoryIO io(model); Store store(io, store_limits, 1024);
+			store.recover([](auto, auto) {}, [](auto&, auto&, auto) {}); ready_store(store);
+			auto append = cleanup ? std::optional<AppendReservation>{} : store.reserve_append(AdmissionClass::Normal, 4);
+			model.operations = 0; if (cleanup) { store.reclaim_step(4096); } else { store.append(*append, "next"); } operations = model.operations;
+		}
+		for (std::size_t operation = 1; operation <= operations; ++operation) {
+			for (bool after : {false, true}) {
+				auto model = baseline.clone();
+				{
+					MemoryIO io(model); std::optional<ArtifactReader> escaped; Store store(io, store_limits, 1024);
+					store.recover([](auto, auto) {}, [&](auto&, auto& bundle, auto) { escaped.emplace(std::move(bundle)); }); ready_store(store);
+					auto append = cleanup ? std::optional<AppendReservation>{} : store.reserve_append(AdmissionClass::Normal, 4);
+					auto charged_before = store.accounting()->used;
+					model.operations = 0; model.fail_operation = operation; model.fail_after = after;
+					check(throws([&] { if (cleanup) { store.reclaim_step(4096); } else { store.append(*append, "next"); } }) && store.fenced() && store.accounting()->tainted, "Store append or cleanup uncertainty fences wrapper accounting");
+					check(store.accounting()->used == charged_before && throws([&] { read_artifact(*escaped); }), "uncertain cleanup never credits deletion and fencing invalidates escaped readers");
+				}
+				for (bool visible : {false, true}) {
+					auto crash = model.clone(); crash.power_loss(visible); MemoryIO io(crash); Store recovered(io, store_limits, 1024); std::vector<std::string> suffix;
+					recovered.recover([&](auto, auto bytes) { suffix.emplace_back(bytes); }, [&](auto&, auto& bundle, auto deps) { check(read_artifact(bundle) == "first" && read_artifact(deps[0]) == "application", "cleanup or append failure preserves required checkpoint"); });
+					ready_store(recovered); store_exact(crash, recovered);
+					check(suffix.empty() || (!cleanup && suffix == std::vector<std::string>{"next"}), "recovery observes only optional uncertain append and required old state");
+				}
+			}
+		}
+		std::cout << "Store " << (cleanup ? "cleanup" : "append") << " operations tested: " << operations << '\n';
+	}
+}
+void store_limits_and_pins() {
+	for (bool entry_limit : {false, true}) {
+		Model model; MemoryIO io(model); auto limits = store_limits;
+		if (entry_limit) { limits.hard.entries = 9; } else { limits.hard.logical_bytes = 1700; }
+		Store store(io, limits, 1024); store.create(identity()); ready_store(store);
+		check(!store.reserve_append(AdmissionClass::Normal, 1), "Store refuses admission when either hard resource leaves no normal peak");
+		check(store.reserve_append(AdmissionClass::Control, 1).has_value(), "normal pressure preserves protected control capacity");
+		auto replacement = store.reserve_replacement(128, 128); check(replacement.has_value(), "normal pressure preserves complete replacement capacity"); store.cancel_replacement(*replacement);
+	}
+	auto model = reclaim_fixture(); MemoryIO io(model); std::optional<ArtifactReader> escaped;
+	{
+		Store store(io, store_limits, 1024); std::string pinned;
+		store.recover([](auto, auto) {}, [&](auto& frontier, auto& bundle, auto) { pinned = artifact_name(*frontier.checkpoint); escaped.emplace(std::move(bundle)); }); ready_store(store);
+		auto replacement = store.reserve_replacement(128, 128); store_replacement(store, *replacement);
+		while (!store.reclaim_step(1).complete) {} store_exact(model, store);
+		check(model.visible.contains(pinned) && read_artifact(*escaped) == "first", "Store cleanup keeps escaped old checkpoint reader pinned and charged");
+		escaped.reset(); while (!store.reclaim_step(1).complete) {} store_exact(model, store);
+		check(!model.visible.contains(pinned), "Store credits old pinned artifact only after actual durable unlink");
+	}
+	Model other_model; MemoryIO other_io(other_model); Store other(other_io, store_limits, 1024); other.create(identity()); ready_store(other);
+	auto foreign_append = other.reserve_append(AdmissionClass::Normal, 1); auto foreign_replacement = other.reserve_replacement(128, 128);
+	Store store(io, store_limits, 1024); store.recover([](auto, auto) {}, [](auto&, auto&, auto) {}); ready_store(store);
+	check(throws([&] { store.append(*foreign_append, "x"); }) && throws([&] { store.begin_artifact(*foreign_replacement, ArtifactPart::Application); }) && !store.fenced(), "foreign Store capabilities reject before mutation without fencing");
+}
+void store_posix() {
+	auto directory = std::filesystem::current_path() / ".scratch" / ("store-test-" + std::to_string(::getpid()));
+	if (!std::filesystem::create_directory(directory)) { throw std::runtime_error("Store test directory exists"); } ::chmod(directory.c_str(), 0700);
+	struct Cleanup { std::filesystem::path path; ~Cleanup() { std::filesystem::remove_all(path); } } cleanup{directory};
+	{
+		PosixIO io(directory); Store store(io, store_limits, 1024); store.create(identity()); ready_store(store);
+		auto append = store.reserve_append(AdmissionClass::Normal, 5); store.append(*append, "first");
+		auto replacement = store.reserve_replacement(128, 128); store_replacement(store, *replacement);
+		auto cancel = store.reserve_replacement(128, 128); store.begin_artifact(*cancel, ArtifactPart::Application); store.write_chunk(*cancel, "orphan"); store.cancel_replacement(*cancel);
+		while (!store.reclaim_step(1).complete) {}
+		Inventory census(io); while (!census.step(1).complete) {}
+		check(store.accounting()->used == StorageResources{census.stats().logical_bytes, census.stats().entries}, "real POSIX Store accounts for publication cancellation and cleanup exactly");
+	}
+	{
+		PosixIO io(directory); Store store(io, store_limits, 1024); std::string bundle, application;
+		store.recover([](auto, auto) {}, [&](auto&, auto& reader, auto deps) { bundle = read_artifact(reader); application = read_artifact(deps[0]); }); ready_store(store);
+		check(bundle == "bundle" && application == "app" && store.frontier().sequence == 1, "actual POSIX Store reopens acknowledged replacement");
+	}
+}
+
 void reclamation_failures() {
 	auto baseline = reclaim_fixture(); std::size_t operations;
 	auto proof = baseline.clone(); auto expected = replay_checkpoint(proof).first;
@@ -803,7 +962,7 @@ void posix() {
 } // namespace
 
 int main() {
-	try { basics(); append_failures(); append_failures(3); append_failures(std::numeric_limits<std::size_t>::max(), true); append_failures(3, true); recovery_failures(); recovery_failures(true); recovery_failures(false, true); recovery_failures(true, true); corruption(); initialization_failures(); checkpoint_basics(); checkpoint_successive_generations(); artifact_verification(); preparation_ownership_and_failures(); checkpoint_publication_failures(); checkpoint_corruption(); reclamation_roots_and_unknowns(); reclamation_failures(); durable_staging_ownership(); mixed_artifact_formats(); footprint_plans(); posix(); }
+	try { basics(); append_failures(); append_failures(3); append_failures(std::numeric_limits<std::size_t>::max(), true); append_failures(3, true); recovery_failures(); recovery_failures(true); recovery_failures(false, true); recovery_failures(true, true); corruption(); initialization_failures(); checkpoint_basics(); checkpoint_successive_generations(); artifact_verification(); preparation_ownership_and_failures(); checkpoint_publication_failures(); checkpoint_corruption(); reclamation_roots_and_unknowns(); reclamation_failures(); durable_staging_ownership(); mixed_artifact_formats(); footprint_plans(); store_basics(); store_failures(); store_append_and_cleanup_failures(); store_limits_and_pins(); store_posix(); posix(); }
 	catch (const std::exception& error) { check(false, error.what()); }
 	std::cout << checks << " journal checks, " << failures << " failures\n";
 	return failures ? 1 : 0;

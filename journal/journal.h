@@ -51,6 +51,9 @@ public:
 	Journal(const Journal&) = delete;
 	Journal& operator=(const Journal&) = delete;
 	bool fenced() const noexcept { return owner_->failed; }
+	// Trusted owning host: uncertainty outside a Journal method must fence
+	// escaped readers and capabilities from the same storage session too.
+	void fence_storage() noexcept { owner_->failed = true; ready_ = false; }
 	Frontier frontier() const { available(); return frontier_; }
 	// Plans live beside the format encoder. Peak includes simultaneous
 	// temporary names/bytes; successful settlement credits only removed names.
@@ -62,6 +65,9 @@ public:
 		available();
 		if (payload_bound > maximum_batch_) { throw std::length_error("journal batch exceeds configured bound"); }
 		auto growth = std::uint64_t(batch_header_size) + payload_bound;
+		if (frontier_.sequence == std::numeric_limits<std::uint64_t>::max() || frontier_.offset > maximum_offset - growth) {
+			throw std::length_error("journal frontier exhausted");
+		}
 		// A reservation may wait across migration or dependency-count changes.
 		return {{growth + maximum_manifest_size, 1}, {growth, 0}, {}};
 	}
@@ -237,10 +243,6 @@ public:
 	Frontier append_batch(std::string_view batch) {
 		available();
 		auto growth = append_plan(batch.size()).added.logical_bytes;
-		if (frontier_.sequence == std::numeric_limits<std::uint64_t>::max() ||
-			frontier_.offset > maximum_offset - growth) {
-			throw std::length_error("journal frontier exhausted");
-		}
 		Frontier next = frontier_;
 		++next.sequence;
 		next.offset += growth;
