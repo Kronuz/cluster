@@ -1,4 +1,5 @@
 #include "consensus/core.h"
+#include "consensus/admission.h"
 #include "consensus/storage.h"
 #include "consensus/checkpoint.h"
 #include "journal/journal.h"
@@ -752,6 +753,38 @@ void reordered_crash_schedules(std::size_t voters, std::uint64_t seed) {
 }
 } // namespace
 
+void event_admission_plans() {
+	using kronuz::journal::AdmissionClass;
+	auto tick = plan_event(Tick{100, 100}, false);
+	check(tick.count == 3 && tick.appends[0].encoded_bytes == 34 && tick.appends[1].encoded_bytes == 43 && tick.appends[2].encoded_bytes == 34, "campaign admission owns its complete three-write continuation");
+	check(plan_event(Tick{100, 100}, true).count == 0, "time updates during persistence require no new pack");
+	auto proposal = plan_event(Propose{1, ""}, false);
+	check(proposal.count == 2 && proposal.appends[0].kind == AdmissionClass::Normal && proposal.appends[1].kind == AdmissionClass::Control, "empty commands preserve normal/control classification");
+	AppendRequest request{1, 1, 0, 0, 0, 0, {}};
+	for (unsigned i = 0; i < 256; ++i) { request.entries.push_back({i + 1, 1, EntryKind::NoOp, ""}); }
+	auto noop = plan_event(Receive{2, request}, false);
+	check(noop.count == 1 && noop.appends[0].kind == AdmissionClass::Control && noop.appends[0].encoded_bytes == 5422, "maximum no-op RPC uses checked protected framing bound");
+	request.entries[0].kind = EntryKind::Command;
+	check(plan_event(Receive{2, request}, false).appends[0].kind == AdmissionClass::Normal, "any command moves the entire atomic RPC to normal admission");
+	request.entries.push_back({257, 1, EntryKind::NoOp, ""});
+	check(throws([&] { plan_event(Receive{2, request}, true); }), "busy admission still rejects oversized typed RPCs");
+	check(throws([] { plan_event(Persisted{1}, false); }) && throws([] { plan_event(LocalCheckpoint{1, 1, 1, 1, {}, {}}, false); }), "external persistence completions and raw checkpoint requests reject explicitly");
+	check(plan_event(Start{}, false).count == 0 && plan_event(Read{1}, false).count == 0, "nonpersistent events do not charge a storage pack");
+	for (Message message : {Message{VoteResponse{9, false}}, Message{AppendRequest{9, 1, 0, 0, 0, 0, {}}}}) {
+		Core core(config(1), empty(1)); core.step(Start{});
+		auto event = Receive{2, message}; auto plan = plan_event(event, false);
+		auto actions = core.step(event); auto persist = find<Persist>(actions);
+		check(persist && plan.count > 0 && storage_batch_size(persist->batch) <= plan.appends[0].encoded_bytes, "higher-term hard-state writes fit response and empty-append plans");
+	}
+	for (auto kind : {EntryKind::NoOp, static_cast<EntryKind>(99)}) {
+		AppendRequest malformed{1, 1, 0, 0, 0, 0, {{1, 1, kind, "payload"}}};
+		check(throws([&] { plan_event(Receive{2, malformed}, true); }), "busy malformed no-op and unknown-kind RPCs reject before admission");
+	}
+	Limits small; small.command_bytes = 4; small.rpc_bytes = 5;
+	AppendRequest aggregate{1, 1, 0, 0, 0, 0, {{1, 1, EntryKind::Command, "four"}, {2, 1, EntryKind::Command, "four"}}};
+	check(throws([&] { plan_event(Receive{2, aggregate}, false, small); }), "aggregate RPC payload bounds reject before planning");
+}
+
 void storage_footprint_plans() {
 	using namespace cluster::consensus;
 	for (bool hard : {false, true}) {
@@ -777,7 +810,7 @@ void storage_footprint_plans() {
 }
 
 int main() {
-	try { storage_footprint_plans(); persistence_barriers(); delayed_completions_do_not_campaign(); replication_and_restart(); affirmative_majority_and_inheritance(); simultaneous_completions(); reads_and_partitions(); overlapping_reads_preserve_data(); application_lag_does_not_spin_reads(); stale_rpc_and_failure_transitions(); bounds_and_semantic_recovery(); local_checkpoint_core(); compacted_index_exhaustion(); compacted_replication(); checkpoint_semantic_recovery(); real_journal_integration(); real_store_integration(); reordered_crash_schedules(3, 0x52414654); reordered_crash_schedules(5, 0x434c5553); }
+	try { event_admission_plans(); storage_footprint_plans(); persistence_barriers(); delayed_completions_do_not_campaign(); replication_and_restart(); affirmative_majority_and_inheritance(); simultaneous_completions(); reads_and_partitions(); overlapping_reads_preserve_data(); application_lag_does_not_spin_reads(); stale_rpc_and_failure_transitions(); bounds_and_semantic_recovery(); local_checkpoint_core(); compacted_index_exhaustion(); compacted_replication(); checkpoint_semantic_recovery(); real_journal_integration(); real_store_integration(); reordered_crash_schedules(3, 0x52414654); reordered_crash_schedules(5, 0x434c5553); }
 	catch (const std::exception& error) { check(false, error.what()); }
 	std::cout << checks << " consensus checks, " << failures << " failures\n";
 	return failures ? 1 : 0;
