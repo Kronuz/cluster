@@ -40,7 +40,19 @@ The version 2 manifest binds the bundle and every required dependency by identit
 
 Reopen with `recover(replay, restore)`. The journal verifies the bundle and all dependencies before passing their bounded readers to `restore`, then replays the suffix. Both callbacks must construct unpublished state until recovery returns successfully. A missing or corrupt referenced artifact fails closed; recovery never falls back to an older generation. Older readers reject version 2 metadata instead of reinitializing it. `pin_artifact()` can retain a currently referenced artifact for a later publication without rewriting it.
 
-Publication does not delete old generations or artifacts. Reclamation, orphan cleanup, consensus checkpoint integration, and snapshot installation remain separate work. The preparation count bounds live handles, not accumulated disk usage.
+Publication does not itself delete old generations or artifacts. Explicit bounded reclamation is described below; consensus checkpoint integration lives in the separate core module, and network snapshot installation remains pending. The preparation count bounds live handles, not accumulated disk usage.
+
+## Bounded reclamation
+
+Call `reclaim_step(scan_budget)` on the owning storage executor after successful recovery/publication. Each call scans at most 1 through 4,096 directory entries, using an independent streaming cursor. A completed pass closes that cursor; a later call starts a new pass. Namespace mutations may cause omissions or repeats, so cleanup is eventual and each candidate is rechecked against current roots immediately before removal.
+
+The reclaimer always protects the current journal generation, manifest, stable lock, checkpoint bundle and declared dependencies. Active builders register their names before creation; prepared leases and readers retain artifact pins, including readers moved out of recovery callbacks. Reader descriptors close before their pins are released. Existing interfaces bound the registry to nine prepared leases, at most nine escaped recovery readers, and the single active builder; temporary verification reads use an already prepared identity.
+
+Exact reserved filename grammar selects candidates, then a bounded header/frame must prove matching store identity and basename identity. Foreign, malformed, unsafe, and unrelated files remain untouched. Only ownership framing is read; obsolete payloads are not checksummed during cleanup. Missing files are idempotent. Deleted names receive a directory barrier before the step succeeds, and uncertain I/O fences the journal; the consensus host must propagate `StorageFault` even without a pending persistence token.
+
+Returned statistics count scanned, protected, removed and unidentifiable candidates, plus logical bytes unlinked. The byte counter saturates explicitly rather than overflowing. These numbers do not report physical disk space freed. No recursive traversal occurs. POSIX enumeration uses a separately opened directory description rather than sharing offsets through `dup`.
+
+Interrupted version 1 artifact preparation leaves zero placeholder headers, which cannot prove store ownership. Such files are retained and reported even if large. Automatic scheduling, admission quotas, and a separately durable staging-ownership prefix remain required before claiming bounded accumulated storage. An explicit cleanup API alone does not establish a production disk bound.
 
 ## POSIX backend
 
@@ -52,7 +64,7 @@ The durability model assumes a local filesystem that honors atomic same-director
 
 ## Scope and tests
 
-Both formats support append and incremental recovery; version 2 adds immutable checkpoint publication. Reclamation, automatic orphan cleanup, asynchronous I/O, and consensus integration remain separate milestones. Interrupted publication may leave temporary manifests; they cannot become authoritative without the manifest replacement. Disk growth is therefore not yet bounded for a continuously running authority.
+Both formats support append and incremental recovery; version 2 adds immutable checkpoint publication. Automatic cleanup scheduling, reclaimable staging ownership, asynchronous I/O, and authority integration remain separate milestones. Interrupted publication may leave temporary manifests; they cannot become authoritative without the manifest replacement. Disk growth is therefore not yet bounded for a continuously running authority.
 
 The injected filesystem tests track visible and durable file contents separately from visible and durable names. They interrupt operations before and after side effects, exercise both namespace outcomes before a barrier, preserve previously acknowledged frontiers, and check process restart followed by power loss. Additional checks cover partial and zero-progress I/O, callbacks, corruption of every durable byte, truncation of every acknowledged prefix, oversized framing, sequence continuity, missing metadata, and concurrent owners. Checkpoint tests additionally interrupt preparation, publication, and recovery, corrupt every byte of required artifacts, and check owner lifetime and bounded admission. The POSIX test verifies real create/append/checkpoint/reopen, ownership locking, filename confinement, and rejection of symlinks, hardlinks, and special files.
 
@@ -89,3 +101,14 @@ Readback now runs explicitly before cutover. Repeating the workload with prepara
 | 67,108,864 | 67,108,864 | 0.706718 | 0.655203 | 0.063774 | 0.000888 |
 
 For the 128 MiB case, the single local publication sample fell from 385 ms to 64 ms, with preparation and readback outside that interval. This shifts work outside the freeze rather than eliminating checksum work. A real consensus bundle must be encoded and written after freezing its retained suffix; that work remains a separate pause budget. These samples do not establish production tail latency.
+
+## Reclamation measurement
+
+`reclaim_bench` publishes two checkpoint generations with two opaque artifacts each, releases preparation handles, then scans and synchronizes deletion of four obsolete files. On the same Intel Mac/AppleClang 17 Release configuration, the October 3, 2026 single samples were:
+
+| Bytes/artifact | Logical bytes before | Logical bytes after | Logical bytes unlinked | Files removed | Cleanup wall s | CPU s |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1,048,576 | 4,194,843 | 2,097,460 | 2,097,383 | 4 | 0.021816 | 0.001311 |
+| 67,108,864 | 268,435,995 | 134,218,036 | 134,217,959 | 4 | 0.030882 | 0.010203 |
+
+The obsolete payloads are intentionally not read; ownership headers establish eligibility. These results measure a nine-file directory and its deletion barrier, not large-directory throughput, physical space recovery, or production tails. Run `.scratch/journal/reclaim_bench` from the repository root. Fixture creation is excluded, and only each workload's own scratch directory is removed afterward.

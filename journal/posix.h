@@ -5,6 +5,7 @@
 #include <cerrno>
 #include <filesystem>
 #include <fcntl.h>
+#include <dirent.h>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -47,6 +48,21 @@ inline off_t checked_offset(std::uint64_t offset) {
 	}
 	return static_cast<off_t>(offset);
 }
+class PosixCursor final : public DirectoryCursor {
+public:
+	explicit PosixCursor(DIR* directory) : directory_(directory) {}
+	~PosixCursor() override { ::closedir(directory_); }
+	std::optional<std::string> next() override {
+		for (;;) {
+			errno = 0; auto entry = ::readdir(directory_);
+			if (!entry) { if (errno) { system_failure("scan journal directory"); } return std::nullopt; }
+			std::string_view name(entry->d_name);
+			if (name != "." && name != "..") { return std::string(name); }
+		}
+	}
+private:
+	DIR* directory_;
+};
 class PosixFile final : public File {
 public:
 	explicit PosixFile(int fd) : fd_(fd) {}
@@ -124,7 +140,26 @@ public:
 	void remove(std::string_view name) override {
 		detail::validate_name(name);
 		std::string component(name);
-		if (::unlinkat(directory_, component.c_str(), 0)) { detail::system_failure("remove journal file"); }
+		if (::unlinkat(directory_, component.c_str(), 0) && errno != ENOENT) { detail::system_failure("remove journal file"); }
+	}
+	std::unique_ptr<DirectoryCursor> scan_directory() override {
+		// dup() would share the original directory's file offset. Use an
+		// independent open description for every reclamation pass.
+		int fd = ::openat(directory_, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+		if (fd < 0) { detail::system_failure("open journal scan cursor"); }
+		auto directory = ::fdopendir(fd);
+		if (!directory) { auto error = errno; ::close(fd); errno = error; detail::system_failure("create journal scan cursor"); }
+		try { return std::make_unique<detail::PosixCursor>(directory); }
+		catch (...) { ::closedir(directory); throw; }
+	}
+	std::unique_ptr<File> open_reclaim_candidate(std::string_view name) override {
+		detail::validate_name(name); std::string component(name); struct stat status{};
+		if (::fstatat(directory_, component.c_str(), &status, AT_SYMLINK_NOFOLLOW)) {
+			if (errno == ENOENT) { return nullptr; } detail::system_failure("inspect reclamation candidate");
+		}
+		if (!S_ISREG(status.st_mode) || status.st_uid != ::geteuid() || status.st_nlink != 1 || (status.st_mode & 0022) ||
+			(status.st_mode & 0600) != 0600 || status.st_dev != device_) { return nullptr; }
+		return file(name, false);
 	}
 	void sync_directory() override {
 		int result;

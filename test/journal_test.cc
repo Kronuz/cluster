@@ -119,8 +119,25 @@ public:
 		model_.after();
 	}
 	void remove(std::string_view name) override { model_.before(); model_.visible.erase(std::string(name)); model_.after(); }
+	std::unique_ptr<DirectoryCursor> scan_directory() override {
+		model_.before(); auto cursor = std::make_unique<Cursor>(model_); model_.after(); return cursor;
+	}
+	std::unique_ptr<File> open_reclaim_candidate(std::string_view name) override {
+		model_.before(); auto found = model_.visible.find(std::string(name));
+		auto file = found == model_.visible.end() ? nullptr : std::make_unique<MemoryFile>(model_, found->second);
+		model_.after(); return file;
+	}
 	void sync_directory() override { model_.before(); model_.durable = model_.visible; model_.after(); }
 private:
+	struct Cursor final : DirectoryCursor {
+		explicit Cursor(Model& model) : model_(model) {}
+		std::optional<std::string> next() override {
+			model_.before(); auto next = model_.visible.upper_bound(last_); std::optional<std::string> result;
+			if (next != model_.visible.end()) { last_ = next->first; result = last_; }
+			model_.after(); return result;
+		}
+		Model& model_; std::string last_;
+	};
 	struct Lock final : OwnerLock {
 		explicit Lock(Model& model) : model_(model) {}
 		~Lock() override { model_.locked = false; }
@@ -325,6 +342,105 @@ void checkpoint_publication_failures() {
 		}
 	}
 	std::cout << "checkpoint publication operations tested: " << operations << '\n';
+}
+
+
+Model reclaim_fixture() {
+	auto model = initialized();
+	{
+		MemoryIO io(model); Journal journal(io, 1024); journal.recover([](auto, auto) {});
+		auto old_bundle = prepare(journal, "first"); auto old_app = prepare(journal, "application");
+		journal.publish_checkpoint(old_bundle, std::array{old_app}, 1);
+		auto bundle = prepare(journal, "first"); auto app = prepare(journal, "application");
+		journal.publish_checkpoint(bundle, std::array{app}, 1);
+	}
+	return model.clone();
+}
+void reclaim_all(Journal& journal, std::size_t budget = 1) {
+	for (std::size_t steps = 0; steps < 1000; ++steps) {
+		auto stats = journal.reclaim_step(budget); check(stats.scanned <= budget, "reclamation bounds scanned entries including protected and unknown names");
+		if (stats.complete) { return; }
+	}
+	throw std::runtime_error("reclamation pass did not complete");
+}
+void reclamation_roots_and_unknowns() {
+	auto model = reclaim_fixture();
+	MemoryIO io(model); std::optional<ArtifactReader> escaped;
+	Journal journal(io, 1024);
+	journal.recover([](auto, auto) {}, [&](auto&, auto& bundle, auto) { escaped.emplace(std::move(bundle)); });
+	check(throws([&] { journal.reclaim_step(0); }) && !journal.fenced(), "invalid scan admission leaves journal usable");
+	auto escaped_name = artifact_name(escaped->descriptor());
+	std::string prepared_name, active_name;
+	{
+		auto held = prepare(journal, "held"); prepared_name = artifact_name(held.descriptor());
+		auto builder = journal.prepare_artifact(); builder.append_chunk("active");
+		// Only one new name is active, distinct from the sealed prepared pin.
+		for (const auto& [name, inode] : model.visible) { if (name.starts_with("artifact-") && inode->visible.starts_with(std::string(56, '\0'))) { active_name = name; } }
+		reclaim_all(journal);
+		check(model.visible.contains(prepared_name) && model.visible.contains(active_name), "prepared handles and active builder protect their names");
+		auto finished = builder.finish();
+		check(model.visible.contains(artifact_name(finished.descriptor())), "protected builder remains finishable after reclamation");
+	}
+	auto sentinel = std::string("artifact-00000000000000000000000000000000");
+	model.visible[sentinel] = std::make_shared<Inode>();
+	auto paused = journal.reclaim_step(1);
+	check(!paused.complete && paused.scanned == 1, "reclamation retains its cursor across a partial scan");
+	{
+		auto bundle = prepare(journal, "first"); auto app = prepare(journal, "application"); journal.publish_checkpoint(bundle, std::array{app}, 1);
+	}
+	auto newest = journal.frontier();
+	reclaim_all(journal);
+	check(model.visible.contains(artifact_name(*newest.checkpoint)) && model.visible.contains(artifact_name(newest.dependencies[0])) &&
+		model.visible.contains("generation-" + detail::hexadecimal(newest.journal_identity)), "publication between scan steps rechecks and protects newly authoritative roots");
+	io.remove(sentinel); io.sync_directory();
+	check(model.visible.contains(escaped_name), "escaped recovery reader pins obsolete artifact across publication");
+	escaped.reset(); reclaim_all(journal);
+	check(!model.visible.contains(escaped_name) && !model.visible.contains(prepared_name) && !model.visible.contains(active_name), "released pins make only their obsolete artifacts reclaimable");
+	check(model.visible.size() == 5 && model.visible.contains("manifest") && model.visible.contains("owner.lock"), "reclamation retains exactly active generation and required roots");
+	// Keep partial, foreign, basename-mismatched and unrelated files intact.
+	auto unclassified = "artifact-" + detail::hexadecimal(detail::random_identity());
+	model.visible[unclassified] = std::make_shared<Inode>(); model.visible[unclassified]->visible.assign(56 + 1024, '\0');
+	auto mismatch = "artifact-" + detail::hexadecimal(detail::random_identity());
+	model.visible[mismatch] = model.visible.at(artifact_name(*journal.frontier().checkpoint));
+	Model foreign;
+	std::string foreign_name;
+	{
+		MemoryIO foreign_io(foreign); Journal other(foreign_io, 1024); auto id = identity(); id[0] = 'Z'; other.create(id);
+		auto file = prepare(other, "foreign"); foreign_name = artifact_name(file.descriptor());
+		model.visible[foreign_name] = foreign.visible.at(foreign_name);
+	}
+	model.visible["notes.txt"] = std::make_shared<Inode>();
+	auto stats = journal.reclaim_step(4096);
+	check(stats.complete && stats.unknown_files == 3 && stats.removed == 0 && !journal.fenced(), "unknown ownership is reported without deleting or fencing");
+	check(model.visible.contains(unclassified) && model.visible.contains(mismatch) && model.visible.contains(foreign_name) && model.visible.contains("notes.txt"), "unknown and unrelated files remain untouched");
+}
+void reclamation_failures() {
+	auto baseline = reclaim_fixture(); std::size_t operations;
+	auto proof = baseline.clone(); auto expected = replay_checkpoint(proof).first;
+	{
+		auto model = baseline.clone(); MemoryIO io(model); Journal journal(io, 1024); journal.recover([](auto, auto) {}, [](auto&, auto&, auto) {});
+		model.operations = 0; auto stats = journal.reclaim_step(4096); operations = model.operations;
+		check(stats.complete && stats.removed == 4 && stats.logical_bytes > 0, "obsolete generations and sealed artifacts are durably reclaimed");
+	}
+	for (std::size_t operation = 1; operation <= operations; ++operation) {
+		for (bool after : {false, true}) {
+			auto failed = baseline.clone();
+			{
+				MemoryIO io(failed); Journal journal(io, 1024); journal.recover([](auto, auto) {}, [](auto&, auto&, auto) {});
+				failed.operations = 0; failed.fail_operation = operation; failed.fail_after = after;
+				check(throws([&] { journal.reclaim_step(4096); }) && journal.fenced(), "uncertain reclamation I/O fences the owner");
+				check(throws([&] { journal.append_batch("unavailable"); }), "failed reclamation cannot resume writes");
+			}
+			failed.fail_operation = 0;
+			for (bool choose_new : {false, true}) {
+				auto crashed = failed.clone(); crashed.power_loss(choose_new);
+				auto [selected, restored] = replay_checkpoint(crashed);
+				check(restored == std::vector<std::string>{"first"} && selected.generation == expected.generation && selected.journal_identity == expected.journal_identity && selected.sequence == expected.sequence,
+					"either cleanup namespace outcome preserves exact latest acknowledged generation and state");
+			}
+		}
+	}
+	std::cout << "reclamation operations tested: " << operations << '\n';
 }
 
 void checkpoint_corruption() {
@@ -560,6 +676,22 @@ void posix() {
 		auto frontier = journal.recover([&](auto sequence, std::string_view batch) { check(sequence == 3, "POSIX checkpoint suffix sequence continues"); tail = batch; },
 			[&](const Frontier&, ArtifactReader& bundle, std::span<ArtifactReader> dependencies) { image = read_artifact(bundle); dependency = read_artifact(dependencies[0]); });
 		check(frontier.base_sequence == 2 && image == "prefix image" && dependency == "app" && tail == "tail", "POSIX checkpoint generation restores declared artifact and suffix");
+		std::vector<std::string> preserved;
+		auto reserved_name = [&] { auto name = "artifact-" + detail::hexadecimal(detail::random_identity()); preserved.push_back(name); return name; };
+		auto symlink = reserved_name(); std::filesystem::create_symlink("manifest", directory / symlink);
+		auto partial = reserved_name(); auto partial_file = io.create_exclusive(partial); detail::write_all(*partial_file, 0, std::string(1024, '\0')); partial_file->sync(); partial_file.reset();
+		auto hardlink = reserved_name(); std::filesystem::create_hard_link(directory / partial, directory / hardlink);
+		auto fifo = reserved_name(); check(::mkfifo((directory / fifo).c_str(), 0600) == 0, "create reserved FIFO candidate");
+		std::filesystem::create_directory(directory / reserved_name());
+		ArtifactDescriptor foreign{detail::random_identity(), 0, crc32c("")}; auto foreign_store = identity(); foreign_store[0] = 'Z';
+		preserved.push_back(artifact_name(foreign)); auto foreign_file = io.create_exclusive(artifact_name(foreign)); detail::write_all(*foreign_file, 0, detail::artifact_header(foreign_store, foreign)); foreign_file->sync(); foreign_file.reset();
+		ArtifactDescriptor corrupt{detail::random_identity(), 0, crc32c("")}; auto corrupt_header = detail::artifact_header(identity(), corrupt); corrupt_header.back() ^= 1;
+		preserved.push_back(artifact_name(corrupt)); auto corrupt_file = io.create_exclusive(artifact_name(corrupt)); detail::write_all(*corrupt_file, 0, corrupt_header); corrupt_file->sync(); corrupt_file.reset();
+		io.sync_directory();
+		auto stats = journal.reclaim_step(4096);
+		check(stats.complete && stats.removed == 1 && !std::filesystem::exists(directory / std::string(data_name)), "POSIX reclaimer removes obsolete owned generation");
+		for (const auto& name : preserved) { check(std::filesystem::symlink_status(directory / name).type() != std::filesystem::file_type::not_found, "POSIX reclaimer preserves foreign unknown and unsafe candidates"); }
+		check(stats.unknown_files == preserved.size(), "POSIX skipped ownership candidates are reported");
 	}
 	std::filesystem::create_symlink("manifest", directory / "symlink");
 	PosixIO io(directory);
@@ -572,7 +704,7 @@ void posix() {
 } // namespace
 
 int main() {
-	try { basics(); append_failures(); append_failures(3); append_failures(std::numeric_limits<std::size_t>::max(), true); append_failures(3, true); recovery_failures(); recovery_failures(true); recovery_failures(false, true); recovery_failures(true, true); corruption(); initialization_failures(); checkpoint_basics(); checkpoint_successive_generations(); artifact_verification(); preparation_ownership_and_failures(); checkpoint_publication_failures(); checkpoint_corruption(); posix(); }
+	try { basics(); append_failures(); append_failures(3); append_failures(std::numeric_limits<std::size_t>::max(), true); append_failures(3, true); recovery_failures(); recovery_failures(true); recovery_failures(false, true); recovery_failures(true, true); corruption(); initialization_failures(); checkpoint_basics(); checkpoint_successive_generations(); artifact_verification(); preparation_ownership_and_failures(); checkpoint_publication_failures(); checkpoint_corruption(); reclamation_roots_and_unknowns(); reclamation_failures(); posix(); }
 	catch (const std::exception& error) { check(false, error.what()); }
 	std::cout << checks << " journal checks, " << failures << " failures\n";
 	return failures ? 1 : 0;

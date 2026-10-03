@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <limits>
 #include <memory>
+#include <map>
+#include <optional>
 #include <utility>
 
 namespace kronuz::journal {
@@ -20,12 +22,24 @@ struct OwnerSession {
 	std::unique_ptr<OwnerLock> lock;
 	bool failed = false;
 	unsigned preparing = 0, prepared = 0;
+	std::optional<Identity> preparing_identity;
+	std::map<Identity, unsigned> pins;
 };
 constexpr unsigned maximum_prepared_artifacts = 9;
+struct ArtifactPin {
+	std::shared_ptr<OwnerSession> owner;
+	Identity identity;
+	ArtifactPin(std::shared_ptr<OwnerSession> session, Identity value) : owner(std::move(session)), identity(value) { ++owner->pins[identity]; }
+	~ArtifactPin() {
+		auto found = owner->pins.find(identity);
+		if (--found->second == 0) { owner->pins.erase(found); }
+	}
+};
 struct ArtifactLease {
 	ArtifactDescriptor descriptor;
 	std::shared_ptr<OwnerSession> owner;
-	ArtifactLease(ArtifactDescriptor value, std::shared_ptr<OwnerSession> session) : descriptor(value), owner(std::move(session)) { ++owner->prepared; }
+	ArtifactPin pin;
+	ArtifactLease(ArtifactDescriptor value, std::shared_ptr<OwnerSession> session) : descriptor(value), owner(std::move(session)), pin(owner, descriptor.identity) { ++owner->prepared; }
 	~ArtifactLease() { --owner->prepared; }
 };
 constexpr std::uint64_t artifact_magic = 0x315452415a4e524bull;
@@ -70,7 +84,7 @@ public:
 	ArtifactBuilder(ArtifactBuilder&& other) noexcept
 		: io_(other.io_), owner_(std::move(other.owner_)), file_(std::move(other.file_)), storage_(other.storage_),
 			descriptor_(other.descriptor_), maximum_(other.maximum_), checksum_(other.checksum_), active_(std::exchange(other.active_, false)) {}
-	~ArtifactBuilder() { if (active_) { --owner_->preparing; } }
+	~ArtifactBuilder() { file_.reset(); if (active_) { --owner_->preparing; owner_->preparing_identity.reset(); } }
 	void append_chunk(std::string_view bytes) {
 		if (!active_ || owner_->failed) { throw std::logic_error("artifact preparation unavailable"); }
 		if (bytes.size() > detail::artifact_chunk_size || bytes.size() > maximum_ - descriptor_.length) {
@@ -87,7 +101,7 @@ public:
 			descriptor_.checksum = checksum_.value();
 			detail::write_all(*file_, 0, detail::artifact_header(storage_, descriptor_));
 			file_->sync(); io_.sync_directory();
-			file_.reset(); active_ = false; --owner_->preparing;
+			file_.reset(); active_ = false; --owner_->preparing; owner_->preparing_identity.reset();
 			return PreparedArtifact(descriptor_, owner_);
 		} catch (...) { owner_->failed = true; throw; }
 	}
@@ -97,7 +111,7 @@ private:
 		: io_(io), owner_(std::move(owner)), storage_(storage), maximum_(maximum) {
 		if (owner_->preparing || owner_->prepared >= detail::maximum_prepared_artifacts) { throw std::logic_error("artifact preparation slots exhausted"); }
 		try {
-			descriptor_.identity = detail::random_identity(); file_ = io_.create_exclusive(artifact_name(descriptor_));
+			descriptor_.identity = detail::random_identity(); owner_->preparing_identity = descriptor_.identity; file_ = io_.create_exclusive(artifact_name(descriptor_));
 			// The placeholder is never authoritative and cannot validate until
 			// finish seals its length and checksum.
 			detail::write_all(*file_, 0, std::string(detail::artifact_header_size, '\0'));
@@ -119,7 +133,7 @@ public:
 	ArtifactReader(ArtifactReader&&) noexcept = default;
 	ArtifactReader& operator=(ArtifactReader&& other) noexcept {
 		if (this != &other) {
-			file_.reset(); owner_ = std::move(other.owner_); file_ = std::move(other.file_); descriptor_ = other.descriptor_;
+			file_.reset(); pin_ = std::move(other.pin_); owner_ = std::move(other.owner_); file_ = std::move(other.file_); descriptor_ = other.descriptor_;
 		}
 		return *this;
 	}
@@ -151,8 +165,10 @@ private:
 			checksum.update(std::string_view(buffer.data(), count)); offset += count;
 		}
 		if (checksum.value() != descriptor.checksum) { throw Corruption("artifact payload checksum mismatch"); }
+		pin_ = std::make_shared<detail::ArtifactPin>(owner_, descriptor.identity);
 	}
 	std::shared_ptr<detail::OwnerSession> owner_;
+	std::shared_ptr<detail::ArtifactPin> pin_;
 	std::unique_ptr<File> file_;
 	ArtifactDescriptor descriptor_;
 };

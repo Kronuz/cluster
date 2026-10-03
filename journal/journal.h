@@ -22,6 +22,12 @@ struct Frontier {
 	std::vector<ArtifactDescriptor> dependencies;
 };
 
+struct ReclaimStats {
+	std::size_t scanned = 0, removed = 0, protected_files = 0, unknown_files = 0;
+	std::uint64_t logical_bytes = 0;
+	bool logical_bytes_saturated = false, complete = false;
+};
+
 // Synchronous, single-owner opaque storage batches. IO outlives the journal
 // and every artifact builder, prepared handle, and reader.
 // Successful append returns only after the manifest's directory barrier.
@@ -60,6 +66,35 @@ public:
 		try {
 			validate_artifact_bound(artifact.descriptor());
 			ArtifactReader verified(io_, owner_, frontier_.identity, artifact.descriptor());
+		} catch (...) { owner_->failed = true; throw; }
+	}
+
+
+	ReclaimStats reclaim_step(std::size_t scan_budget = 128) {
+		available();
+		if (scan_budget == 0 || scan_budget > 4096) { throw std::invalid_argument("invalid reclamation scan budget"); }
+		ReclaimStats stats;
+		try {
+			if (!reclaim_cursor_) { reclaim_cursor_ = io_.scan_directory(); }
+			while (stats.scanned < scan_budget) {
+				auto name = reclaim_cursor_->next();
+				if (!name) { stats.complete = true; reclaim_cursor_.reset(); break; }
+				++stats.scanned;
+				if (protected_name(*name)) { ++stats.protected_files; continue; }
+				if (!reclaim_name(*name)) { continue; }
+				auto file = io_.open_reclaim_candidate(*name);
+				if (!file) { ++stats.unknown_files; continue; }
+				auto length = file->size();
+				if (!owned_candidate(*name, *file, length)) { ++stats.unknown_files; continue; }
+				file.reset();
+				if (protected_name(*name)) { ++stats.protected_files; continue; }
+				io_.remove(*name); ++stats.removed;
+				if (length > std::numeric_limits<std::uint64_t>::max() - stats.logical_bytes) {
+					stats.logical_bytes = std::numeric_limits<std::uint64_t>::max(); stats.logical_bytes_saturated = true;
+				} else { stats.logical_bytes += length; }
+			}
+			if (stats.removed) { io_.sync_directory(); }
+			return stats;
 		} catch (...) { owner_->failed = true; throw; }
 	}
 
@@ -236,6 +271,52 @@ private:
 	static constexpr std::size_t maximum_manifest_size = manifest_v2_size + maximum_dependencies * 28;
 	static constexpr std::uint64_t maximum_offset = std::numeric_limits<std::int64_t>::max();
 
+	static bool hexadecimal_name(std::string_view name, std::string_view prefix, std::size_t digits) {
+		if (!name.starts_with(prefix) || name.size() != prefix.size() + digits) { return false; }
+		name.remove_prefix(prefix.size());
+		return std::all_of(name.begin(), name.end(), [](unsigned char byte) { return (byte >= '0' && byte <= '9') || (byte >= 'a' && byte <= 'f'); });
+	}
+	static bool reclaim_name(std::string_view name) {
+		return name == "journal-0000000000000001" || hexadecimal_name(name, "generation-", 32) ||
+			hexadecimal_name(name, "artifact-", 32) || hexadecimal_name(name, "manifest.pending-", 32);
+	}
+	bool protected_name(std::string_view name) const {
+		if (name == manifest_name || name == "owner.lock" || name == data_name(frontier_)) { return true; }
+		if (frontier_.checkpoint && name == artifact_name(*frontier_.checkpoint)) { return true; }
+		for (const auto& artifact : frontier_.dependencies) { if (name == artifact_name(artifact)) { return true; } }
+		if (owner_->preparing_identity && name == "artifact-" + detail::hexadecimal(*owner_->preparing_identity)) { return true; }
+		for (const auto& [identity, references] : owner_->pins) { if (name == "artifact-" + detail::hexadecimal(identity)) { return true; } }
+		return false;
+	}
+	bool owned_candidate(std::string_view name, File& file, std::uint64_t length) const {
+		try {
+			std::array<char, maximum_manifest_size> raw{};
+			if (name.starts_with("manifest.pending-")) {
+				if (length != manifest_size && (length < manifest_v2_size || length > maximum_manifest_size)) { return false; }
+				read_all(file, 0, std::span<char>(raw.data(), static_cast<std::size_t>(length)));
+				return decode_manifest(std::string_view(raw.data(), static_cast<std::size_t>(length))).identity == frontier_.identity;
+			}
+			auto size = name.starts_with("artifact-") ? detail::artifact_header_size : (name.starts_with("generation-") ? file_header_v2_size : file_header_size);
+			if (length < size) { return false; }
+			read_all(file, 0, std::span<char>(raw.data(), size));
+			std::string_view bytes(raw.data(), size);
+			if (crc32c(bytes.substr(0, size - 4)) != checksum_at_end(bytes)) { return false; }
+			auto magic = get64(bytes);
+			if (bytes.substr(0, frontier_.identity.size()) != std::string_view(frontier_.identity.data(), frontier_.identity.size())) { return false; }
+			bytes.remove_prefix(frontier_.identity.size());
+			if (name.starts_with("artifact-")) {
+				Identity id{}; std::copy_n(bytes.begin(), id.size(), id.begin()); bytes.remove_prefix(id.size());
+				auto payload = get64(bytes);
+				return magic == detail::artifact_magic && name == "artifact-" + detail::hexadecimal(id) &&
+					payload <= maximum_offset - detail::artifact_header_size && length == detail::artifact_header_size + payload;
+			}
+			if (name.starts_with("generation-")) {
+				Identity id{}; std::copy_n(bytes.begin(), id.size(), id.begin()); bytes.remove_prefix(id.size());
+				return magic == file_v2_magic && name == "generation-" + detail::hexadecimal(id) && get64(bytes) >= 2;
+			}
+			return magic == file_magic && name == "journal-0000000000000001";
+		} catch (const Corruption&) { return false; }
+	}
 	void unused() const {
 		if (owner_->lock || ready_ || owner_->failed) { throw std::logic_error("journal already initialized or fenced"); }
 	}
@@ -341,6 +422,7 @@ private:
 	std::shared_ptr<detail::OwnerSession> owner_ = std::make_shared<detail::OwnerSession>();
 	std::unique_ptr<File> data_;
 	Frontier frontier_;
+	std::unique_ptr<DirectoryCursor> reclaim_cursor_;
 	bool ready_ = false;
 };
 
