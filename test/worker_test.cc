@@ -1,4 +1,9 @@
 #include "consensus/worker.h"
+#include "consensus/snapshot_channel.h"
+#include <deque>
+#include <chrono>
+#include <fstream>
+#include <sys/resource.h>
 #include "journal/posix.h"
 #include <iostream>
 #include <map>
@@ -437,11 +442,11 @@ struct SnapshotFixture {
 	static FixedConfiguration fixed() { auto result = configuration(); result.voters = {1, 2, 3}; return result; }
 	static kronuz::journal::AdmissionLimits quota() { return {{512 * 1024, 4096}, {16 * 1024, 3}, {128 * 1024, 4}, 8, 3}; }
 	Directory directory; FaultIO io; Worker worker; bool unexpected_install = false; std::string application_state;
-	explicit SnapshotFixture(std::string name, std::optional<SnapshotLimits> snapshots = SnapshotLimits{7, 100000}, kronuz::journal::AdmissionLimits capacity = quota())
+	explicit SnapshotFixture(std::string name, std::optional<SnapshotLimits> snapshots = SnapshotLimits{7, 100000}, kronuz::journal::AdmissionLimits capacity = quota(), bool start = true)
 		: directory(std::move(name)), io(directory.path), worker(io, fixed(), capacity, limits(), {}, {4, 1}, snapshots) {
 		kronuz::journal::Identity identity{}; identity[0] = 'S'; worker.create(identity);
 		for (unsigned turn = 0; turn < 100 && !worker.ready(); ++turn) { worker.run_one({0, 100}); }
-		worker.try_submit(Start{}); drain();
+		if (start) { worker.try_submit(Start{}); drain(); }
 	}
 	void drain() {
 		for (const auto& action : worker.take_actions()) {
@@ -817,7 +822,7 @@ void snapshot_install_reopening() {
 			auto frontier = journal.recover([](auto, auto) {}, [&](const auto& selected, auto& reader, auto dependencies) {
 				std::string bytes(static_cast<std::size_t>(reader.descriptor().length), '\0'); reader.read_at(0, std::span<char>(bytes.data(), bytes.size()));
 				auto bundle = decode_checkpoint(bytes, SnapshotFixture::fixed(), selected.base_sequence, selected.dependencies.at(0), limits()); decoded = true;
-				check(dependencies.size() == 1 && bundle.storage_sequence == sequence && bundle.state.configuration == SnapshotFixture::fixed() && bundle.state.hard.term == incoming_term && bundle.state.hard.voted_for == (incoming_term == 1 ? std::optional<NodeId>{2} : std::nullopt), "persisted receiver bundle preserves fixed identity and same-term ballot or clears a higher-term ballot");
+				check(dependencies.size() == 1 && bundle.storage_sequence == sequence && bundle.application_format == 7 && bundle.state.configuration == SnapshotFixture::fixed() && bundle.state.hard.term == incoming_term && bundle.state.hard.voted_for == (incoming_term == 1 ? std::optional<NodeId>{2} : std::nullopt), "persisted receiver bundle preserves fixed identity and same-term ballot or clears a higher-term ballot");
 				check(bundle.state.entries.size() == (matching ? 1 : 0) && (!matching || bundle.state.entries[0].payload == "retained"), "persisted receiver bundle retains only the correctly matching local suffix");
 			});
 			check(decoded && frontier.identity[0] == 'S' && frontier.sequence == sequence, "receiver storage identity and exact covered sequence survive publication");
@@ -884,7 +889,321 @@ void snapshot_publication_faults() {
 	}
 }
 
-int main() {
-	try { snapshot_reception_and_validation(); snapshot_policy_and_rejection(); snapshot_cancellation_phases(); snapshot_read_faults(); snapshot_restart_cleanup(); snapshot_protocol_progress(); snapshot_installation(); snapshot_rejection_branches(); snapshot_old_application(); snapshot_install_reopening(); snapshot_install_admission(); snapshot_publication_faults(); maintenance_preserves_protocol_timers(); real_worker(); partial_control_pack(); failures_and_multi_action_output(); interrupted_initialization(); checkpoint_crash_and_progress(); preparation_preserves_protocol_timers(); checkpoint_cancellation_and_completion(); checkpoint_faults(); } catch (const std::exception& error) { check(false, error.what()); }
+void owned_snapshot_sources() {
+	std::optional<SourceInfo> foreign_source;
+	for (auto [length, fault] : std::array<std::pair<std::size_t, unsigned>, 7>{{{0, 0}, {9, 0}, {65553, 0}, {9, 1}, {9, 2}, {9, 3}, {65553, 4}}}) {
+		SnapshotFixture fixture("source-" + std::to_string(length) + "-" + std::to_string(fault)); auto& worker = fixture.worker; std::string image(length, 's');
+		auto id = worker.reserve_snapshot(fixture.context(image)); if (!id) { check(false, "source fixture reserves incoming publication"); continue; }
+		validate_incoming(fixture, *id, image); worker.request_install(*id);
+		for (unsigned turn = 0; turn < 200 && !worker.snapshot_activation(); ++turn) { fixture.pump(); }
+		auto activation = worker.snapshot_activation(); if (!activation) { check(false, "source fixture publishes candidate"); continue; }
+		worker.snapshot_activated(*id, activation->token);
+		for (unsigned turn = 0; turn < 100 && worker.busy(); ++turn) { fixture.pump(); } worker.take_snapshot_result();
+		fixture.io.fail_read = fault == 1 || fault == 2; fixture.io.read_failure_after = fault == 2; fixture.io.corrupt_payload_read = fault == 3;
+		std::map<NodeId, Receive> responses; unsigned contacts = 0;
+		auto drain = [&] {
+			for (const auto& action : worker.take_actions()) {
+				if (auto committed = std::get_if<Committed>(&action)) { worker.applied({committed->entries.back().index}); }
+				if (auto send = std::get_if<Send>(&action)) {
+					if (auto vote = std::get_if<VoteRequest>(&send->message); vote && send->peer == 3) { responses.insert_or_assign(3, Receive{3, VoteResponse{vote->term, true}}); }
+					if (auto append = std::get_if<AppendRequest>(&send->message)) {
+						if (send->peer == 3) { auto matched = append->previous + append->entries.size(); responses.insert_or_assign(3, Receive{3, AppendResponse{append->term, append->rpc, true, matched, matched + 1, append->read_probe}}); }
+						else if (!append->previous && append->entries.empty()) { ++contacts; }
+						else { responses.insert_or_assign(2, Receive{2, AppendResponse{append->term, append->rpc, false, 0, 1, append->read_probe}}); }
+					}
+				}
+			}
+		};
+		std::uint64_t source_clock = 0;
+		auto pump = [&](std::uint64_t now) {
+			source_clock = std::max(source_clock, now);
+			if (!responses.empty()) { auto next = responses.begin(); if (worker.try_submit(next->second) == SubmitResult::Accepted) { responses.erase(next); } }
+			worker.run_one({source_clock, 100}); drain();
+		};
+		worker.try_submit(Tick{100, 100}); drain();
+		if (fault == 4) {
+			auto reads = fixture.io.payload_reads; bool canceled = false;
+			for (unsigned turn = 0; turn < 1000 && !canceled; ++turn) { pump(100 + turn / 10); if (fixture.io.payload_reads > reads) { canceled = worker.source_peer_failed(2) == ValidationAck::Accepted; } }
+			auto after = fixture.io.payload_reads; auto now = source_clock; for (unsigned turn = 0; turn < 30; ++turn) { pump(now); }
+			check(canceled && !worker.snapshot_source() && !worker.fenced() && fixture.io.payload_reads == after, "peer cancellation during source verification releases IO ownership and retains its failure across busy callbacks"); continue;
+		}
+		for (unsigned turn = 0; turn < 1000 && !worker.snapshot_source(); ++turn) { pump(100 + turn / 10); }
+		auto source = worker.snapshot_source();
+		if (fault) { check(worker.fenced() && !source, "source metadata/read failures and checksum corruption fence before transmission"); continue; }
+		check(source && source->peer == 2 && source->descriptor.application_bytes == length && source->descriptor.application_format == 7 && source->key.boundary == LogBoundary{1, 1} && worker.committed() == 2, "owned source binds completed incoming format, publication, flight and healthy peer commitment");
+		if (!source) { continue; }
+		if (foreign_source) { check(worker.source_failed(foreign_source->source) == ValidationAck::Stale && worker.consume_source(foreign_source->source, 1) == ValidationAck::Stale && !worker.fenced(), "foreign source callbacks cannot consume or fence another owner"); }
+		foreign_source = source;
+		std::string actual; bool final = false, held = false; Token previous = 0;
+		for (unsigned turn = 0; turn < 1000 && !final; ++turn) {
+			pump(250 + turn / 10); auto chunk = worker.source_chunk(); if (!chunk) { continue; }
+			check(chunk->offset == actual.size() && chunk->chunk > previous && chunk->bytes.size() <= 65536, "owned source has exact bounded offsets and distinct monotonic chunk tokens");
+			if (!held) {
+				auto incoming_context = fixture.context("incoming"); incoming_context.leader_term = worker.term(); incoming_context.authenticated_peer = 3;
+				auto incoming = worker.reserve_snapshot(incoming_context); check(incoming.has_value(), "outbound source and incoming replacement use independent owned slots");
+				if (incoming) { worker.offer_snapshot_chunk(*incoming, 0, "incoming", true); for (unsigned prepare = 0; prepare < 100 && !worker.validation_chunk(); ++prepare) { pump(300 + prepare); } }
+				auto reads = fixture.io.payload_reads, scans = fixture.io.scans; auto token = chunk->chunk; auto data = std::string(chunk->bytes.data(), chunk->bytes.size()); auto before_contacts = contacts; bool proposed = false;
+				for (unsigned wait = 0; wait < 60; ++wait) { if (!proposed) { proposed = worker.try_submit(Propose{799, "more"}) == SubmitResult::Accepted; } worker.try_submit(Read{800 + wait}); pump(400 + wait * 20); }
+				check(incoming && worker.validation_chunk() && worker.snapshot_buffer_capacity() == 131072 && proposed && worker.committed() == 3, "held inbound and outbound views permit healthy voter commitment and bounded independent mailboxes");
+				if (incoming) { worker.cancel_snapshot(*incoming); worker.take_snapshot_result(); }
+				for (unsigned pending = 0; pending < 30 && worker.try_submit(Read{1700}) != SubmitResult::Accepted; ++pending) { pump(1600); }
+				auto held_reads = fixture.io.payload_reads, held_scans = fixture.io.scans;
+				for (unsigned pending = 0; pending < 30; ++pending) { worker.run_one({1600 + pending, 100}); }
+				check(fixture.io.scans > held_scans && fixture.io.payload_reads == held_reads && worker.source_chunk() && worker.try_submit(Read{1701}) == SubmitResult::Busy, "held ordinary output and source view continue reclamation without rereading"); drain();
+				auto same = worker.source_chunk(); check(same && same->chunk == token && std::string(same->bytes.data(), same->bytes.size()) == data && fixture.io.payload_reads == reads && fixture.io.scans > scans && contacts > before_contacts, "held source mailbox preserves bytes while timers and reclamation continue"); held = true;
+			}
+			actual.append(chunk->bytes.data(), chunk->bytes.size()); final = chunk->final; previous = chunk->chunk;
+			check(worker.consume_source(source->source, chunk->chunk + 1000000) == ValidationAck::Stale && worker.consume_source(source->source, chunk->chunk) == ValidationAck::Accepted && worker.consume_source(source->source, chunk->chunk) == ValidationAck::Stale, "only exact unconsumed source token advances output");
+		}
+		check(final && actual == image && worker.snapshot_source() && !worker.source_chunk() && !worker.fenced(), "verified source streams complete image and distinct final EOF while retaining flight");
+		check(worker.source_failed(source->source) == ValidationAck::Accepted, "owned source failure is accepted independently of output");
+		for (unsigned turn = 0; turn < 30; ++turn) { pump(1500); }
+		check(worker.consume_source(source->source, previous) == ValidationAck::Stale && !worker.fenced(), "released source rejects obsolete callbacks without fencing");
+	}
+}
+
+void binary_transfer_integration(std::size_t length, unsigned mode = 0, bool measure = false) {
+	using Clock = std::chrono::steady_clock;
+	struct Node {
+		SnapshotFixture::Directory directory; FaultIO io; Worker worker; SnapshotChannel transfer;
+		std::deque<Receive> messages; std::string application, candidate; Token eof = 0;
+		Node(NodeId id, std::size_t size, unsigned mode) : directory("binary-" + std::to_string(size) + "-" + std::to_string(mode) + "-" + std::to_string(id)), io(directory.path),
+			worker(io, [&] { auto fixed = SnapshotFixture::fixed(); fixed.local = id; return fixed; }(), {{1024ull * 1024 * 1024, 4096}, {16 * 1024, 3}, {256ull * 1024 * 1024, 4}, 8, 3}, limits(), {}, {4, 1}, SnapshotLimits{7, 128ull * 1024 * 1024}), transfer(worker) {
+			kronuz::journal::Identity identity{}; identity[0] = static_cast<char>(id); worker.create(identity);
+			for (unsigned turn = 0; turn < 100 && !worker.ready(); ++turn) { worker.run_one({0, 100}); }
+			worker.try_submit(Start{}); worker.take_actions();
+		}
+	};
+	Node leader(1, length, mode), receiver(2, length, mode), healthy(3, length, mode); std::array<Node*, 3> nodes{&leader, &receiver, &healthy};
+	std::string image(length, 'i'); leader.application = image; healthy.application = image;
+	Identity first{}, second{}; first[0] = 'a'; second[0] = 'b'; TrustedSession outgoing{2, first, second}, incoming{1, second, first};
+	leader.transfer.register_session(outgoing); receiver.transfer.register_session(incoming);
+	bool opened_peer = false, installed_result = false, suffix = false, proposed = false, disturbed = false;
+	std::uint64_t leader_offset = 0; std::string duplicate_begin; bool duplicated = false; std::optional<CheckpointId> capture;
+	std::size_t offered = 0, wire_bytes = 0, maximum_buffers = 0, allocated_buffers = 0, queue_peak = 0; std::uint64_t clock = 100;
+	auto start = Clock::now(); auto cpu_start = std::clock(); Token observed_leader = 0, observed_receiver = 0;
+	auto drain = [&](Node& node) {
+		for (const auto& action : node.worker.take_actions()) {
+			if (auto fenced = std::get_if<Fenced>(&action)) { std::cerr << "binary node " << node.worker.configuration().local << ": " << fenced->reason << "\n"; }
+			if (auto range = std::get_if<Committed>(&action)) { for (const auto& entry : range->entries) { if (entry.kind == EntryKind::Command) { node.application += "/" + entry.payload; } } node.worker.applied({range->entries.back().index}); }
+			if (auto send = std::get_if<Send>(&action)) {
+				if (!opened_peer && (send->peer == 2 || node.worker.configuration().local == 2)) { continue; }
+				auto destination = nodes.at(static_cast<std::size_t>(send->peer - 1)); destination->messages.push_back({node.worker.configuration().local, send->message}); queue_peak = std::max(queue_peak, destination->messages.size());
+				check(destination->messages.size() <= 64, "integration host keeps ordinary RPC queue bounded");
+			}
+		}
+	};
+	auto wire = [&](Node& from, Node& to, TrustedSession session, Token& observed) {
+		auto output = from.transfer.outbound(); if (!output) { return; }
+		if (observed != output->token) {
+			observed = output->token; auto frame = decode_transfer(std::string_view(output->bytes.data(), output->bytes.size()));
+			if (&from == &leader && frame.kind == TransferKind::Begin && mode == 0 && !measure) { duplicate_begin.assign(output->bytes.data(), output->bytes.size()); }
+			if (frame.kind == TransferKind::Result && static_cast<unsigned char>(frame.body[0]) == static_cast<unsigned char>(TransferOutcome::Installed)) {
+				installed_result = true;
+				if (mode == 2 && !disturbed) { from.transfer.consume_output(output->token, output->bytes.size()); disturbed = true; leader_offset = 60040; return; }
+			}
+		}
+		auto count = std::min(output->bytes.size(), length > 65553 ? std::size_t{32768} : std::size_t{127});
+		auto input = to.transfer.receive(session, output->bytes.first(count)); check(input.result != TransferReceive::Closed, "trusted partial binary delivery stays open");
+		if (input.consumed) { from.transfer.consume_output(output->token, input.consumed); wire_bytes += input.consumed; }
+	};
+	for (unsigned turn = 0; turn < 100000; ++turn) {
+		clock = 100 + turn / 20;
+		for (auto node : nodes) {
+			if (!node->messages.empty()) { auto result = node->worker.try_submit(node->messages.front()); if (result == SubmitResult::Accepted) { node->messages.pop_front(); } }
+			node->worker.run_one({node == &receiver && !opened_peer ? 0 : clock + (node == &leader ? leader_offset : 0), node == &leader ? 100u : 200u}); drain(*node);
+		}
+		if (!capture && !opened_peer && leader.worker.applied_index() == 1) { capture = leader.worker.reserve_checkpoint(length); if (capture) { leader.worker.attach_capture(*capture, {1000, 1, leader.worker.term()}); } }
+		if (capture && !opened_peer && offered <= length) {
+			auto count = std::min<std::size_t>(65536, length - offered); auto result = leader.worker.offer_application_chunk(*capture, std::string_view(image).substr(offered, count), offered + count == length);
+			if (result == SubmitResult::Accepted) { offered += count; if (offered == length) { ++offered; } }
+		}
+		if (leader.worker.base_index() == 1) { opened_peer = true; }
+		if (leader.worker.snapshot_source() && !proposed) { if (leader.worker.try_submit(Propose{2000, "tail"}) == SubmitResult::Accepted) { proposed = true; } drain(leader); }
+		if (mode == 3) { if (auto result = receiver.worker.pending_snapshot_result(); result && result->reason == SnapshotReason::Installed) { installed_result = true; } }
+		leader.transfer.run_one({clock + leader_offset, 100}); receiver.transfer.run_one({clock, 200});
+		if (mode == 3 && !disturbed && receiver.worker.storage_frontier().checkpoint) {
+			leader.transfer.session_closed(outgoing); receiver.transfer.session_closed(incoming);
+			first[0] = 'x'; second[0] = 'y'; outgoing = {2, first, second}; incoming = {1, second, first};
+			leader.transfer.register_session(outgoing); receiver.transfer.register_session(incoming); disturbed = true;
+		}
+		if (mode == 3) { if (auto result = receiver.worker.pending_snapshot_result(); result && result->reason == SnapshotReason::Installed) { installed_result = true; } }
+		wire(leader, receiver, incoming, observed_leader); wire(receiver, leader, outgoing, observed_receiver);
+		if (!duplicated && !duplicate_begin.empty() && receiver.transfer.incoming_snapshot() && !receiver.transfer.outbound()) { auto repeated = receiver.transfer.receive(incoming, std::span<const char>(duplicate_begin.data(), duplicate_begin.size())); wire_bytes += repeated.consumed; check(repeated.consumed == duplicate_begin.size() && repeated.result == TransferReceive::Accepted, "duplicate Begin traverses active real Workers before transfer completion"); duplicated = true; }
+		if (auto view = receiver.worker.validation_chunk()) {
+			check(view->offset == receiver.candidate.size(), "binary receiver validates exact candidate offsets"); receiver.candidate.append(view->bytes.data(), view->bytes.size());
+			receiver.worker.consume_validation(view->snapshot, view->chunk); if (view->verified_eof) { receiver.eof = view->chunk; receiver.worker.validation_succeeded(view->snapshot, view->chunk); }
+			if (mode == 1 && !disturbed && !view->verified_eof) {
+				auto previous = incoming; leader.transfer.session_closed(outgoing); receiver.transfer.session_closed(incoming);
+				first[0] = 'x'; second[0] = 'y'; outgoing = {2, first, second}; incoming = {1, second, first};
+				leader.transfer.register_session(outgoing); receiver.transfer.register_session(incoming);
+				check(receiver.transfer.receive(previous, {}).result == TransferReceive::Closed && !receiver.worker.fenced(), "old session callback cannot consume new connection state");
+				receiver.candidate.clear(); receiver.eof = 0; disturbed = true;
+			}
+		}
+		if (auto activation = receiver.worker.snapshot_activation()) { check(receiver.eof && receiver.candidate == image, "actual binary transfer reaches validated exact image before activation"); if (mode == 5) {
+			check(receiver.worker.cancel_snapshot(activation->snapshot) == CancelResult::TooLate, "published activation failure fixture cannot cancel its installation");
+			check(receiver.worker.snapshot_activation_failed(activation->snapshot, activation->token) == ValidationAck::Accepted && receiver.worker.fenced(), "matching activation failure fences actual binary receiver");
+			receiver.transfer.run_one({clock, 200});
+			check(receiver.transfer.drained() && !receiver.transfer.incoming_snapshot() && !receiver.transfer.outbound() && !receiver.transfer.session_open(incoming) && receiver.transfer.retained_bytes() == 0, "fenced TooLate installation releases channel ownership without emitting a result");
+			leader.transfer.session_closed(outgoing); return;
+		} receiver.application = std::move(receiver.candidate); receiver.worker.snapshot_activated(activation->snapshot, activation->token); }
+		maximum_buffers = std::max(maximum_buffers, leader.transfer.retained_bytes() + receiver.transfer.retained_bytes());
+		allocated_buffers = std::max(allocated_buffers, leader.transfer.buffer_capacity() + receiver.transfer.buffer_capacity() + leader.worker.snapshot_buffer_capacity() + receiver.worker.snapshot_buffer_capacity());
+		if (installed_result && receiver.worker.applied_index() == 2 && leader.worker.applied_index() == 2 && healthy.worker.applied_index() == 2) { suffix = true; break; }
+		if (leader.worker.fenced() || receiver.worker.fenced() || healthy.worker.fenced()) { break; }
+	}
+	if (!suffix) { std::cerr << "binary progress: bytes=" << wire_bytes << " capture=" << bool(capture) << " base=" << leader.worker.base_index() << " term=" << leader.worker.term() << " role=" << int(leader.worker.role()) << " commit=" << leader.worker.committed() << " receiver=" << receiver.worker.applied_index() << " healthy=" << healthy.worker.applied_index() << " source=" << bool(leader.worker.snapshot_source()) << "\n"; }
+	check(installed_result && suffix && receiver.application == image + "/tail" && leader.application == receiver.application && healthy.application == receiver.application && !leader.worker.snapshot_source(), "receiver-generated durable Installed result advances real sender flight and ordinary suffix produces exact application state");
+	check(queue_peak <= 64 && maximum_buffers <= maximum_transfer_bytes * 2 + 400, "binary stop-and-wait retains bounded frame storage independently of image size");
+	auto elapsed = std::chrono::duration<double>(Clock::now() - start).count(); auto cpu = double(std::clock() - cpu_start) / CLOCKS_PER_SEC; rusage usage{}; getrusage(RUSAGE_SELF, &usage);
+	if (!measure) { return; }
+	std::ofstream measurements(std::filesystem::current_path() / ".scratch" / "snapshot-transfer-benchmark.csv", std::ios::app);
+	measurements << length << ',' << elapsed << ',' << cpu << ',' << wire_bytes << ',' << maximum_buffers << ',' << allocated_buffers << ',' << usage.ru_maxrss << ',' << leader.io.payload_reads << ',' << receiver.io.payload_reads << '\n';
+}
+
+void checkpoint_format_recovery() {
+	for (bool known : {false, true}) {
+		SnapshotFixture::Directory directory("format-recovery-" + std::to_string(known));
+		{
+			FaultIO io(directory.path); Worker worker(io, configuration(), SnapshotFixture::quota(), limits(), {}, {4, 1}, known ? std::optional<SnapshotLimits>{{7, 100000}} : std::nullopt);
+			kronuz::journal::Identity identity{}; identity[0] = 'f'; worker.create(identity);
+			for (unsigned turn = 0; turn < 100 && !worker.ready(); ++turn) { worker.run_one({0, 100}); } worker.try_submit(Start{}); worker.take_actions();
+			auto pump = [&] { worker.run_one({100, 100}); for (const auto& action : worker.take_actions()) { if (auto committed = std::get_if<Committed>(&action)) { worker.applied({committed->entries.back().index}); } } };
+			for (unsigned turn = 0; turn < 100 && worker.applied_index() != 1; ++turn) { pump(); }
+			auto id = worker.reserve_checkpoint(5); if (!id) { check(false, "format fixture reserves local capture"); continue; }
+			worker.attach_capture(*id, {1, 1, worker.term()}); worker.offer_application_chunk(*id, "image", true);
+			for (unsigned turn = 0; turn < 100 && worker.base_index() != 1; ++turn) { pump(); }
+			check(worker.base_index() == 1 && !worker.fenced(), "format fixture publishes exact local image");
+		}
+		{
+			FaultIO io(directory.path); Worker worker(io, configuration(), SnapshotFixture::quota(), limits(), {}, {4, 1}, SnapshotLimits{8, 100000}); bool restored = false;
+			auto restore = [&](auto& reader) { std::array<char, 5> bytes{}; reader.read_at(0, bytes); restored = std::string_view(bytes.data(), bytes.size()) == "image"; };
+			if (known) { check(throws([&] { worker.recover(restore); }) && worker.fenced() && !restored, "changed format policy rejects known persisted format before application activation"); }
+			else { worker.recover(restore); for (unsigned turn = 0; turn < 100 && !worker.ready(); ++turn) { worker.run_one({100, 100}); } check(restored && worker.ready() && worker.base_index() == 1 && !worker.snapshot_source(), "legacy unknown-format image remains recoverable without inferred export format"); }
+		}
+	}
+}
+
+void legacy_source_export_rejection() {
+	SnapshotFixture::Directory directory("legacy-source-export"); auto fixed = SnapshotFixture::fixed();
+	{
+		FaultIO io(directory.path); kronuz::journal::Store store(io, SnapshotFixture::quota(), 1024); kronuz::journal::Identity identity{}; identity[0] = 'v'; store.create(identity); while (!store.inventory_step(1).complete) {}
+		auto initialization = encode_initialization(fixed); auto append = store.reserve_append(kronuz::journal::AdmissionClass::Control, initialization.size()); store.append(*append, initialization);
+		auto replacement = store.reserve_replacement(5, checkpoint_detail::maximum_size(limits())); store.begin_artifact(*replacement, kronuz::journal::ArtifactPart::Application); store.write_chunk(*replacement, "image"); auto application = store.finish_artifact(*replacement);
+		RecoveredState state{fixed, {1, 1, 1}, 1, 1, {}, 1}; auto bundle = encode_checkpoint(state, 1, application, limits());
+		store.begin_artifact(*replacement, kronuz::journal::ArtifactPart::Bundle); store.write_chunk(*replacement, bundle); store.finish_artifact(*replacement); store.publish(*replacement, 1);
+	}
+	FaultIO io(directory.path); Worker worker(io, fixed, SnapshotFixture::quota(), limits(), {}, {4, 1}, SnapshotLimits{7, 100000}); std::string restored;
+	worker.recover([&](auto& reader) { std::array<char, 5> bytes{}; reader.read_at(0, bytes); restored.assign(bytes.data(), bytes.size()); }); for (unsigned turn = 0; turn < 100 && !worker.ready(); ++turn) { worker.run_one({0, 100}); }
+	std::map<NodeId, Receive> responses; unsigned needed = 0; bool exported = false;
+	auto drain = [&] { for (const auto& action : worker.take_actions()) {
+		if (std::holds_alternative<SnapshotNeeded>(action)) { ++needed; }
+		if (auto committed = std::get_if<Committed>(&action)) { worker.applied({committed->entries.back().index}); }
+		if (auto send = std::get_if<Send>(&action)) {
+			if (auto vote = std::get_if<VoteRequest>(&send->message); vote && send->peer == 3) { responses.insert_or_assign(3, Receive{3, VoteResponse{vote->term, true}}); }
+			if (auto append = std::get_if<AppendRequest>(&send->message)) { auto matched = append->previous + append->entries.size(); responses.insert_or_assign(send->peer, Receive{send->peer, AppendResponse{append->term, append->rpc, send->peer == 3, send->peer == 3 ? matched : 0, send->peer == 3 ? matched + 1 : 1, append->read_probe}}); }
+		}
+	} };
+	worker.try_submit(Start{}); drain();
+	for (unsigned turn = 0; turn < 1000; ++turn) {
+		if (!responses.empty()) { auto next = responses.begin(); if (worker.try_submit(next->second) == SubmitResult::Accepted) { responses.erase(next); } }
+		worker.run_one({100 + turn / 5, 100}); drain(); exported |= worker.snapshot_source().has_value();
+	}
+	check(restored == "image" && worker.role() == Role::Leader && worker.committed() == 2 && needed >= 2 && !exported && !worker.fenced(), "actual legacy v1 recovery cannot label or export unknown format under current snapshot policy");
+}
+
+void binary_channel_validation() {
+	for (unsigned branch = 0; branch < 10; ++branch) {
+		SnapshotFixture fixture("channel-validation-" + std::to_string(branch)); SnapshotChannel channel(fixture.worker);
+		Identity local{}, remote{}; local[0] = 'l'; remote[0] = 'r'; TrustedSession session{2, local, remote}; channel.register_session(session);
+		auto context = fixture.context("data"); auto fixed = fixture.worker.configuration(); TransferEnvelope envelope{fixed.cluster, fixed.configuration, remote, local, 2, 1, {1, 17, {1, 1}}};
+		auto bytes = encode_transfer(TransferKind::Begin, envelope, encode_snapshot(context.descriptor, *fixture.worker.snapshot_policy()));
+		auto frontier = fixture.worker.storage_frontier(); auto used = fixture.worker.accounting()->used;
+		if (branch < 8) {
+			std::array<std::size_t, 8> offsets{0, 8, 12, 16, 32, 48, 64, 80}; bytes[offsets[branch]] ^= static_cast<char>(255);
+			auto result = channel.receive(session, std::span<const char>(bytes.data(), bytes.size()));
+			check(result.result == TransferReceive::Closed && !fixture.worker.fenced() && fixture.worker.accounting()->used == used && fixture.worker.storage_frontier().generation == frontier.generation && !channel.incoming_snapshot(), "malformed or unbound Begin closes only its session before storage reservation"); continue;
+		}
+		for (char byte : bytes) { auto result = channel.receive(session, std::span<const char>(&byte, 1)); check(result.consumed == 1 && result.result == TransferReceive::Accepted, "single-byte fragmented Begin stays bounded and correlated"); }
+		auto id = channel.incoming_snapshot(); check(id.has_value(), "complete Begin owns receiver replacement"); auto reserved = fixture.worker.accounting()->outstanding;
+		auto result = channel.receive(session, std::span<const char>(bytes.data(), bytes.size()));
+		check(result.result == TransferReceive::Busy && result.consumed == bytes.size() && fixture.worker.accounting()->outstanding == reserved, "duplicate Begin under control pressure retains one frame and one replacement reservation");
+		auto output = channel.outbound(); if (!output) { check(false, "Accepted output is retained"); continue; }
+		auto token = output->token; channel.consume_output(token, 1); auto remainder = channel.outbound();
+		Identity third{}; third[0] = 't'; TrustedSession other{3, local, third}; channel.register_session(other); channel.session_closed(other);
+		check(channel.outbound()->token == token && channel.outbound()->bytes.size() == remainder->bytes.size(), "closing another channel cannot preempt a partially written control frame");
+		channel.consume_output(token, remainder->bytes.size()); channel.run_one({0, 100}); output = channel.outbound();
+		check(output && decode_transfer(std::string_view(output->bytes.data(), output->bytes.size())).kind == TransferKind::Accepted && channel.incoming_snapshot() == id && fixture.worker.accounting()->outstanding == reserved, "duplicate Begin reuses exact owned operation after control output drains");
+		channel.consume_output(output->token, output->bytes.size());
+		if (branch == 8) {
+			auto invalid = encode_transfer(TransferKind::Chunk, envelope, transfer_chunk_body(99, 1, "data", true));
+			check(channel.receive(session, std::span<const char>(invalid.data(), invalid.size())).result == TransferReceive::Closed && !fixture.worker.fenced(), "out-of-order data closes session without fencing healthy storage");
+		} else {
+			auto chunk = encode_transfer(TransferKind::Chunk, envelope, transfer_chunk_body(99, 0, "data", false));
+			check(channel.receive(session, std::span<const char>(chunk.data(), chunk.size())).result == TransferReceive::Accepted, "first bounded chunk enters owned receiver mailbox");
+			output = channel.outbound(); check(output && decode_transfer(std::string_view(output->bytes.data(), output->bytes.size())).kind == TransferKind::Credit, "credit follows mailbox acceptance without claiming durability");
+			channel.consume_output(output->token, output->bytes.size()); auto final = encode_transfer(TransferKind::Chunk, envelope, transfer_chunk_body(100, 4, "", true));
+			check(channel.receive(session, std::span<const char>(final.data(), final.size())).result == TransferReceive::Busy && !channel.outbound(), "busy receiver consumes no final input and creates no credit");
+			for (unsigned turn = 0; turn < 30 && !channel.outbound(); ++turn) { fixture.pump(); channel.run_one({0, 100}); }
+			check(channel.outbound().has_value(), "retained final frame retries after mailbox storage drains"); channel.session_closed(session);
+		}
+		channel.run_one({0, 100}); check(!channel.incoming_snapshot() && !fixture.worker.pending_snapshot_result() && !fixture.worker.fenced(), "session loss cancels legal staging and drains its correlated terminal result");
+	}
+}
+
+void channel_dispatch_and_unstarted_result() {
+	for (bool unstarted : {false, true}) {
+		SnapshotFixture fixture("dispatch-unstarted-" + std::to_string(unstarted), SnapshotLimits{7, 100000}, SnapshotFixture::quota(), !unstarted); SnapshotChannel channel(fixture.worker);
+		Identity local{}, remote{}; local[0] = 'l'; remote[0] = 'r'; TrustedSession session{2, local, remote}; channel.register_session(session);
+		auto fixed = fixture.worker.configuration(); TransferEnvelope envelope{fixed.cluster, fixed.configuration, remote, local, 2, 1, {1, 17, {1, 1}}};
+		if (!unstarted) {
+			auto control = encode_transfer(TransferKind::Accepted, envelope, {}); std::string joined; for (unsigned count = 0; count < 100; ++count) { joined += control; }
+			auto first = channel.receive(session, std::span<const char>(joined.data(), joined.size()));
+			check(first.result == TransferReceive::Accepted && first.consumed == control.size(), "one receive call dispatches one frame from arbitrarily concatenated controls");
+			std::size_t consumed = first.consumed; while (consumed < joined.size()) { auto next = channel.receive(session, std::span<const char>(joined.data() + consumed, joined.size() - consumed)); check(next.result == TransferReceive::Accepted && next.consumed == control.size(), "caller retries exact remaining prefix under bounded dispatch"); consumed += next.consumed; }
+			check(!fixture.worker.fenced() && !channel.incoming_snapshot() && channel.retained_bytes() == 0, "bounded concatenated dispatch retains no extra queue or storage state"); continue;
+		}
+		auto context = fixture.context("data"); auto begin = encode_transfer(TransferKind::Begin, envelope, encode_snapshot(context.descriptor, *fixture.worker.snapshot_policy()));
+		channel.receive(session, std::span<const char>(begin.data(), begin.size())); auto id = channel.incoming_snapshot(); if (!id) { check(false, "unstarted receiver owns candidate"); continue; }
+		auto accepted = channel.outbound(); channel.consume_output(accepted->token, accepted->bytes.size()); auto data = encode_transfer(TransferKind::Chunk, envelope, transfer_chunk_body(99, 0, "data", true)); channel.receive(session, std::span<const char>(data.data(), data.size()));
+		for (unsigned turn = 0; turn < 200; ++turn) {
+			fixture.pump(); if (auto view = fixture.worker.validation_chunk()) { auto token = view->chunk; auto final = view->verified_eof; fixture.worker.consume_validation(view->snapshot, token); if (final) { fixture.worker.validation_succeeded(view->snapshot, token); } }
+			channel.run_one({0, 100}); auto output = channel.outbound(); if (!output) { continue; }
+			auto frame = decode_transfer(std::string_view(output->bytes.data(), output->bytes.size()));
+			if (frame.kind == TransferKind::Result) {
+				auto body = frame.body.substr(8); check(frame.body[0] == static_cast<char>(TransferOutcome::Failed) && kronuz::journal::get64(body) == 0 && fixture.worker.term() == 0 && !fixture.worker.fenced(), "Busy before Start generates a healthy termless Failed result");
+				SnapshotFixture::Directory directory("unstarted-result-sender"); FaultIO io(directory.path); auto configuration = fixed; configuration.local = 2;
+				Worker sender(io, configuration, SnapshotFixture::quota(), limits(), {}, {4, 1}, SnapshotLimits{7, 100000}); kronuz::journal::Identity identity{}; identity[0] = 'z'; sender.create(identity); for (unsigned ready = 0; ready < 100 && !sender.ready(); ++ready) { sender.run_one({0, 100}); }
+				SnapshotChannel sender_channel(sender); TrustedSession reverse{1, remote, local}; sender_channel.register_session(reverse); auto delivered = sender_channel.receive(reverse, output->bytes);
+				check(delivered.result == TransferReceive::Accepted && delivered.consumed == output->bytes.size() && !sender.fenced() && sender.term() == 0, "term-zero generated result crosses real adapter without fabricating or observing a term");
+				channel.consume_output(output->token, output->bytes.size()); check(channel.drained(), "unstarted rejected operation drains before channel destruction"); break;
+			}
+			channel.consume_output(output->token, output->bytes.size());
+		}
+		check(channel.drained(), "unstarted failure completes bounded owned result delivery");
+	}
+}
+
+void binary_transfer_codec() {
+	Identity cluster{}, configuration{}, local{}, remote{}; cluster[0] = 'c'; configuration[0] = 'f'; local[0] = 'l'; remote[0] = 'r';
+	TransferEnvelope envelope{cluster, configuration, local, remote, 1, 2, {3, 5, {7, 2}}};
+	SnapshotDescriptor descriptor{cluster, configuration, 0, 7, 2, 3, kronuz::journal::crc32c("abc")}; SnapshotPolicy policy{cluster, configuration, 0, 65536};
+	auto bytes = encode_transfer(TransferKind::Begin, envelope, encode_snapshot(descriptor, policy)); auto decoded = decode_transfer(bytes);
+	check(decoded.envelope.key == envelope.key && decode_snapshot(decoded.body, policy) == descriptor, "binary envelope preserves full snapshot correlation and descriptor");
+	for (std::size_t length = 0; length < bytes.size(); ++length) { check(throws([&] { decode_transfer(std::string_view(bytes).substr(0, length)); }), "every truncated binary Begin fails closed"); }
+	for (std::size_t offset : {std::size_t{0}, std::size_t{8}, std::size_t{12}, std::size_t{13}}) { auto corrupted = bytes; corrupted[offset] ^= static_cast<char>(255); check(throws([&] { decode_transfer(corrupted); }), "invalid magic, length, kind and reserved fields reject"); }
+	auto chunk = encode_transfer(TransferKind::Chunk, envelope, transfer_chunk_body(8, 0, "abc", true)); check(decode_transfer(chunk).body.size() == 27, "bounded chunk framing round trips");
+	chunk[transfer_header_bytes + 20] = 2; check(throws([&] { decode_transfer(chunk); }), "unknown chunk flags reject");
+	check(throws([&] { encode_transfer(TransferKind::Chunk, envelope, std::string(65561, 'x')); }), "oversized frame rejects before encoding");
+}
+
+int main(int argc, char** argv) {
+	try {
+		if (argc == 2 && std::string_view(argv[1]) == "--review-regressions") { channel_dispatch_and_unstarted_result(); binary_transfer_integration(65553); binary_transfer_integration(65553, 5); owned_snapshot_sources(); std::cout << checks << " review checks, " << failures << " failures\n"; return failures ? 1 : 0; }
+		if (argc == 2 && std::string_view(argv[1]) == "--transfer-benchmark") { std::ofstream(std::filesystem::current_path() / ".scratch" / "snapshot-transfer-benchmark.csv") << "image_bytes,wall_s,cpu_s,wire_bytes,retained_frame_bytes,payload_buffer_capacity,process_maxrss_native,sender_payload_reads,receiver_payload_reads\n"; binary_transfer_integration(1048576, 0, true); binary_transfer_integration(67108864, 0, true); std::cout << checks << " benchmark checks, " << failures << " failures\n"; return failures ? 1 : 0; }
+		checkpoint_format_recovery(); legacy_source_export_rejection(); binary_channel_validation(); channel_dispatch_and_unstarted_result(); binary_transfer_codec(); for (std::size_t length : {std::size_t{0}, std::size_t{9}, std::size_t{65553}, std::size_t{1048576}}) { binary_transfer_integration(length); }
+		for (unsigned mode : {1u, 2u, 3u, 5u}) { binary_transfer_integration(65553, mode); }
+		owned_snapshot_sources(); snapshot_reception_and_validation(); snapshot_policy_and_rejection(); snapshot_cancellation_phases(); snapshot_read_faults(); snapshot_restart_cleanup(); snapshot_protocol_progress(); snapshot_installation(); snapshot_rejection_branches(); snapshot_old_application(); snapshot_install_reopening(); snapshot_install_admission(); snapshot_publication_faults(); maintenance_preserves_protocol_timers(); real_worker(); partial_control_pack(); failures_and_multi_action_output(); interrupted_initialization(); checkpoint_crash_and_progress(); preparation_preserves_protocol_timers(); checkpoint_cancellation_and_completion(); checkpoint_faults(); } catch (const std::exception& error) { check(false, error.what()); }
 	std::cout << checks << " worker checks, " << failures << " failures\n"; return failures ? 1 : 0;
 }

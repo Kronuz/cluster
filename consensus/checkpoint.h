@@ -8,9 +8,11 @@ struct CheckpointBundle {
 	std::uint64_t storage_sequence;
 	kronuz::journal::ArtifactDescriptor application;
 	RecoveredState state;
+	std::optional<std::uint32_t> application_format{};
 };
 namespace checkpoint_detail {
 constexpr std::uint64_t magic = 0x31504b4342544652ull;
+constexpr std::uint64_t magic_v2 = 0x32504b4342544652ull;
 inline std::size_t maximum_size(Limits limits) {
 	constexpr std::size_t fixed = 400;
 	if (limits.log_entries > (std::numeric_limits<std::size_t>::max() - fixed) / 21 ||
@@ -21,7 +23,7 @@ inline std::size_t maximum_size(Limits limits) {
 }
 }
 inline std::string encode_checkpoint(const RecoveredState& state, std::uint64_t storage_sequence,
-	const kronuz::journal::ArtifactDescriptor& application, Limits limits = {}) {
+	const kronuz::journal::ArtifactDescriptor& application, Limits limits = {}, std::optional<std::uint32_t> application_format = {}) {
 	using namespace storage_detail;
 	// Validate the typed state before producing storage bytes.
 	auto maximum = checkpoint_detail::maximum_size(limits);
@@ -32,9 +34,11 @@ inline std::string encode_checkpoint(const RecoveredState& state, std::uint64_t 
 	for (const auto& entry : state.entries) {
 		if (entry.payload.size() > std::numeric_limits<std::uint32_t>::max()) { throw std::length_error("checkpoint payload framing overflow"); }
 	}
-	auto encoded_size = std::size_t(92) + initialization.size() + state.entries.size() * 21 + payload_bytes;
+	auto encoded_size = std::size_t(application_format ? 96 : 92) + initialization.size() + state.entries.size() * 21 + payload_bytes;
 	if (encoded_size > maximum) { throw std::length_error("checkpoint exceeds encoded bound"); }
-	std::string result; result.reserve(encoded_size); put64(result, checkpoint_detail::magic); put64(result, storage_sequence);
+	std::string result; result.reserve(encoded_size); put64(result, application_format ? checkpoint_detail::magic_v2 : checkpoint_detail::magic);
+	if (application_format) { put32(result, *application_format); }
+	put64(result, storage_sequence);
 	identity(result, application.identity); put64(result, application.length); put32(result, application.checksum);
 	put32(result, static_cast<std::uint32_t>(initialization.size())); result.append(initialization);
 	put64(result, state.base_index); put64(result, state.base_term);
@@ -48,17 +52,21 @@ inline std::string encode_checkpoint(const RecoveredState& state, std::uint64_t 
 	return result;
 }
 inline std::string encode_checkpoint(const CheckpointBundle& bundle, Limits limits = {}) {
-	return encode_checkpoint(bundle.state, bundle.storage_sequence, bundle.application, limits);
+	return encode_checkpoint(bundle.state, bundle.storage_sequence, bundle.application, limits, bundle.application_format);
 }
 // Decode only into unpublished state. The caller also verifies the enclosing
 // journal frontier and the application artifact before activating either.
 inline CheckpointBundle decode_checkpoint(std::string_view bytes, const FixedConfiguration& expected, std::uint64_t covered_sequence,
 	const kronuz::journal::ArtifactDescriptor& application, Limits limits = {}) {
 	using namespace storage_detail;
-	if (bytes.size() > checkpoint_detail::maximum_size(limits) || get64(bytes) != checkpoint_detail::magic) {
+	if (bytes.size() > checkpoint_detail::maximum_size(limits)) { throw Corruption("oversized checkpoint bundle"); }
+	auto magic = get64(bytes);
+	if (magic != checkpoint_detail::magic && magic != checkpoint_detail::magic_v2) {
 		throw Corruption("unsupported or oversized checkpoint bundle");
 	}
-	CheckpointBundle bundle; bundle.storage_sequence = get64(bytes);
+	CheckpointBundle bundle;
+	if (magic == checkpoint_detail::magic_v2) { bundle.application_format = get32(bytes); }
+	bundle.storage_sequence = get64(bytes);
 	bundle.application.identity = identity(bytes); bundle.application.length = get64(bytes); bundle.application.checksum = get32(bytes);
 	if (bundle.storage_sequence == 0 || bundle.storage_sequence != covered_sequence || bundle.application != application) { throw Corruption("checkpoint dependency or storage sequence mismatch"); }
 	auto length = get32(bytes); auto initialization = encode_initialization(expected);

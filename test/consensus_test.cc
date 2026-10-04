@@ -519,6 +519,13 @@ void checkpoint_semantic_recovery() {
 	auto bytes = encode_checkpoint(CheckpointBundle{40, application, state});
 	auto decoded = decode_checkpoint(bytes, config(1), 40, application);
 	check(decoded.state.entries.size() == 260, "checkpoint decoder uses retained-log bound rather than Append RPC entry bound");
+	check(!decoded.application_format, "legacy checkpoint application format remains unknown");
+	for (std::uint32_t format : {std::uint32_t{0}, std::uint32_t{7}, std::numeric_limits<std::uint32_t>::max()}) {
+		auto versioned = encode_checkpoint(CheckpointBundle{40, application, state, format});
+		auto recovered = decode_checkpoint(versioned, config(1), 40, application);
+		check(recovered.application_format == format && recovered.state.base_index == state.base_index && recovered.state.entries == state.entries && versioned.size() == bytes.size() + 4, "versioned checkpoint preserves explicit format including zero");
+		for (std::size_t length = 0; length < versioned.size(); ++length) { check(throws([&] { decode_checkpoint(std::string_view(versioned).substr(0, length), config(1), 40, application); }), "every truncated versioned checkpoint fails closed"); }
+	}
 	Recovery recovery(config(1)); recovery.restore(std::move(decoded.state), 40);
 	recovery.replay(41, encode_storage_batch(StorageBatch{HardState{3, 2, 260}, LogMutation{261, {{261, 3, EntryKind::Command, "replacement"}}}}));
 	auto restored = recovery.finish(41);

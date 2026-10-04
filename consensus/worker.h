@@ -32,12 +32,25 @@ class SnapshotId {
 public:
 	SnapshotId(const SnapshotId&) = default;
 	SnapshotId& operator=(const SnapshotId&) = default;
+	bool operator==(const SnapshotId&) const = default;
 private:
 	friend class Worker;
 	SnapshotId(std::shared_ptr<char> owner, Token token) : owner_(std::move(owner)), token_(token) {}
 	std::shared_ptr<char> owner_;
 	Token token_;
 };
+class SourceId {
+public:
+	SourceId(const SourceId&) = default;
+	SourceId& operator=(const SourceId&) = default;
+	bool operator==(const SourceId&) const = default;
+private:
+	friend class Worker;
+	SourceId(std::shared_ptr<char> owner, Token token) : owner_(std::move(owner)), token_(token) {}
+	std::shared_ptr<char> owner_; Token token_;
+};
+struct SourceInfo { SourceId source; NodeId peer; SnapshotKey key; SnapshotDescriptor descriptor; };
+struct SourceChunk { SourceId source; Token chunk; std::uint64_t offset; std::span<const char> bytes; bool final; };
 struct SnapshotOffer { SubmitResult result; std::uint64_t next_offset; };
 struct ValidationView { SnapshotId snapshot; Token chunk; std::uint64_t offset; std::span<const char> bytes; bool verified_eof; };
 struct SnapshotResult { SnapshotId snapshot; SnapshotContext context; SnapshotReason reason; std::optional<InstallRejectReason> rejection{}; std::optional<Term> receiver_term{}; };
@@ -93,6 +106,8 @@ public:
 						offset += bundle.read_at(offset, std::span<char>(bytes.data() + offset, count));
 					}
 					auto decoded = decode_checkpoint(bytes, configuration_, selected.base_sequence, selected.dependencies[0], limits_);
+					if (decoded.application_format && snapshot_limits_ && *decoded.application_format != snapshot_limits_->application_format) { throw kronuz::journal::Corruption("checkpoint application format conflicts with snapshot policy"); }
+					published_ = Publication{{decoded.state.base_index, decoded.state.base_term}, decoded.application_format, selected.generation};
 					recovery.restore(std::move(decoded.state), decoded.storage_sequence);
 					restore_application(dependencies[0]); // Build unpublished application state.
 				});
@@ -228,6 +243,9 @@ public:
 	}
 	CancelResult reject_snapshot_validation(const SnapshotId& id) { return cancel_snapshot(id, SnapshotReason::InvalidApplication); }
 	CancelResult cancel_snapshot(const SnapshotId& id) { return cancel_snapshot(id, SnapshotReason::Canceled); }
+	const SnapshotResult* pending_snapshot_result() const noexcept { return snapshot_result_ ? &*snapshot_result_ : nullptr; }
+	std::optional<SnapshotPolicy> snapshot_policy() const { return snapshot_limits_ ? std::optional<SnapshotPolicy>{{configuration_.cluster, configuration_.configuration, snapshot_limits_->application_format, snapshot_limits_->application_bytes}} : std::nullopt; }
+	const FixedConfiguration& configuration() const noexcept { return configuration_; }
 	std::optional<SnapshotResult> take_snapshot_result() { auto result = std::move(snapshot_result_); snapshot_result_.reset(); return result; }
 	SubmitResult request_install(const SnapshotId& id) {
 		if (fenced()) { return SubmitResult::Fenced; }
@@ -266,10 +284,40 @@ public:
 		fail("snapshot application activation failed"); return ValidationAck::Accepted;
 	}
 
+	std::optional<SourceInfo> snapshot_source() const {
+		if (fenced() || !source_ || (source_->phase != SourcePhase::Streaming && source_->phase != SourcePhase::AwaitResult) || !core_->snapshot_sending(source_->peer, source_->key)) { return std::nullopt; }
+		return SourceInfo{SourceId(source_owner_, source_->token), source_->peer, source_->key, source_->descriptor};
+	}
+	std::optional<SourceChunk> source_chunk() const {
+		if (!snapshot_source() || !source_->view) { return std::nullopt; }
+		return SourceChunk{SourceId(source_owner_, source_->token), source_->view, source_->offset, std::span<const char>(source_->buffer.data(), source_->count), source_->final};
+	}
+	ValidationAck consume_source(const SourceId& id, Token chunk) {
+		if (fenced()) { return ValidationAck::Fenced; }
+		refresh_source();
+		if (!source_ || id.owner_ != source_owner_ || id.token_ != source_->token || !source_->view || source_->view != chunk) { return ValidationAck::Stale; }
+		source_->offset += source_->count; source_->view = 0;
+		if (source_->final) { source_->phase = SourcePhase::AwaitResult; }
+		return ValidationAck::Accepted;
+	}
+	std::size_t snapshot_buffer_capacity() const noexcept { return (source_ ? 65536 : 0) + (checkpoint_ ? 65536 : 0); }
+	ValidationAck source_peer_failed(NodeId peer) {
+		if (fenced()) { return ValidationAck::Fenced; }
+		refresh_source(); if (!source_ || source_->peer != peer) { return ValidationAck::NotReady; }
+		return source_failed(SourceId(source_owner_, source_->token));
+	}
+	ValidationAck source_failed(const SourceId& id) {
+		if (fenced()) { return ValidationAck::Fenced; }
+		refresh_source();
+		if (!source_ || id.owner_ != source_owner_ || id.token_ != source_->token) { return ValidationAck::Stale; }
+		source_->verifier.reset(); source_->reader.reset(); source_->view = 0; source_->phase = SourcePhase::Failed;
+		return ValidationAck::Accepted;
+	}
 	TurnResult run_one(Tick current_time) {
 		if (store_.fenced() && !failed_) { fail("storage fenced outside worker"); }
 		if (fenced()) { return TurnResult::Fenced; }
 		if (!core_) { throw std::logic_error("worker not opened"); }
+		refresh_source();
 		try {
 			if (!store_.accounting()) { store_.inventory_step(scheduling_.scan_entries); return TurnResult::Inventory; }
 			if (!initialization_.empty()) {
@@ -291,7 +339,7 @@ public:
 				completion_ = Persisted{persist_->token}; persist_.reset(); ++foreground_; return TurnResult::Stored;
 			}
 			if (!output_.empty()) {
-				if (preparation_runnable() || installation_waiting()) { maintenance(); return fenced() ? TurnResult::Fenced : TurnResult::Maintenance; }
+				if (preparation_runnable() || source_ || installation_waiting()) { maintenance(); return fenced() ? TurnResult::Fenced : TurnResult::Maintenance; }
 				return TurnResult::Blocked;
 			}
 			if (application_) {
@@ -303,9 +351,12 @@ public:
 				ingest(core_->step(current_time));
 				auto value = *completion_; completion_.reset();
 				if (checkpoint_ && checkpoint_->phase == Phase::Completion && checkpoint_->persistence_token == value.token && std::holds_alternative<Local>(checkpoint_->mode)) {
+					pending_publication_ = Publication{LogBoundary{std::get<Local>(checkpoint_->mode).capture->through, std::get<Local>(checkpoint_->mode).capture->term}, snapshot_limits_ ? std::optional<std::uint32_t>{snapshot_limits_->application_format} : std::nullopt, store_.frontier().generation};
 					checkpoint_.reset(); cutover_debt_ = false;
 				}
-				ingest(core_->step(value)); ++foreground_; return TurnResult::Completed;
+				ingest(core_->step(value));
+				if (pending_publication_ && !fenced()) { published_ = pending_publication_; pending_publication_.reset(); }
+				++foreground_; return TurnResult::Completed;
 			}
 			if (activation_completion_) {
 				ingest(core_->step(current_time)); auto value = *activation_completion_; activation_completion_.reset();
@@ -318,7 +369,7 @@ public:
 				if (result == SubmitResult::Fenced) { return TurnResult::Fenced; }
 				maintenance(); return fenced() ? TurnResult::Fenced : TurnResult::Maintenance;
 			}
-			if (preparation_runnable()) {
+			if (preparation_runnable() || source_runnable()) {
 				// Before freeze, sustained preparation cannot postpone protocol
 				// timers. Alternate an admitted timer opportunity with maintenance.
 				if (!cutover_debt_ && timer_due_) {
@@ -356,6 +407,19 @@ private:
 	enum class Phase { Reserved, BeginApplication, Application, SealApplication, OpenVerification, Readback, FinishVerification, AwaitVerifiedEOF, AwaitSemantic, Validated, AwaitRejection, Cutover, EncodeBundle, BeginBundle, Bundle, SealBundle, Publish, Completion };
 	struct Chunk { std::array<char, 65536> bytes{}; std::size_t length = 0; bool final = false; std::uint64_t offset = 0; Token token = 0; };
 	struct Local { std::optional<CaptureMetadata> capture; };
+	enum class SourcePhase { Opening, Verifying, Ready, Streaming, AwaitResult, Failed };
+	struct Publication { LogBoundary boundary; std::optional<std::uint32_t> format; std::uint64_t generation; };
+	struct Source {
+		Source(kronuz::journal::PublishedArtifactSelection selected, NodeId destination, SnapshotKey flight, Token identity, SnapshotDescriptor image)
+			: selection(std::move(selected)), peer(destination), key(flight), token(identity), descriptor(image) {}
+		kronuz::journal::PublishedArtifactSelection selection;
+		NodeId peer; SnapshotKey key; Token token; SnapshotDescriptor descriptor;
+		SourcePhase phase = SourcePhase::Opening;
+		std::optional<kronuz::journal::ArtifactVerifier> verifier;
+		std::optional<kronuz::journal::ArtifactReader> reader;
+		std::array<char, 65536> buffer{};
+		Token view = 0; std::uint64_t offset = 0; std::size_t count = 0; bool final = false;
+	};
 	struct Incoming {
 		explicit Incoming(SnapshotContext value) : context(std::move(value)) {}
 		SnapshotContext context;
@@ -425,10 +489,61 @@ private:
 	}
 	void maintenance() {
 		auto owed_timer = timer_due_;
-		if (preparation_next_ && preparation_runnable()) { prepare_one(); preparation_next_ = false; }
-		else { store_.reclaim_step(scheduling_.scan_entries); preparation_next_ = true; }
+		for (unsigned attempt = 0; attempt < 3; ++attempt) {
+			auto kind = maintenance_next_; maintenance_next_ = (maintenance_next_ + 1) % 3;
+			if (kind == 0) { store_.reclaim_step(scheduling_.scan_entries); break; }
+			if (kind == 1 && preparation_runnable()) { prepare_one(); break; }
+			if (kind == 2 && source_runnable()) { source_one(); break; }
+		}
 		foreground_ = 0; // Cutover debt is independent of this fairness counter.
 		timer_blocked_ = owed_timer; timer_due_ = true;
+	}
+	void refresh_source() {
+		if (source_ && (!core_ || !core_->snapshot_active(source_->peer, source_->key))) { source_.reset(); }
+	}
+	bool source_runnable() const {
+		if (!snapshot_limits_ || !core_ || core_->role() != Role::Leader) { return false; }
+		if (source_) {
+			if (source_->phase == SourcePhase::AwaitResult || (source_->phase == SourcePhase::Streaming && source_->view)) { return false; }
+			if (source_->phase == SourcePhase::Ready || source_->phase == SourcePhase::Failed) { return !core_->busy() && output_.empty() && !completion_ && !persist_ && !application_ && !cutover_debt_; }
+			return true;
+		}
+		if (core_->busy() || !output_.empty() || completion_ || persist_ || application_ || cutover_debt_) { return false; }
+		for (auto peer : configuration_.voters) { if (core_->awaiting_snapshot(peer)) { return true; } }
+		return false;
+	}
+	void source_one() {
+		refresh_source();
+		if (!source_) {
+			for (std::size_t checked = 0; checked < configuration_.voters.size(); ++checked) {
+				auto peer = configuration_.voters[source_next_]; source_next_ = (source_next_ + 1) % configuration_.voters.size(); auto key = core_->awaiting_snapshot(peer); if (!key) { continue; }
+				if (core_->busy() || !output_.empty() || completion_ || persist_ || application_ || cutover_debt_) { return; }
+				auto selected = store_.select_published_dependency(0);
+				if (!published_ || !published_->format || *published_->format != snapshot_limits_->application_format || published_->boundary != key->boundary || core_->base_boundary() != key->boundary || !selected || selected->generation() != published_->generation || selected->descriptor().length > snapshot_limits_->application_bytes) { ingest(core_->step(SnapshotTransferFailed{peer, *key})); return; }
+				if (next_source_ == std::numeric_limits<Token>::max()) { throw std::length_error("source identity exhausted"); }
+				const auto& artifact = selected->descriptor(); SnapshotDescriptor descriptor{configuration_.cluster, configuration_.configuration, *published_->format, key->boundary.index, key->boundary.term, artifact.length, artifact.checksum};
+				source_ = std::make_unique<Source>(std::move(*selected), peer, *key, ++next_source_, descriptor); return;
+			}
+			return;
+		}
+		auto& source = *source_;
+		if (source.phase == SourcePhase::Opening) {
+			source.verifier = store_.begin_published_verification(source.selection);
+			if (source.verifier) { source.phase = SourcePhase::Verifying; } else { source.phase = SourcePhase::Failed; }
+		} else if (source.phase == SourcePhase::Verifying) {
+			if (source.verifier->offset() < source.descriptor.application_bytes) { source.verifier->read_next(source.buffer); }
+			else { source.reader.emplace(std::move(*source.verifier).finish()); source.verifier.reset(); source.phase = SourcePhase::Ready; }
+		} else if (source.phase == SourcePhase::Ready || source.phase == SourcePhase::Failed) {
+			if (core_->busy() || !output_.empty() || completion_ || persist_ || application_ || cutover_debt_) { return; }
+			if (source.phase == SourcePhase::Failed || source.selection.generation() != store_.frontier().generation || core_->base_boundary() != source.key.boundary) { auto peer = source.peer; auto key = source.key; source_.reset(); ingest(core_->step(SnapshotTransferFailed{peer, key})); }
+			else { source.phase = SourcePhase::Streaming; ingest(core_->step(SnapshotSourceReady{source.peer, source.key})); refresh_source(); }
+		} else if (source.phase == SourcePhase::Streaming && !source.view) {
+			if (!core_->snapshot_sending(source.peer, source.key)) { return; }
+			if (next_source_chunk_ == std::numeric_limits<Token>::max()) { throw std::length_error("source chunk identity exhausted"); }
+			source.final = source.offset == source.descriptor.application_bytes;
+			source.count = source.final ? 0 : source.reader->read_at(source.offset, std::span<char>(source.buffer.data(), static_cast<std::size_t>(std::min<std::uint64_t>(65536, source.descriptor.application_bytes - source.offset))));
+			source.view = ++next_source_chunk_;
+		}
 	}
 	void prepare_one() {
 		auto& operation = *checkpoint_;
@@ -484,7 +599,7 @@ private:
 			break;
 		}
 		case Phase::EncodeBundle:
-			operation.bundle = encode_checkpoint(*operation.captured, operation.sequence, *operation.application, limits_);
+			operation.bundle = encode_checkpoint(*operation.captured, operation.sequence, *operation.application, limits_, std::holds_alternative<Incoming>(operation.mode) ? std::optional<std::uint32_t>{std::get<Incoming>(operation.mode).context.descriptor.application_format} : (snapshot_limits_ ? std::optional<std::uint32_t>{snapshot_limits_->application_format} : std::nullopt));
 			operation.captured.reset(); operation.phase = Phase::BeginBundle; break;
 		case Phase::BeginBundle:
 			store_.begin_artifact(operation.replacement, ArtifactPart::Bundle); operation.phase = Phase::Bundle; break;
@@ -575,10 +690,12 @@ private:
 		}
 		if (!external.empty()) { output_ = std::move(external); }
 		if (!core_->busy()) { release_pack(); }
+		refresh_source();
 	}
 	void finish_snapshot(RequestId request, Token prepared, SnapshotReason reason, std::optional<InstallRejectReason> rejection = {}) {
 		if (!checkpoint_ || !std::holds_alternative<Incoming>(checkpoint_->mode) || checkpoint_->token != prepared || snapshot_result_) { throw std::logic_error("snapshot terminal correlation mismatch"); }
 		auto context = std::get<Incoming>(checkpoint_->mode).context;
+		if (reason == SnapshotReason::Installed) { published_ = Publication{{context.descriptor.through, context.descriptor.term}, context.descriptor.application_format, store_.frontier().generation}; }
 		if (context.request != request) { throw std::logic_error("snapshot request correlation mismatch"); }
 		SnapshotId id(checkpoint_owner_, prepared);
 		if (reason != SnapshotReason::Installed) { store_.cancel_replacement(checkpoint_->replacement); }
@@ -589,7 +706,7 @@ private:
 	void fail(std::string reason) {
 		if (failed_) { return; } failed_ = true;
 		store_.fence_storage(); if (core_) { core_->step(StorageFault{reason}); }
-		persist_.reset(); completion_.reset(); application_.reset(); activation_completion_.reset(); checkpoint_.reset(); release_pack(); terminal_ = Fenced{std::move(reason)};
+		persist_.reset(); completion_.reset(); application_.reset(); activation_completion_.reset(); checkpoint_.reset(); source_.reset(); published_.reset(); pending_publication_.reset(); release_pack(); terminal_ = Fenced{std::move(reason)};
 	}
 	FixedConfiguration configuration_;
 	Limits limits_;
@@ -613,7 +730,12 @@ private:
 	std::optional<SnapshotResult> snapshot_result_;
 	Actions output_;
 	Index delivered_ = 0;
-	bool failed_ = false, cutover_debt_ = false, preparation_next_ = true, timer_due_ = true, timer_blocked_ = false;
+	std::optional<Publication> published_, pending_publication_;
+	std::shared_ptr<char> source_owner_ = std::make_shared<char>();
+	std::unique_ptr<Source> source_;
+	Token next_source_ = 0, next_source_chunk_ = 0;
+	std::size_t source_next_ = 0; unsigned maintenance_next_ = 1;
+	bool failed_ = false, cutover_debt_ = false, timer_due_ = true, timer_blocked_ = false;
 };
 
 } // namespace cluster::consensus

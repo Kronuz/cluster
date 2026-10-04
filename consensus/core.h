@@ -51,6 +51,20 @@ public:
 	Index applied() const noexcept { return applied_; }
 	Index last_index() const noexcept { return base_index_ + static_cast<Index>(entries_.size()); }
 	Index base_index() const noexcept { return base_index_; }
+	LogBoundary base_boundary() const noexcept { return {base_index_, base_term_}; }
+	std::optional<SnapshotKey> awaiting_snapshot(NodeId peer) const {
+		auto found = peers_.find(peer);
+		if (role_ != Role::Leader || found == peers_.end() || !found->second.snapshot || found->second.snapshot->phase != SnapshotPhase::AwaitSource) { return std::nullopt; }
+		return found->second.snapshot->key;
+	}
+	bool snapshot_active(NodeId peer, const SnapshotKey& key) const {
+		auto found = peers_.find(peer);
+		return role_ == Role::Leader && hard_.term == durable_.term && found != peers_.end() && found->second.snapshot && found->second.snapshot->key == key;
+	}
+	bool snapshot_sending(NodeId peer, const SnapshotKey& key) const {
+		auto found = peers_.find(peer);
+		return snapshot_active(peer, key) && found->second.snapshot->phase == SnapshotPhase::Sending;
+	}
 	bool busy() const noexcept { return pending_.has_value() || install_.has_value(); }
 	const HardState& durable_hard_state() const noexcept { return durable_; }
 	const FixedConfiguration& configuration() const noexcept { return configuration_; }
