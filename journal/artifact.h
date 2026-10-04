@@ -22,10 +22,17 @@ struct OwnerSession {
 	std::unique_ptr<OwnerLock> lock;
 	bool failed = false;
 	unsigned preparing = 0, prepared = 0;
+	unsigned verification_handles = 0;
 	std::optional<Identity> preparing_identity;
 	std::map<Identity, unsigned> pins;
 };
 constexpr unsigned maximum_prepared_artifacts = 9;
+constexpr unsigned maximum_verification_handles = 9;
+struct VerificationLease {
+	std::shared_ptr<OwnerSession> owner;
+	explicit VerificationLease(std::shared_ptr<OwnerSession> session) : owner(std::move(session)) { ++owner->verification_handles; }
+	~VerificationLease() { --owner->verification_handles; }
+};
 struct ArtifactPin {
 	std::shared_ptr<OwnerSession> owner;
 	Identity identity;
@@ -146,12 +153,13 @@ private:
 	bool active_ = false;
 };
 
+class ArtifactVerifier;
 class ArtifactReader {
 public:
 	ArtifactReader(ArtifactReader&&) noexcept = default;
 	ArtifactReader& operator=(ArtifactReader&& other) noexcept {
 		if (this != &other) {
-			file_.reset(); pin_ = std::move(other.pin_); owner_ = std::move(other.owner_); file_ = std::move(other.file_); descriptor_ = other.descriptor_; payload_offset_ = other.payload_offset_;
+			file_.reset(); pin_ = std::move(other.pin_); verification_ = std::move(other.verification_); owner_ = std::move(other.owner_); file_ = std::move(other.file_); descriptor_ = other.descriptor_; payload_offset_ = other.payload_offset_;
 		}
 		return *this;
 	}
@@ -170,16 +178,9 @@ public:
 	}
 private:
 	friend class Journal;
+	friend class ArtifactVerifier;
 	ArtifactReader(IO& io, std::shared_ptr<detail::OwnerSession> owner, Identity storage, ArtifactDescriptor descriptor)
-		: owner_(std::move(owner)), file_(io.open_existing(artifact_name(descriptor))), descriptor_(descriptor) {
-		std::array<char, 8> magic_bytes{}; detail::read_all(*file_, 0, magic_bytes);
-		std::string_view magic_view(magic_bytes.data(), magic_bytes.size()); auto magic = get64(magic_view);
-		if (magic != detail::artifact_magic && magic != detail::artifact_v2_magic) { throw Corruption("unsupported artifact format"); }
-		payload_offset_ = magic == detail::artifact_magic ? detail::artifact_v1_header_size : detail::artifact_header_size;
-		if (file_->size() != payload_offset_ + descriptor.length) { throw Corruption("artifact size mismatch"); }
-		std::array<char, detail::artifact_header_size> header{}; detail::read_all(*file_, 0, std::span<char>(header.data(), payload_offset_));
-		auto expected = magic == detail::artifact_magic ? detail::artifact_header_v1(storage, descriptor) : detail::artifact_header(storage, descriptor);
-		if (std::string_view(header.data(), payload_offset_) != expected) { throw Corruption("artifact header mismatch"); }
+		: ArtifactReader(io, std::move(owner), storage, descriptor, {}) {
 		std::array<char, detail::artifact_chunk_size> buffer{}; Checksum checksum;
 		std::uint64_t offset = 0;
 		while (offset < descriptor.length) {
@@ -188,12 +189,68 @@ private:
 			checksum.update(std::string_view(buffer.data(), count)); offset += count;
 		}
 		if (checksum.value() != descriptor.checksum) { throw Corruption("artifact payload checksum mismatch"); }
+	}
+	// Header-only construction is private to the incremental verifier.
+	ArtifactReader(IO& io, std::shared_ptr<detail::OwnerSession> owner, Identity storage, ArtifactDescriptor descriptor,
+		std::shared_ptr<detail::VerificationLease> verification)
+		: owner_(std::move(owner)), verification_(std::move(verification)), file_(io.open_existing(artifact_name(descriptor))), descriptor_(descriptor) {
+		std::array<char, 8> magic_bytes{}; detail::read_all(*file_, 0, magic_bytes);
+		std::string_view magic_view(magic_bytes.data(), magic_bytes.size()); auto magic = get64(magic_view);
+		if (magic != detail::artifact_magic && magic != detail::artifact_v2_magic) { throw Corruption("unsupported artifact format"); }
+		payload_offset_ = magic == detail::artifact_magic ? detail::artifact_v1_header_size : detail::artifact_header_size;
+		if (file_->size() != payload_offset_ + descriptor.length) { throw Corruption("artifact size mismatch"); }
+		std::array<char, detail::artifact_header_size> header{}; detail::read_all(*file_, 0, std::span<char>(header.data(), payload_offset_));
+		auto expected = magic == detail::artifact_magic ? detail::artifact_header_v1(storage, descriptor) : detail::artifact_header(storage, descriptor);
+		if (std::string_view(header.data(), payload_offset_) != expected) { throw Corruption("artifact header mismatch"); }
 		pin_ = std::make_shared<detail::ArtifactPin>(owner_, descriptor.identity);
 	}
 	std::shared_ptr<detail::OwnerSession> owner_;
 	std::shared_ptr<detail::ArtifactPin> pin_;
+	std::shared_ptr<detail::VerificationLease> verification_;
 	std::unique_ptr<File> file_;
 	ArtifactDescriptor descriptor_;
 	std::size_t payload_offset_ = 0;
+};
+
+// Candidate bytes must remain unpublished until CRC and semantic validation
+// both succeed. IO outlives this handle and its promoted reader.
+class ArtifactVerifier {
+public:
+	ArtifactVerifier(ArtifactVerifier&&) noexcept = default;
+	ArtifactVerifier& operator=(ArtifactVerifier&&) noexcept = default;
+	ArtifactVerifier(const ArtifactVerifier&) = delete;
+	ArtifactVerifier& operator=(const ArtifactVerifier&) = delete;
+	const ArtifactDescriptor& descriptor() const noexcept { return reader_.descriptor(); }
+	std::uint64_t offset() const noexcept { return offset_; }
+	std::size_t read_next(std::span<char> destination) {
+		healthy();
+		if (destination.size() > detail::artifact_chunk_size || (destination.empty() && offset_ < descriptor().length)) {
+			throw std::length_error("invalid verification chunk bound");
+		}
+		auto count = static_cast<std::size_t>(std::min<std::uint64_t>(destination.size(), descriptor().length - offset_));
+		if (!count) { return 0; }
+		// One backend call. Partial progress stays visible to the scheduler.
+		auto actual = reader_.read_at(offset_, destination.first(count));
+		checksum_.update(std::string_view(destination.data(), actual)); offset_ += actual; return actual;
+	}
+	ArtifactReader finish() && {
+		healthy();
+		if (offset_ != descriptor().length) { throw std::logic_error("artifact verification is incomplete"); }
+		if (checksum_.value() != descriptor().checksum) {
+			reader_.owner_->failed = true; throw Corruption("artifact payload checksum mismatch");
+		}
+		return std::move(reader_); // Preserve the verified FD, pin and lease.
+	}
+private:
+	friend class Journal;
+	ArtifactVerifier(IO& io, std::shared_ptr<detail::OwnerSession> owner, Identity storage, ArtifactDescriptor descriptor,
+		std::shared_ptr<detail::VerificationLease> verification)
+		: reader_(io, std::move(owner), storage, descriptor, std::move(verification)) {}
+	void healthy() const {
+		if (!reader_.owner_ || !reader_.file_ || reader_.owner_->failed) { throw std::logic_error("artifact owner fenced or verifier moved"); }
+	}
+	ArtifactReader reader_;
+	Checksum checksum_;
+	std::uint64_t offset_ = 0;
 };
 } // namespace kronuz::journal

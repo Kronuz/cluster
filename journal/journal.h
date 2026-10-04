@@ -109,6 +109,16 @@ public:
 	}
 
 
+	std::optional<ArtifactVerifier> begin_artifact_verification(const PreparedArtifact& artifact) {
+		available();
+		if (!artifact.lease_ || artifact.lease_->owner != owner_) { throw std::invalid_argument("foreign or moved artifact preparation"); }
+		validate_artifact_bound(artifact.descriptor());
+		if (owner_->verification_handles >= detail::maximum_verification_handles) { return std::nullopt; }
+		auto lease = std::make_shared<detail::VerificationLease>(owner_);
+		try { return ArtifactVerifier(io_, owner_, frontier_.identity, artifact.descriptor(), std::move(lease)); }
+		catch (...) { owner_->failed = true; throw; }
+	}
+
 	void verify_artifact(const PreparedArtifact& artifact) {
 		available();
 		if (!artifact.lease_ || artifact.lease_->owner != owner_) { throw std::invalid_argument("foreign artifact preparation"); }

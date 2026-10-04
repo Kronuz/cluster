@@ -153,6 +153,12 @@ public:
 			return operation.prepared[index]->descriptor();
 		} catch (...) { fence(); throw; }
 	}
+	std::optional<ArtifactVerifier> begin_artifact_verification(const ReplacementId& id, ArtifactPart part) {
+		auto& operation = replacement(id); auto index = part_index(part);
+		if (!operation.prepared[index]) { throw std::logic_error("artifact not sealed"); }
+		try { return journal_.begin_artifact_verification(*operation.prepared[index]); }
+		catch (...) { if (journal_.fenced()) { fence(); } throw; }
+	}
 	void verify_artifact(const ReplacementId& id, ArtifactPart part) {
 		auto& operation = replacement(id); auto index = part_index(part);
 		if (!operation.prepared[index]) { throw std::logic_error("artifact not sealed"); }
