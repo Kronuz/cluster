@@ -3,6 +3,7 @@
 #include "core.h"
 #include "admission.h"
 #include "checkpoint.h"
+#include "snapshot.h"
 #include "../journal/store.h"
 
 namespace cluster::consensus {
@@ -11,6 +12,10 @@ enum class SubmitResult { Accepted, Busy, Pressure, Fenced };
 enum class TurnResult { Idle, Blocked, Pressure, Inventory, Stored, Completed, Maintenance, Fenced };
 struct WorkerLimits { std::size_t foreground_burst = 16, scan_entries = 128; };
 struct CaptureMetadata { RequestId request; Index through; Term term; };
+struct SnapshotLimits { std::uint32_t application_format; std::uint64_t application_bytes; };
+struct SnapshotContext { NodeId authenticated_peer; Term leader_term; RequestId request; Token transfer; SnapshotDescriptor descriptor; };
+enum class ValidationAck { Accepted, Stale, NotReady, Fenced };
+enum class SnapshotReason { Canceled, InvalidImage, InvalidApplication };
 enum class CancelResult { Canceled, TooLate, Stale };
 class Worker;
 class CheckpointId {
@@ -23,15 +28,28 @@ private:
 	std::shared_ptr<char> owner_;
 	Token token_;
 };
+class SnapshotId {
+public:
+	SnapshotId(const SnapshotId&) = default;
+	SnapshotId& operator=(const SnapshotId&) = default;
+private:
+	friend class Worker;
+	SnapshotId(std::shared_ptr<char> owner, Token token) : owner_(std::move(owner)), token_(token) {}
+	std::shared_ptr<char> owner_;
+	Token token_;
+};
+struct SnapshotOffer { SubmitResult result; std::uint64_t next_offset; };
+struct ValidationView { SnapshotId snapshot; Token chunk; std::uint64_t offset; std::span<const char> bytes; bool verified_eof; };
+struct SnapshotResult { SnapshotId snapshot; SnapshotContext context; SnapshotReason reason; };
 
 // One owning executor. IO is exclusive to this worker and outlives it.
 // There is no input queue; retryable work remains with the caller.
 class Worker {
 public:
 	Worker(kronuz::journal::IO& io, FixedConfiguration configuration, kronuz::journal::AdmissionLimits admission,
-		Limits limits = {}, Timing timing = {}, WorkerLimits scheduling = {})
+		Limits limits = {}, Timing timing = {}, WorkerLimits scheduling = {}, std::optional<SnapshotLimits> snapshots = {})
 		: configuration_(std::move(configuration)), limits_(limits), timing_(timing), scheduling_(scheduling),
-		store_(io, admission, batch_limit(configuration_, limits)) {
+		snapshot_limits_(snapshots), store_(io, admission, batch_limit(configuration_, limits), artifact_limit(snapshots)) {
 		Core validate(configuration_, RecoveredState{configuration_, {}, 0, 0, {}, 0}, limits_, timing_);
 		if (!scheduling_.foreground_burst || scheduling_.foreground_burst > 1048576 || !scheduling_.scan_entries || scheduling_.scan_entries > 4096 ||
 			admission.control_slots < 3 || admission.maximum_tickets < 5) { throw std::invalid_argument("invalid worker scheduling or control slots"); }
@@ -117,7 +135,7 @@ public:
 		if (!fenced() && core_ && through != 0 && through == delivered_) { fail(std::move(reason)); }
 	}
 	std::optional<CheckpointId> reserve_checkpoint(std::uint64_t application_cap) {
-		if (!ready() || checkpoint_) { return std::nullopt; }
+		if (!ready() || checkpoint_ || snapshot_result_) { return std::nullopt; }
 		if (next_checkpoint_ == std::numeric_limits<Token>::max()) { throw std::length_error("checkpoint identity exhausted"); }
 		auto replacement = store_.reserve_replacement(application_cap, checkpoint_detail::maximum_size(limits_));
 		if (!replacement) { return std::nullopt; }
@@ -129,7 +147,7 @@ public:
 	void attach_capture(const CheckpointId& id, CaptureMetadata capture) {
 		auto& operation = checkpoint(id);
 		if (operation.phase != Phase::Reserved || !capture.through || !capture.term) { throw std::invalid_argument("invalid checkpoint capture phase or boundary"); }
-		operation.capture = capture; operation.phase = Phase::BeginApplication;
+		std::get<Local>(operation.mode).capture = capture; operation.phase = Phase::BeginApplication;
 	}
 	SubmitResult offer_application_chunk(const CheckpointId& id, std::string_view bytes, bool final = false) {
 		auto& operation = checkpoint(id);
@@ -144,11 +162,72 @@ public:
 		return SubmitResult::Accepted;
 	}
 	CancelResult cancel_checkpoint(const CheckpointId& id) {
-		if (id.owner_ != checkpoint_owner_ || !checkpoint_ || id.token_ != checkpoint_->token) { return CancelResult::Stale; }
-		if (checkpoint_->phase >= Phase::EncodeBundle) { return CancelResult::TooLate; }
+		if (id.owner_ != checkpoint_owner_ || !checkpoint_ || id.token_ != checkpoint_->token || !std::holds_alternative<Local>(checkpoint_->mode)) { return CancelResult::Stale; }
+		if (publication_started(checkpoint_->phase)) { return CancelResult::TooLate; }
 		try { store_.cancel_replacement(checkpoint_->replacement); checkpoint_.reset(); cutover_debt_ = false; return CancelResult::Canceled; }
 		catch (const std::exception& error) { fail(error.what()); throw; }
 	}
+	std::optional<SnapshotId> reserve_snapshot(SnapshotContext context) {
+		if (!snapshot_limits_) { throw std::invalid_argument("snapshot reception is disabled"); }
+		validate_snapshot(context.descriptor, {configuration_.cluster, configuration_.configuration, snapshot_limits_->application_format, snapshot_limits_->application_bytes});
+		if (!context.request || !context.transfer || !context.leader_term || context.descriptor.term > context.leader_term ||
+			context.authenticated_peer == configuration_.local || std::find(configuration_.voters.begin(), configuration_.voters.end(), context.authenticated_peer) == configuration_.voters.end() ||
+			(core_ && context.leader_term < core_->term())) { throw std::invalid_argument("invalid snapshot sender context"); }
+		if (!ready() || checkpoint_ || snapshot_result_) { return std::nullopt; }
+		if (next_checkpoint_ == std::numeric_limits<Token>::max()) { throw std::length_error("snapshot identity exhausted"); }
+		auto replacement = store_.reserve_replacement(context.descriptor.application_bytes, checkpoint_detail::maximum_size(limits_));
+		if (!replacement) { return std::nullopt; }
+		auto token = ++next_checkpoint_;
+		try {
+			checkpoint_ = std::make_unique<Checkpoint>(*replacement, token, context.descriptor.application_bytes);
+			checkpoint_->mode.emplace<Incoming>(std::move(context)); checkpoint_->phase = Phase::BeginApplication;
+		} catch (...) { checkpoint_.reset(); store_.cancel_replacement(*replacement); throw; }
+		return SnapshotId(checkpoint_owner_, token);
+	}
+	SnapshotOffer offer_snapshot_chunk(const SnapshotId& id, std::uint64_t offset, std::string_view bytes, bool final = false) {
+		auto& operation = snapshot(id);
+		if ((operation.phase != Phase::BeginApplication && operation.phase != Phase::Application) || operation.final_offered) { throw std::invalid_argument("snapshot no longer accepts input"); }
+		if (offset != operation.offered_bytes) { throw std::invalid_argument("snapshot input offset is not sequential"); }
+		if (bytes.size() > 65536 || bytes.size() > operation.application_cap - offset) { throw std::length_error("snapshot chunk or image bound"); }
+		if ((!final && bytes.empty()) || (final && offset + bytes.size() != operation.application_cap)) { throw std::invalid_argument("invalid snapshot final marker"); }
+		if (operation.chunk) { return {SubmitResult::Busy, operation.offered_bytes}; }
+		operation.chunk.emplace(); std::copy(bytes.begin(), bytes.end(), operation.chunk->bytes.begin());
+		operation.chunk->length = bytes.size(); operation.chunk->final = final;
+		operation.offered_bytes += bytes.size(); operation.final_offered = final;
+		return {SubmitResult::Accepted, operation.offered_bytes};
+	}
+	std::optional<ValidationView> validation_chunk() const {
+		if (fenced() || !checkpoint_) { return std::nullopt; }
+		auto incoming = std::get_if<Incoming>(&checkpoint_->mode);
+		if (!incoming || !incoming->view) { return std::nullopt; }
+		const auto& chunk = *checkpoint_->chunk;
+		return ValidationView{SnapshotId(checkpoint_owner_, checkpoint_->token), chunk.token, chunk.offset, std::span<const char>(chunk.bytes.data(), chunk.length), chunk.final};
+	}
+	ValidationAck consume_validation(const SnapshotId& id, Token token) {
+		if (fenced()) { return ValidationAck::Fenced; }
+		auto operation = find_snapshot(id); if (!operation) { return ValidationAck::Stale; }
+		auto& incoming = std::get<Incoming>(operation->mode);
+		if (!incoming.view || operation->chunk->token != token) { return ValidationAck::Stale; }
+		incoming.view = false;
+		if (operation->chunk->final) { incoming.eof = token; operation->phase = Phase::AwaitSemantic; }
+		else if (incoming.verifier->offset() == operation->application_cap) { operation->phase = Phase::FinishVerification; }
+		operation->chunk.reset(); return ValidationAck::Accepted;
+	}
+	ValidationAck validation_succeeded(const SnapshotId& id, Token eof) {
+		if (fenced()) { return ValidationAck::Fenced; }
+		auto operation = find_snapshot(id); if (!operation) { return ValidationAck::Stale; }
+		auto& incoming = std::get<Incoming>(operation->mode);
+		if (!incoming.eof || incoming.view) { return ValidationAck::NotReady; }
+		if (incoming.eof != eof || operation->phase != Phase::AwaitSemantic) { return ValidationAck::Stale; }
+		operation->phase = Phase::Validated; return ValidationAck::Accepted;
+	}
+	bool snapshot_validated(const SnapshotId& id) const noexcept {
+		return !fenced() && checkpoint_ && id.owner_ == checkpoint_owner_ && id.token_ == checkpoint_->token &&
+			std::holds_alternative<Incoming>(checkpoint_->mode) && checkpoint_->phase == Phase::Validated;
+	}
+	CancelResult reject_snapshot_validation(const SnapshotId& id) { return cancel_snapshot(id, SnapshotReason::InvalidApplication); }
+	CancelResult cancel_snapshot(const SnapshotId& id) { return cancel_snapshot(id, SnapshotReason::Canceled); }
+	std::optional<SnapshotResult> take_snapshot_result() { auto result = std::move(snapshot_result_); snapshot_result_.reset(); return result; }
 	TurnResult run_one(Tick current_time) {
 		if (store_.fenced() && !failed_) { fail("storage fenced outside worker"); }
 		if (fenced()) { return TurnResult::Fenced; }
@@ -231,8 +310,16 @@ private:
 			return fenced() ? SubmitResult::Fenced : SubmitResult::Accepted;
 		} catch (const std::exception& error) { fail(error.what()); return SubmitResult::Fenced; }
 	}
-	enum class Phase { Reserved, BeginApplication, Application, SealApplication, Cutover, EncodeBundle, BeginBundle, Bundle, SealBundle, Publish, Completion };
-	struct Chunk { std::array<char, 65536> bytes{}; std::size_t length = 0; bool final = false; };
+	enum class Phase { Reserved, BeginApplication, Application, SealApplication, OpenVerification, Readback, FinishVerification, AwaitVerifiedEOF, AwaitSemantic, Validated, Cutover, EncodeBundle, BeginBundle, Bundle, SealBundle, Publish, Completion };
+	struct Chunk { std::array<char, 65536> bytes{}; std::size_t length = 0; bool final = false; std::uint64_t offset = 0; Token token = 0; };
+	struct Local { std::optional<CaptureMetadata> capture; };
+	struct Incoming {
+		explicit Incoming(SnapshotContext value) : context(std::move(value)) {}
+		SnapshotContext context;
+		std::optional<kronuz::journal::ArtifactVerifier> verifier;
+		std::optional<kronuz::journal::ArtifactReader> reader;
+		Token eof = 0; bool view = false;
+	};
 	struct Checkpoint {
 		Checkpoint(kronuz::journal::ReplacementId id, Token identity, std::uint64_t cap)
 			: replacement(std::move(id)), token(identity), application_cap(cap) {}
@@ -240,7 +327,7 @@ private:
 		Token token, persistence_token = 0;
 		std::uint64_t application_cap, offered_bytes = 0, sequence = 0;
 		Phase phase = Phase::Reserved;
-		std::optional<CaptureMetadata> capture;
+		std::variant<Local, Incoming> mode;
 		std::optional<Chunk> chunk;
 		std::optional<kronuz::journal::ArtifactDescriptor> application;
 		std::optional<PersistCheckpoint> action;
@@ -250,14 +337,39 @@ private:
 	};
 	Checkpoint& checkpoint(const CheckpointId& id) {
 		if (fenced()) { throw std::logic_error("worker fenced"); }
-		if (id.owner_ != checkpoint_owner_ || !checkpoint_ || id.token_ != checkpoint_->token) { throw std::invalid_argument("stale or foreign checkpoint identity"); }
+		if (id.owner_ != checkpoint_owner_ || !checkpoint_ || id.token_ != checkpoint_->token || !std::holds_alternative<Local>(checkpoint_->mode)) { throw std::invalid_argument("stale or foreign checkpoint identity"); }
 		return *checkpoint_;
+	}
+	Checkpoint* find_snapshot(const SnapshotId& id) {
+		return checkpoint_ && id.owner_ == checkpoint_owner_ && id.token_ == checkpoint_->token && std::holds_alternative<Incoming>(checkpoint_->mode) ? checkpoint_.get() : nullptr;
+	}
+	Checkpoint& snapshot(const SnapshotId& id) {
+		if (fenced()) { throw std::logic_error("worker fenced"); }
+		auto operation = find_snapshot(id); if (!operation) { throw std::invalid_argument("stale or foreign snapshot identity"); } return *operation;
+	}
+	static bool publication_started(Phase phase) {
+		return phase == Phase::EncodeBundle || phase == Phase::BeginBundle || phase == Phase::Bundle || phase == Phase::SealBundle || phase == Phase::Publish || phase == Phase::Completion;
+	}
+	CancelResult cancel_snapshot(const SnapshotId& id, SnapshotReason reason) {
+		auto operation = find_snapshot(id); if (!operation) { return CancelResult::Stale; }
+		if (publication_started(operation->phase)) { return CancelResult::TooLate; }
+		try {
+			auto context = std::get<Incoming>(operation->mode).context;
+			if (snapshot_result_) { throw std::logic_error("snapshot result slot occupied"); }
+			store_.cancel_replacement(operation->replacement); checkpoint_.reset();
+			snapshot_result_.emplace(SnapshotResult{id, std::move(context), reason}); return CancelResult::Canceled;
+		} catch (const std::exception& error) { fail(error.what()); throw; }
+	}
+	Token validation_token() {
+		if (next_validation_ == std::numeric_limits<Token>::max()) { throw std::overflow_error("validation identity exhausted"); }
+		return ++next_validation_;
 	}
 	bool preparation_runnable() const noexcept {
 		if (!checkpoint_) { return false; }
 		auto phase = checkpoint_->phase;
-		if (phase == Phase::Reserved || phase == Phase::Completion) { return false; }
+		if (phase == Phase::Reserved || phase == Phase::Completion || phase == Phase::AwaitVerifiedEOF || phase == Phase::AwaitSemantic || phase == Phase::Validated) { return false; }
 		if (phase == Phase::Application) { return checkpoint_->chunk.has_value(); }
+		if (phase == Phase::Readback) { return !std::get<Incoming>(checkpoint_->mode).view; }
 		if (phase == Phase::Cutover) { return !core_->busy() && output_.empty() && !application_ && !completion_; }
 		return true;
 	}
@@ -282,9 +394,32 @@ private:
 		}
 		case Phase::SealApplication:
 			operation.application = store_.finish_artifact(operation.replacement);
-			operation.phase = Phase::Cutover; cutover_debt_ = true; break;
+			if (auto incoming = std::get_if<Incoming>(&operation.mode)) {
+				const auto& descriptor = incoming->context.descriptor;
+				if (operation.application->length != descriptor.application_bytes || operation.application->checksum != descriptor.application_crc32c) {
+					cancel_snapshot(SnapshotId(checkpoint_owner_, operation.token), SnapshotReason::InvalidImage); break;
+				}
+				operation.phase = Phase::OpenVerification;
+			} else { operation.phase = Phase::Cutover; cutover_debt_ = true; }
+			break;
+		case Phase::OpenVerification: {
+			auto& incoming = std::get<Incoming>(operation.mode);
+			incoming.verifier = store_.begin_artifact_verification(operation.replacement, ArtifactPart::Application);
+			if (incoming.verifier) { operation.phase = operation.application_cap ? Phase::Readback : Phase::FinishVerification; }
+			break;
+		}
+		case Phase::Readback: {
+			auto& incoming = std::get<Incoming>(operation.mode); operation.chunk.emplace(); auto& chunk = *operation.chunk;
+			chunk.offset = incoming.verifier->offset(); chunk.length = incoming.verifier->read_next(chunk.bytes); chunk.token = validation_token(); incoming.view = true; break;
+		}
+		case Phase::FinishVerification: {
+			auto& incoming = std::get<Incoming>(operation.mode);
+			incoming.reader.emplace(std::move(*incoming.verifier).finish()); incoming.verifier.reset(); operation.chunk.emplace();
+			auto& chunk = *operation.chunk; chunk.offset = operation.application_cap; chunk.final = true; chunk.token = validation_token();
+			incoming.view = true; operation.phase = Phase::AwaitVerifiedEOF; break;
+		}
 		case Phase::Cutover: {
-			auto capture = *operation.capture;
+			auto capture = *std::get<Local>(operation.mode).capture;
 			ingest(core_->step(LocalCheckpoint{capture.request, operation.token, capture.through, capture.term, configuration_.cluster, configuration_.configuration}));
 			if (fenced()) { break; }
 			if (!core_->busy()) { store_.cancel_replacement(operation.replacement); checkpoint_.reset(); cutover_debt_ = false; }
@@ -320,6 +455,9 @@ private:
 	static std::size_t batch_limit(const FixedConfiguration& configuration, Limits limits) {
 		return std::max(encode_initialization(configuration).size(), storage_batch_size(true, true, limits.rpc_entries, limits.rpc_bytes));
 	}
+	static std::uint64_t artifact_limit(std::optional<SnapshotLimits> limits) {
+		return std::max(std::uint64_t{512ull * 1024 * 1024}, limits ? limits->application_bytes : 0);
+	}
 	bool maintenance_due() const noexcept { return foreground_ >= scheduling_.foreground_burst; }
 	void unopened() const { if (core_ || failed_) { throw std::logic_error("worker already opened or fenced"); } }
 	void release_pack() { for (auto& permit : pack_) { permit.reset(); } pack_count_ = pack_next_ = 0; }
@@ -346,7 +484,7 @@ private:
 				throw std::logic_error("snapshot installation requires worker transfer API");
 			}
 			else if (auto value = std::get_if<PersistCheckpoint>(&action)) {
-				if (!checkpoint_ || checkpoint_->phase != Phase::Cutover || value->capture != checkpoint_->token) { throw std::logic_error("checkpoint lacks owned replacement"); }
+				if (!checkpoint_ || !std::holds_alternative<Local>(checkpoint_->mode) || checkpoint_->phase != Phase::Cutover || value->capture != checkpoint_->token) { throw std::logic_error("checkpoint lacks owned replacement"); }
 				checkpoint_->sequence = store_.frontier().sequence; checkpoint_->persistence_token = value->token;
 				checkpoint_->action = std::move(*value); checkpoint_->phase = Phase::EncodeBundle;
 			}
@@ -371,6 +509,7 @@ private:
 	Limits limits_;
 	Timing timing_;
 	WorkerLimits scheduling_;
+	std::optional<SnapshotLimits> snapshot_limits_;
 	kronuz::journal::Store store_;
 	std::unique_ptr<Core> core_;
 	std::string initialization_;
@@ -383,6 +522,8 @@ private:
 	std::shared_ptr<char> checkpoint_owner_ = std::make_shared<char>();
 	std::unique_ptr<Checkpoint> checkpoint_;
 	Token next_checkpoint_ = 0;
+	Token next_validation_ = 0;
+	std::optional<SnapshotResult> snapshot_result_;
 	Actions output_;
 	Index delivered_ = 0;
 	bool failed_ = false, cutover_debt_ = false, preparation_next_ = true, timer_due_ = true, timer_blocked_ = false;

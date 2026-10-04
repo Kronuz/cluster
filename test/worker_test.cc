@@ -15,9 +15,16 @@ class FaultIO final : public kronuz::journal::IO {
 public:
 	explicit FaultIO(const std::filesystem::path& directory) : backend(directory) {}
 	bool fail_sync = false;
+	bool fail_read = false, read_failure_after = false, corrupt_payload_read = false;
+	std::size_t artifact_read_chunk = 65536;
+	unsigned payload_reads = 0, artifact_opens = 0;
 	unsigned scans = 0, artifacts = 0, directory_syncs = 0;
 	auto acquire_owner(bool create) -> std::unique_ptr<kronuz::journal::OwnerLock> override { return backend.acquire_owner(create); }
-	auto open_existing(std::string_view name) -> std::unique_ptr<kronuz::journal::File> override { return backend.open_existing(name); }
+	auto open_existing(std::string_view name) -> std::unique_ptr<kronuz::journal::File> override {
+		auto file = backend.open_existing(name);
+		if (name.starts_with("artifact-")) { ++artifact_opens; return std::make_unique<ReadFile>(*this, std::move(file)); }
+		return file;
+	}
 	auto create_exclusive(std::string_view name) -> std::unique_ptr<kronuz::journal::File> override { auto file = backend.create_exclusive(name); if (name.starts_with("artifact-")) { ++artifacts; } return file; }
 	void replace(std::string_view source, std::string_view destination) override { backend.replace(source, destination); }
 	void remove(std::string_view name) override { backend.remove(name); }
@@ -26,6 +33,23 @@ public:
 	auto open_reclaim_candidate(std::string_view name) -> std::unique_ptr<kronuz::journal::File> override { return backend.open_reclaim_candidate(name); }
 	void sync_directory() override { if (fail_sync) { fail_sync = false; throw std::runtime_error("injected worker directory barrier failure"); } backend.sync_directory(); ++directory_syncs; }
 private:
+	class ReadFile final : public kronuz::journal::File {
+	public:
+		ReadFile(FaultIO& owner, std::unique_ptr<kronuz::journal::File> file) : owner_(owner), file_(std::move(file)) {}
+		std::uint64_t size() override { return file_->size(); }
+		std::size_t read_at(std::uint64_t offset, std::span<char> bytes) override {
+			if (offset >= kronuz::journal::detail::artifact_header_size) { ++owner_.payload_reads; }
+			bool fail = std::exchange(owner_.fail_read, false);
+			if (fail && !owner_.read_failure_after) { throw std::runtime_error("injected read failure before effect"); }
+			auto count = file_->read_at(offset, bytes.first(std::min(bytes.size(), owner_.artifact_read_chunk)));
+			if (owner_.corrupt_payload_read && offset >= kronuz::journal::detail::artifact_header_size && count) { bytes[0] ^= 1; }
+			if (fail) { throw std::runtime_error("injected read failure after effect"); } return count;
+		}
+		std::size_t write_at(std::uint64_t offset, std::string_view bytes) override { return file_->write_at(offset, bytes); }
+		void truncate(std::uint64_t size) override { file_->truncate(size); }
+		void sync() override { file_->sync(); }
+	private: FaultIO& owner_; std::unique_ptr<kronuz::journal::File> file_;
+	};
 	kronuz::journal::PosixIO backend;
 };
 void real_worker() {
@@ -401,8 +425,252 @@ void checkpoint_faults() {
 		}
 	}
 }
+struct SnapshotFixture {
+	struct Directory {
+		std::filesystem::path path;
+		explicit Directory(std::string name) : path(std::filesystem::current_path() / ".scratch" / ("worker-snapshot-" + name + "-" + std::to_string(::getpid()))) {
+			std::filesystem::create_directories(path.parent_path());
+			if (!std::filesystem::create_directory(path)) { throw std::runtime_error("snapshot fixture directory exists"); } ::chmod(path.c_str(), 0700);
+		}
+		~Directory() { std::filesystem::remove_all(path); }
+	};
+	static FixedConfiguration fixed() { auto result = configuration(); result.voters = {1, 2, 3}; return result; }
+	static kronuz::journal::AdmissionLimits quota() { return {{512 * 1024, 4096}, {16 * 1024, 3}, {128 * 1024, 4}, 8, 3}; }
+	Directory directory; FaultIO io; Worker worker; bool unexpected_install = false;
+	explicit SnapshotFixture(std::string name, std::optional<SnapshotLimits> snapshots = SnapshotLimits{7, 100000}, kronuz::journal::AdmissionLimits capacity = quota())
+		: directory(std::move(name)), io(directory.path), worker(io, fixed(), capacity, limits(), {}, {4, 1}, snapshots) {
+		kronuz::journal::Identity identity{}; identity[0] = 'S'; worker.create(identity);
+		for (unsigned turn = 0; turn < 100 && !worker.ready(); ++turn) { worker.run_one({0, 100}); }
+		worker.try_submit(Start{}); drain();
+	}
+	void drain() {
+		for (const auto& action : worker.take_actions()) {
+			unexpected_install |= std::holds_alternative<PersistInstall>(action) || std::holds_alternative<ActivateInstall>(action) || std::holds_alternative<InstallCompleted>(action) || std::holds_alternative<CheckpointPublished>(action);
+			if (auto range = std::get_if<Committed>(&action)) { worker.applied({range->entries.back().index}); }
+		}
+	}
+	std::uint64_t staged_bytes() const {
+		std::uint64_t total = 0;
+		for (const auto& entry : std::filesystem::directory_iterator(directory.path)) { if (entry.path().filename().string().starts_with("artifact-")) { total += entry.file_size(); } }
+		return total;
+	}
+	void pump() { worker.run_one({0, 100}); drain(); }
+	SnapshotContext context(std::string_view payload) {
+		auto configuration = fixed(); return {2, 1, 13, 17, {configuration.cluster, configuration.configuration, 7, 1, 1, payload.size(), kronuz::journal::crc32c(payload)}};
+	}
+	void send(const SnapshotId& id, std::string_view payload) {
+		std::uint64_t offset = 0; bool final = false;
+		for (unsigned turn = 0; turn < 1000 && !final; ++turn) {
+			auto count = std::min<std::size_t>(payload.size() - offset, 65536);
+			auto result = worker.offer_snapshot_chunk(id, offset, payload.substr(static_cast<std::size_t>(offset), count), offset + count == payload.size());
+			if (result.result == SubmitResult::Accepted) { offset = result.next_offset; final = offset == payload.size(); }
+			else { pump(); }
+		}
+		check(final, "snapshot reception accepts the complete exact input stream");
+	}
+};
+void snapshot_reception_and_validation() {
+	for (std::size_t length : {std::size_t{0}, std::size_t{9}, std::size_t{65553}}) {
+		SnapshotFixture fixture("validation-" + std::to_string(length)); auto& worker = fixture.worker; fixture.io.artifact_read_chunk = 3;
+		std::string payload(length, 'x'); auto before = worker.storage_frontier(); auto id = worker.reserve_snapshot(fixture.context(payload));
+		check(id.has_value() && !worker.reserve_checkpoint(16) && !worker.reserve_snapshot(fixture.context(payload)), "local and incoming capture share one reserved replacement slot");
+		if (!id) { continue; } fixture.send(*id, payload);
+		check(throws([&] { worker.offer_snapshot_chunk(*id, payload.size(), "", true); }), "input closes immediately after the accepted final marker");
+		std::string candidate; Token previous = 0, eof = 0; bool held = false;
+		for (unsigned turn = 0; turn < 150000 && !eof; ++turn) {
+			fixture.pump(); auto view = worker.validation_chunk(); if (!view) { continue; }
+			check(view->chunk > previous && view->offset == candidate.size(), "validation views have exact offsets and fresh monotonic tokens");
+			check(worker.validation_succeeded(*id, view->chunk) == ValidationAck::NotReady, "data or unconsumed EOF cannot declare semantic success");
+			if (!view->verified_eof) {
+				check(!view->bytes.empty() && view->bytes.size() <= 65536, "candidate data is bounded and distinct from verified EOF");
+				if (!held) {
+					auto token = view->chunk; auto data = std::string(view->bytes.data(), view->bytes.size()); auto reads = fixture.io.payload_reads; auto scans = fixture.io.scans; unsigned admitted = 0;
+					for (unsigned wait = 0; wait < 12; ++wait) { admitted += worker.try_submit(Read{100 + wait}) == SubmitResult::Accepted; fixture.pump(); }
+					check(admitted >= 3 && fixture.io.scans > scans, "held data view permits ordinary admission and bounded reclamation");
+					auto same = worker.validation_chunk();
+					check(same && same->chunk == token && std::string(same->bytes.data(), same->bytes.size()) == data && fixture.io.payload_reads == reads, "held validation view stays stable and does not occupy ordinary consensus output"); held = true;
+				}
+				candidate.append(view->bytes.data(), view->bytes.size());
+			} else { check(view->bytes.empty() && candidate == payload, "verified EOF follows complete matching candidate data"); eof = view->chunk; }
+			previous = view->chunk;
+			check(worker.consume_validation(*id, view->chunk + 1000000) == ValidationAck::Stale && worker.consume_validation(*id, view->chunk) == ValidationAck::Accepted && worker.consume_validation(*id, view->chunk) == ValidationAck::Stale, "only an exact unconsumed validation token advances the mailbox");
+		}
+		check(eof && worker.validation_succeeded(*id, eof + 1) == ValidationAck::Stale && worker.validation_succeeded(*id, eof) == ValidationAck::Accepted && worker.validation_succeeded(*id, eof) == ValidationAck::Stale, "semantic success requires exactly the consumed verified EOF");
+		unsigned validated_admission = 0; auto validated_scans = fixture.io.scans;
+		for (unsigned turn = 0; turn < 20; ++turn) { validated_admission += worker.try_submit(Read{200 + turn}) == SubmitResult::Accepted; fixture.pump(); }
+		check(validated_admission >= 3 && fixture.io.scans > validated_scans, "validated unpublished candidate permits ordinary traffic and reclamation");
+		auto after = worker.storage_frontier();
+		check(worker.snapshot_validated(*id) && !worker.take_snapshot_result() && !worker.fenced() && !worker.busy() && worker.term() == 0 && worker.base_index() == 0 && after.generation == before.generation && after.sequence == before.sequence && !after.checkpoint && !fixture.unexpected_install, "validated candidate changes no incoming Core state, generation, activation or ordinary admission");
+		check(worker.cancel_snapshot(*id) == CancelResult::Canceled && !worker.reserve_checkpoint(16) && !worker.reserve_snapshot(fixture.context(payload)), "cancelable validated candidate retains terminal-result backpressure on both replacement APIs");
+		unsigned accepted = 0;
+		for (unsigned turn = 0; turn < 20; ++turn) { accepted += worker.try_submit(Read{300 + turn}) == SubmitResult::Accepted; fixture.pump(); }
+		check(accepted >= 3 && !worker.reserve_checkpoint(16) && !worker.reserve_snapshot(fixture.context(payload)), "held snapshot result blocks only replacement work while ordinary consensus continues");
+		auto result = worker.take_snapshot_result(); check(result && result->reason == SnapshotReason::Canceled && result->context.transfer == 17 && !worker.take_snapshot_result(), "snapshot cancellation result is correlated and delivered exactly once");
+		check(worker.consume_validation(*id, eof) == ValidationAck::Stale && worker.validation_succeeded(*id, eof) == ValidationAck::Stale && worker.cancel_snapshot(*id) == CancelResult::Stale, "completed snapshot tokens cannot mutate another operation");
+		auto next = worker.reserve_snapshot(fixture.context("next")); check(next.has_value(), "drained result permits a new replacement reservation");
+		check(worker.consume_validation(*id, eof) == ValidationAck::Stale && worker.validation_succeeded(*id, eof) == ValidationAck::Stale && !worker.snapshot_validated(*next), "old-operation callbacks leave the new incoming candidate untouched");
+		worker.cancel_snapshot(*next); worker.take_snapshot_result();
+	}
 }
+void snapshot_policy_and_rejection() {
+	SnapshotFixture fixture("policy"); auto& worker = fixture.worker; auto context = fixture.context("abc"); auto used = worker.accounting()->used;
+	auto local = worker.reserve_checkpoint(16); check(local && !worker.reserve_snapshot(context), "reserved local checkpoint excludes inbound replacement"); if (local) { worker.cancel_checkpoint(*local); }
+	for (unsigned fault = 0; fault < 9; ++fault) {
+		auto invalid = context;
+		switch (fault) { case 0: invalid.request = 0; break; case 1: invalid.transfer = 0; break; case 2: invalid.authenticated_peer = 1; break; case 3: invalid.authenticated_peer = 4; break; case 4: invalid.leader_term = 0; break; case 5: invalid.descriptor.configuration[0] ^= 1; break; case 6: invalid.descriptor.application_format = 8; break; case 7: invalid.descriptor.application_bytes = 100001; break; case 8: invalid.descriptor.term = 2; break; }
+		check(throws([&] { worker.reserve_snapshot(invalid); }) && !worker.fenced() && worker.accounting()->used == used && !worker.take_snapshot_result(), "malformed snapshot policy/context reserves nothing and queues no result");
+	}
+	auto id = worker.reserve_snapshot(context); if (!id) { check(false, "policy fixture reservation"); return; }
+	check(throws([&] { worker.offer_snapshot_chunk(*id, 1, "a"); }) && throws([&] { worker.offer_snapshot_chunk(*id, 0, ""); }) && throws([&] { worker.offer_snapshot_chunk(*id, 0, "a", true); }) && throws([&] { worker.offer_snapshot_chunk(*id, 0, "abcd", true); }) && throws([&] { worker.offer_snapshot_chunk(*id, 0, std::string(65537, 'x')); }) && !worker.fenced(), "invalid offsets, zero chunks, early final and excess sizes leave reception unchanged");
+	auto first = worker.offer_snapshot_chunk(*id, 0, "a"); auto busy = worker.offer_snapshot_chunk(*id, 1, "b");
+	check(first.result == SubmitResult::Accepted && first.next_offset == 1 && busy.result == SubmitResult::Busy && busy.next_offset == 1 && throws([&] { worker.offer_snapshot_chunk(*id, 0, "a"); }), "busy input accepts no bytes and duplicate offsets reject");
+	for (unsigned turn = 0; turn < 100 && worker.offer_snapshot_chunk(*id, 1, "bc").result == SubmitResult::Busy; ++turn) { fixture.pump(); }
+	SnapshotOffer final{SubmitResult::Busy, 3};
+	for (unsigned turn = 0; turn < 100 && final.result == SubmitResult::Busy; ++turn) { fixture.pump(); final = worker.offer_snapshot_chunk(*id, 3, "", true); }
+	check(final.result == SubmitResult::Accepted, "empty final marker closes a fully offered nonempty image");
+	SnapshotFixture other("foreign"); auto other_id = other.worker.reserve_snapshot(other.context("abc"));
+	check(other_id && worker.consume_validation(*other_id, 1) == ValidationAck::Stale && worker.validation_succeeded(*other_id, 1) == ValidationAck::Stale && worker.cancel_snapshot(*other_id) == CancelResult::Stale && throws([&] { worker.offer_snapshot_chunk(*other_id, 0, "a"); }), "foreign session callbacks cannot change an incoming candidate");
+	check(worker.reject_snapshot_validation(*id) == CancelResult::Canceled, "semantic rejection cancels healthy staged storage");
+	auto rejected = worker.take_snapshot_result(); check(rejected && rejected->reason == SnapshotReason::InvalidApplication && !worker.fenced(), "semantic rejection is a correlated healthy result");
+	context.descriptor.application_crc32c ^= 1; id = worker.reserve_snapshot(context); fixture.send(*id, "abc");
+	for (unsigned turn = 0; turn < 100 && worker.accounting()->tickets; ++turn) { fixture.pump(); }
+	rejected = worker.take_snapshot_result(); check(rejected && rejected->reason == SnapshotReason::InvalidImage && !worker.fenced() && !worker.validation_chunk() && fixture.io.payload_reads == 0, "remote checksum mismatch rejects before readback without fencing storage");
+	SnapshotFixture disabled("disabled", std::nullopt); check(throws([&] { disabled.worker.reserve_snapshot(context); }) && !disabled.worker.fenced(), "existing callers keep reception disabled until configured");
+	auto capacity = SnapshotFixture::quota(); capacity.replacement_pool = {}; SnapshotFixture pressure("pressure", SnapshotLimits{7, 100000}, capacity);
+	check(!pressure.worker.reserve_snapshot(pressure.context("abc")) && !pressure.worker.take_snapshot_result() && !pressure.worker.fenced(), "replacement pressure creates no incoming operation or terminal result");
+}
+}
+void snapshot_cancellation_phases() {
+	for (unsigned phase = 0; phase < 8; ++phase) {
+		SnapshotFixture fixture("cancel-" + std::to_string(phase)); auto& worker = fixture.worker;
+		auto baseline = worker.accounting()->used; std::string payload(17, 'c'); auto id = worker.reserve_snapshot(fixture.context(payload));
+		if (!id) { check(false, "cancellation fixture reserves replacement"); continue; }
+		Token eof = 0; auto barriers = fixture.io.directory_syncs;
+		if (phase == 1) { for (unsigned turn = 0; turn < 20 && !fixture.io.artifacts; ++turn) { fixture.pump(); } }
+		if (phase == 2) {
+			worker.offer_snapshot_chunk(*id, 0, "part");
+			for (unsigned turn = 0; turn < 10; ++turn) { fixture.pump(); }
+		}
+		if (phase >= 3) {
+			fixture.send(*id, payload);
+			for (unsigned turn = 0; turn < 200; ++turn) {
+				fixture.pump(); auto view = worker.validation_chunk();
+				if (phase == 3 && fixture.io.directory_syncs >= barriers + 1 && !fixture.io.artifact_opens) { break; }
+				if (!view) { continue; }
+				if (phase == 4 && !view->verified_eof) { break; }
+				if (view->verified_eof) {
+					eof = view->chunk;
+					if (phase >= 6) { worker.consume_validation(*id, eof); }
+					if (phase == 7) { worker.validation_succeeded(*id, eof); }
+					break;
+				}
+				worker.consume_validation(*id, view->chunk);
+			}
+		}
+		check(phase == 0 || (phase == 1 ? fixture.io.artifacts > 0 : phase == 2 ? fixture.staged_bytes() == kronuz::journal::detail::artifact_header_size + 4 : phase == 3 ? fixture.io.directory_syncs >= barriers + 1 && !fixture.io.artifact_opens : phase == 4 ? worker.validation_chunk() && !worker.validation_chunk()->verified_eof : phase == 5 ? worker.validation_chunk() && worker.validation_chunk()->verified_eof : phase == 6 ? eof && !worker.validation_chunk() : worker.snapshot_validated(*id)), "cancellation reaches its explicit targeted phase witness");
+		check(worker.cancel_snapshot(*id) == CancelResult::Canceled && !worker.validation_chunk() && !worker.fenced(), "every unpublished receive/validation phase cancels without a storage fence");
+		check(worker.consume_validation(*id, eof) == ValidationAck::Stale && worker.validation_succeeded(*id, eof) == ValidationAck::Stale, "cancellation invalidates outstanding data and semantic callbacks");
+		check(!worker.reserve_checkpoint(8), "held cancellation result retains replacement exclusion");
+		worker.take_snapshot_result();
+		for (unsigned turn = 0; turn < 300 && worker.accounting()->used != baseline; ++turn) { fixture.pump(); }
+		check(worker.accounting()->used == baseline, "cancel closes validation pins and reclaims exact staged byte/name charges");
+		auto local = worker.reserve_checkpoint(8); check(bool(local), "incoming cancellation releases the shared local checkpoint slot");
+		if (local) { check(worker.cancel_checkpoint(*local) == CancelResult::Canceled, "local checkpoint cancellation remains valid after every incoming phase"); }
+	}
+}
+void snapshot_read_faults() {
+	for (unsigned fault = 0; fault < 5; ++fault) {
+		SnapshotFixture fixture("read-fault-" + std::to_string(fault)); auto& worker = fixture.worker;
+		auto id = worker.reserve_snapshot(fixture.context("payload")); if (!id) { check(false, "fault fixture reserves replacement"); continue; }
+		auto barriers = fixture.io.directory_syncs;
+		fixture.send(*id, "payload");
+		for (unsigned turn = 0; turn < 100 && !fixture.io.artifact_opens; ++turn) {
+			if (fault < 2 && fixture.io.directory_syncs >= barriers + 1) { break; }
+			fixture.pump();
+		}
+		// Admission is idle here; retain its output before arming the fault.
+		check(worker.try_submit(Read{71}) == SubmitResult::Accepted, "read fault starts with accepted ordinary output retained");
+		if (fault == 4) { fixture.io.corrupt_payload_read = true; }
+		else { fixture.io.fail_read = true; fixture.io.read_failure_after = fault % 2; }
+		for (unsigned turn = 0; turn < 100 && !worker.fenced(); ++turn) {
+			worker.run_one({0, 100});
+			if (auto view = worker.validation_chunk()) {
+				check(!view->verified_eof, "corrupt readback never exposes verified EOF"); worker.consume_validation(*id, view->chunk);
+			}
+		}
+		check(worker.fenced() && !worker.validation_chunk() && !worker.take_snapshot_result() && worker.consume_validation(*id, 1) == ValidationAck::Fenced, "metadata/payload failures and final checksum corruption fence all receiver capabilities");
+		bool notice = false; for (const auto& action : worker.take_actions()) { notice |= std::holds_alternative<Fenced>(action); }
+		worker.run_one({0, 100}); for (const auto& action : worker.take_actions()) { notice |= std::holds_alternative<Fenced>(action); }
+		check(notice && !fixture.unexpected_install, "storage fault retains a global fence notice without incoming publication");
+	}
+}
+
+void snapshot_restart_cleanup() {
+	for (bool sealed : {false, true}) {
+		SnapshotFixture::Directory directory("restart-" + std::to_string(sealed));
+		kronuz::journal::StorageResources baseline{};
+		{
+			FaultIO io(directory.path); Worker worker(io, SnapshotFixture::fixed(), SnapshotFixture::quota(), limits(), {}, {4, 1}, SnapshotLimits{7, 100000});
+			kronuz::journal::Identity identity{}; identity[0] = 'S'; worker.create(identity);
+			while (!worker.ready()) { worker.run_one({0, 100}); }
+			baseline = worker.accounting()->used;
+			auto fixed = SnapshotFixture::fixed(); std::string payload(17, 'r');
+			SnapshotContext context{2, 1, 13, 17, {fixed.cluster, fixed.configuration, 7, 1, 1, payload.size(), kronuz::journal::crc32c(payload)}};
+			auto id = worker.reserve_snapshot(context); if (!id) { check(false, "restart fixture reserves replacement"); continue; }
+			worker.offer_snapshot_chunk(*id, 0, sealed ? payload : std::string("partial"), sealed);
+			for (unsigned turn = 0; turn < 50; ++turn) { worker.run_one({0, 100}); worker.take_actions(); }
+			std::uint64_t staged = 0; for (const auto& entry : std::filesystem::directory_iterator(directory.path)) { if (entry.path().filename().string().starts_with("artifact-")) { staged += entry.file_size(); } }
+			check(staged == kronuz::journal::detail::artifact_header_size + (sealed ? payload.size() : 7) && (!sealed || worker.validation_chunk()), "restart fixture leaves actual unpublished artifact bytes and optionally a held verifier view");
+		}
+		{
+			FaultIO io(directory.path); Worker worker(io, SnapshotFixture::fixed(), SnapshotFixture::quota(), limits(), {}, {4, 1}, SnapshotLimits{7, 100000});
+			bool restored = false; worker.recover([&](auto&) { restored = true; });
+			for (unsigned turn = 0; turn < 300; ++turn) { worker.run_one({0, 100}); worker.take_actions(); }
+			check(worker.ready() && !worker.fenced() && !restored && worker.base_index() == 0 && worker.committed() == 0 && worker.storage_frontier().sequence == 1 && !worker.storage_frontier().checkpoint, "reopen preserves the old durable frontier without activating an abandoned candidate");
+			check(worker.accounting()->used == baseline && !worker.validation_chunk() && !worker.take_snapshot_result(), "restart inventory and bounded reclamation remove abandoned receive artifacts with exact accounting");
+		}
+	}
+}
+
+void snapshot_protocol_progress() {
+	SnapshotFixture fixture("protocol-progress"); auto& worker = fixture.worker; fixture.io.artifact_read_chunk = 1024;
+	std::map<NodeId, Receive> responses; unsigned sends = 0;
+	auto drain = [&] {
+		for (const auto& action : worker.take_actions()) {
+			if (auto range = std::get_if<Committed>(&action)) { worker.applied({range->entries.back().index}); }
+			if (auto send = std::get_if<Send>(&action)) {
+				if (auto vote = std::get_if<VoteRequest>(&send->message)) { responses.insert_or_assign(send->peer, Receive{send->peer, VoteResponse{vote->term, true}}); }
+				if (auto append = std::get_if<AppendRequest>(&send->message)) {
+					++sends; auto matched = append->previous + append->entries.size();
+					responses.insert_or_assign(send->peer, Receive{send->peer, AppendResponse{append->term, append->rpc, true, matched, matched + 1, append->read_probe}});
+				}
+			}
+		}
+	};
+	auto respond = [&] { if (!responses.empty()) { auto next = responses.begin(); if (worker.try_submit(next->second) == SubmitResult::Accepted) { responses.erase(next); } } };
+	for (unsigned turn = 0; turn < 200 && worker.applied_index() < 1; ++turn) { respond(); worker.run_one({100, 100}); drain(); }
+	check(worker.role() == Role::Leader && worker.applied_index() == 1, "incoming progress fixture elects a durable three-voter leader");
+	std::string payload(90000, 'p'); auto context = fixture.context(payload); context.leader_term = worker.term();
+	auto id = worker.reserve_snapshot(context); if (!id) { check(false, "protocol progress reserves incoming image"); return; }
+	auto scan = fixture.io.scans; sends = 0; std::uint64_t offset = 0; Token eof = 0;
+	for (unsigned turn = 0; turn < 2000 && !eof; ++turn) {
+		if (offset < payload.size()) {
+			auto count = std::min<std::size_t>(1024, payload.size() - offset);
+			auto result = worker.offer_snapshot_chunk(*id, offset, std::string_view(payload).substr(offset, count), offset + count == payload.size());
+			if (result.result == SubmitResult::Accepted) { offset = result.next_offset; }
+		}
+		respond(); worker.run_one({200 + 20 * turn, 100}); drain();
+		if (auto view = worker.validation_chunk(); view && turn % 2 == 0) {
+			if (view->verified_eof) { eof = view->chunk; }
+			worker.consume_validation(*id, view->chunk);
+		}
+	}
+	check(offset == payload.size() && eof && sends >= 4 && fixture.io.scans >= scan + 4 && !worker.fenced(), "continuous receive and incremental validation preserve protocol timers and reclamation progress");
+	check(eof && worker.validation_succeeded(*id, eof) == ValidationAck::Accepted && worker.role() == Role::Leader && worker.base_index() == 0, "semantic validation neither changes leader role nor installs the boundary");
+	worker.cancel_snapshot(*id); worker.take_snapshot_result();
+}
+
 int main() {
-	try { maintenance_preserves_protocol_timers(); real_worker(); partial_control_pack(); failures_and_multi_action_output(); interrupted_initialization(); checkpoint_crash_and_progress(); preparation_preserves_protocol_timers(); checkpoint_cancellation_and_completion(); checkpoint_faults(); } catch (const std::exception& error) { check(false, error.what()); }
+	try { snapshot_reception_and_validation(); snapshot_policy_and_rejection(); snapshot_cancellation_phases(); snapshot_read_faults(); snapshot_restart_cleanup(); snapshot_protocol_progress(); maintenance_preserves_protocol_timers(); real_worker(); partial_control_pack(); failures_and_multi_action_output(); interrupted_initialization(); checkpoint_crash_and_progress(); preparation_preserves_protocol_timers(); checkpoint_cancellation_and_completion(); checkpoint_faults(); } catch (const std::exception& error) { check(false, error.what()); }
 	std::cout << checks << " worker checks, " << failures << " failures\n"; return failures ? 1 : 0;
 }
