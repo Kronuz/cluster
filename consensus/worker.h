@@ -15,7 +15,7 @@ struct CaptureMetadata { RequestId request; Index through; Term term; };
 struct SnapshotLimits { std::uint32_t application_format; std::uint64_t application_bytes; };
 struct SnapshotContext { NodeId authenticated_peer; Term leader_term; RequestId request; Token transfer; SnapshotDescriptor descriptor; };
 enum class ValidationAck { Accepted, Stale, NotReady, Fenced };
-enum class SnapshotReason { Canceled, InvalidImage, InvalidApplication };
+enum class SnapshotReason { Canceled, InvalidImage, InvalidApplication, Rejected, Installed };
 enum class CancelResult { Canceled, TooLate, Stale };
 class Worker;
 class CheckpointId {
@@ -40,7 +40,8 @@ private:
 };
 struct SnapshotOffer { SubmitResult result; std::uint64_t next_offset; };
 struct ValidationView { SnapshotId snapshot; Token chunk; std::uint64_t offset; std::span<const char> bytes; bool verified_eof; };
-struct SnapshotResult { SnapshotId snapshot; SnapshotContext context; SnapshotReason reason; };
+struct SnapshotResult { SnapshotId snapshot; SnapshotContext context; SnapshotReason reason; std::optional<InstallRejectReason> rejection{}; std::optional<Term> receiver_term{}; };
+struct SnapshotActivation { SnapshotId snapshot; Token token; SnapshotDescriptor descriptor; };
 
 // One owning executor. IO is exclusive to this worker and outlives it.
 // There is no input queue; retryable work remains with the caller.
@@ -228,6 +229,43 @@ public:
 	CancelResult reject_snapshot_validation(const SnapshotId& id) { return cancel_snapshot(id, SnapshotReason::InvalidApplication); }
 	CancelResult cancel_snapshot(const SnapshotId& id) { return cancel_snapshot(id, SnapshotReason::Canceled); }
 	std::optional<SnapshotResult> take_snapshot_result() { auto result = std::move(snapshot_result_); snapshot_result_.reset(); return result; }
+	SubmitResult request_install(const SnapshotId& id) {
+		if (fenced()) { return SubmitResult::Fenced; }
+		auto& operation = snapshot(id); auto& incoming = std::get<Incoming>(operation.mode);
+		if (incoming.requested) { return SubmitResult::Accepted; }
+		if (operation.phase != Phase::Validated) { return SubmitResult::Busy; }
+		try {
+			auto permit = store_.reserve_append(kronuz::journal::AdmissionClass::Control, storage_batch_size(true, false));
+			if (!permit) { return SubmitResult::Pressure; }
+			incoming.cutover_permit = std::move(permit); incoming.requested = true; operation.phase = Phase::Cutover; cutover_debt_ = true;
+			return SubmitResult::Accepted;
+		} catch (const std::exception& error) { fail(error.what()); return SubmitResult::Fenced; }
+	}
+	std::optional<SnapshotActivation> snapshot_activation() const {
+		if (fenced() || !checkpoint_ || delivered_ || application_ || activation_completion_) { return std::nullopt; }
+		auto incoming = std::get_if<Incoming>(&checkpoint_->mode);
+		if (!incoming || !incoming->activation) { return std::nullopt; }
+		return SnapshotActivation{SnapshotId(checkpoint_owner_, checkpoint_->token), incoming->activation->token, incoming->context.descriptor};
+	}
+	ValidationAck snapshot_activated(const SnapshotId& id, Token token) {
+		if (fenced()) { return ValidationAck::Fenced; }
+		auto operation = find_snapshot(id); if (!operation) { return ValidationAck::Stale; }
+		auto& incoming = std::get<Incoming>(operation->mode);
+		if (!incoming.activation) { return ValidationAck::NotReady; }
+		if (incoming.activation->token != token) { return ValidationAck::Stale; }
+		if (activation_completion_) { return ValidationAck::Stale; }
+		if (!snapshot_activation()) { return ValidationAck::NotReady; }
+		activation_completion_ = InstallActivated{token}; return ValidationAck::Accepted;
+	}
+	ValidationAck snapshot_activation_failed(const SnapshotId& id, Token token) {
+		if (fenced()) { return ValidationAck::Fenced; }
+		auto operation = find_snapshot(id); if (!operation) { return ValidationAck::Stale; }
+		auto& incoming = std::get<Incoming>(operation->mode);
+		if (!incoming.activation) { return ValidationAck::NotReady; }
+		if (incoming.activation->token != token) { return ValidationAck::Stale; }
+		fail("snapshot application activation failed"); return ValidationAck::Accepted;
+	}
+
 	TurnResult run_one(Tick current_time) {
 		if (store_.fenced() && !failed_) { fail("storage fenced outside worker"); }
 		if (fenced()) { return TurnResult::Fenced; }
@@ -253,7 +291,7 @@ public:
 				completion_ = Persisted{persist_->token}; persist_.reset(); ++foreground_; return TurnResult::Stored;
 			}
 			if (!output_.empty()) {
-				if (preparation_runnable()) { maintenance(); return fenced() ? TurnResult::Fenced : TurnResult::Maintenance; }
+				if (preparation_runnable() || installation_waiting()) { maintenance(); return fenced() ? TurnResult::Fenced : TurnResult::Maintenance; }
 				return TurnResult::Blocked;
 			}
 			if (application_) {
@@ -264,11 +302,16 @@ public:
 				// cannot campaign and consumes no additional reservation.
 				ingest(core_->step(current_time));
 				auto value = *completion_; completion_.reset();
-				if (checkpoint_ && checkpoint_->phase == Phase::Completion && checkpoint_->persistence_token == value.token) {
+				if (checkpoint_ && checkpoint_->phase == Phase::Completion && checkpoint_->persistence_token == value.token && std::holds_alternative<Local>(checkpoint_->mode)) {
 					checkpoint_.reset(); cutover_debt_ = false;
 				}
 				ingest(core_->step(value)); ++foreground_; return TurnResult::Completed;
 			}
+			if (activation_completion_) {
+				ingest(core_->step(current_time)); auto value = *activation_completion_; activation_completion_.reset();
+				ingest(core_->step(value)); ++foreground_; return TurnResult::Completed;
+			}
+			if (installation_waiting()) { maintenance(); return fenced() ? TurnResult::Fenced : TurnResult::Maintenance; }
 			if (timer_blocked_ && !cutover_debt_) {
 				auto result = submit(current_time, true);
 				if (result == SubmitResult::Accepted) { timer_blocked_ = false; timer_due_ = true; return TurnResult::Idle; }
@@ -310,7 +353,7 @@ private:
 			return fenced() ? SubmitResult::Fenced : SubmitResult::Accepted;
 		} catch (const std::exception& error) { fail(error.what()); return SubmitResult::Fenced; }
 	}
-	enum class Phase { Reserved, BeginApplication, Application, SealApplication, OpenVerification, Readback, FinishVerification, AwaitVerifiedEOF, AwaitSemantic, Validated, Cutover, EncodeBundle, BeginBundle, Bundle, SealBundle, Publish, Completion };
+	enum class Phase { Reserved, BeginApplication, Application, SealApplication, OpenVerification, Readback, FinishVerification, AwaitVerifiedEOF, AwaitSemantic, Validated, AwaitRejection, Cutover, EncodeBundle, BeginBundle, Bundle, SealBundle, Publish, Completion };
 	struct Chunk { std::array<char, 65536> bytes{}; std::size_t length = 0; bool final = false; std::uint64_t offset = 0; Token token = 0; };
 	struct Local { std::optional<CaptureMetadata> capture; };
 	struct Incoming {
@@ -318,7 +361,9 @@ private:
 		SnapshotContext context;
 		std::optional<kronuz::journal::ArtifactVerifier> verifier;
 		std::optional<kronuz::journal::ArtifactReader> reader;
-		Token eof = 0; bool view = false;
+		Token eof = 0; bool view = false, requested = false, admitted = false;
+		std::optional<kronuz::journal::AppendReservation> cutover_permit;
+		std::optional<ActivateInstall> activation;
 	};
 	struct Checkpoint {
 		Checkpoint(kronuz::journal::ReplacementId id, Token identity, std::uint64_t cap)
@@ -330,7 +375,7 @@ private:
 		std::variant<Local, Incoming> mode;
 		std::optional<Chunk> chunk;
 		std::optional<kronuz::journal::ArtifactDescriptor> application;
-		std::optional<PersistCheckpoint> action;
+		std::optional<RecoveredState> captured;
 		std::string bundle;
 		std::size_t offset = 0;
 		bool final_offered = false;
@@ -352,11 +397,11 @@ private:
 	}
 	CancelResult cancel_snapshot(const SnapshotId& id, SnapshotReason reason) {
 		auto operation = find_snapshot(id); if (!operation) { return CancelResult::Stale; }
-		if (publication_started(operation->phase)) { return CancelResult::TooLate; }
+		if (publication_started(operation->phase) || std::get<Incoming>(operation->mode).admitted) { return CancelResult::TooLate; }
 		try {
 			auto context = std::get<Incoming>(operation->mode).context;
 			if (snapshot_result_) { throw std::logic_error("snapshot result slot occupied"); }
-			store_.cancel_replacement(operation->replacement); checkpoint_.reset();
+			store_.cancel_replacement(operation->replacement); checkpoint_.reset(); cutover_debt_ = false;
 			snapshot_result_.emplace(SnapshotResult{id, std::move(context), reason}); return CancelResult::Canceled;
 		} catch (const std::exception& error) { fail(error.what()); throw; }
 	}
@@ -364,13 +409,18 @@ private:
 		if (next_validation_ == std::numeric_limits<Token>::max()) { throw std::overflow_error("validation identity exhausted"); }
 		return ++next_validation_;
 	}
+	bool installation_waiting() const noexcept {
+		if (!checkpoint_ || checkpoint_->phase != Phase::Completion) { return false; }
+		auto incoming = std::get_if<Incoming>(&checkpoint_->mode); return incoming && incoming->activation.has_value();
+	}
+
 	bool preparation_runnable() const noexcept {
 		if (!checkpoint_) { return false; }
 		auto phase = checkpoint_->phase;
-		if (phase == Phase::Reserved || phase == Phase::Completion || phase == Phase::AwaitVerifiedEOF || phase == Phase::AwaitSemantic || phase == Phase::Validated) { return false; }
+		if (phase == Phase::Reserved || phase == Phase::Completion || phase == Phase::AwaitVerifiedEOF || phase == Phase::AwaitSemantic || phase == Phase::Validated || phase == Phase::AwaitRejection) { return false; }
 		if (phase == Phase::Application) { return checkpoint_->chunk.has_value(); }
 		if (phase == Phase::Readback) { return !std::get<Incoming>(checkpoint_->mode).view; }
-		if (phase == Phase::Cutover) { return !core_->busy() && output_.empty() && !application_ && !completion_; }
+		if (phase == Phase::Cutover) { return !core_->busy() && output_.empty() && !application_ && !completion_ && !persist_ && pack_count_ == 0; }
 		return true;
 	}
 	void maintenance() {
@@ -419,6 +469,14 @@ private:
 			incoming.view = true; operation.phase = Phase::AwaitVerifiedEOF; break;
 		}
 		case Phase::Cutover: {
+			if (auto incoming = std::get_if<Incoming>(&operation.mode)) {
+				if (!incoming->cutover_permit || pack_count_) { throw std::logic_error("installation cutover lacks dedicated control permit"); }
+				pack_[0] = std::move(incoming->cutover_permit); incoming->cutover_permit.reset(); pack_count_ = 1; pack_next_ = 0;
+				auto context = incoming->context;
+				ingest(core_->step(InstallPrepared{context.request, operation.token, context.authenticated_peer, context.leader_term,
+					configuration_.cluster, configuration_.configuration, {context.descriptor.through, context.descriptor.term}}));
+				break;
+			}
 			auto capture = *std::get<Local>(operation.mode).capture;
 			ingest(core_->step(LocalCheckpoint{capture.request, operation.token, capture.through, capture.term, configuration_.cluster, configuration_.configuration}));
 			if (fenced()) { break; }
@@ -426,8 +484,8 @@ private:
 			break;
 		}
 		case Phase::EncodeBundle:
-			operation.bundle = encode_checkpoint(operation.action->state, operation.sequence, *operation.application, limits_);
-			operation.action.reset(); operation.phase = Phase::BeginBundle; break;
+			operation.bundle = encode_checkpoint(*operation.captured, operation.sequence, *operation.application, limits_);
+			operation.captured.reset(); operation.phase = Phase::BeginBundle; break;
 		case Phase::BeginBundle:
 			store_.begin_artifact(operation.replacement, ArtifactPart::Bundle); operation.phase = Phase::Bundle; break;
 		case Phase::Bundle: {
@@ -473,20 +531,38 @@ private:
 			else if (auto value = std::get_if<Committed>(&action)) { count_entries(value->entries); }
 			else if (auto value = std::get_if<Send>(&action)) { if (auto append = std::get_if<AppendRequest>(&value->message)) { count_entries(append->entries); } }
 			else if (auto value = std::get_if<PersistCheckpoint>(&action)) { count_entries(value->state.entries); }
+			else if (auto value = std::get_if<PersistInstall>(&action)) { count_entries(value->state.entries); }
 		}
 		if (payload > output_payload_ || entries > output_entries_) { throw std::length_error("worker action payload bound"); }
 		for (auto& action : actions) {
 			if (auto value = std::get_if<Persist>(&action)) {
 				if (persist_ || completion_ || pack_next_ >= pack_count_ || !pack_[pack_next_]) { throw std::logic_error("persistence lacks preowned reservation"); }
 				persist_ = std::move(*value);
+				if (checkpoint_ && checkpoint_->phase == Phase::Cutover) {
+					if (auto incoming = std::get_if<Incoming>(&checkpoint_->mode); incoming && !incoming->cutover_permit) { incoming->admitted = true; checkpoint_->phase = Phase::AwaitRejection; }
+				}
 			} else if (auto value = std::get_if<Fenced>(&action)) { fail(value->reason); }
-			else if (std::holds_alternative<PersistInstall>(action) || std::holds_alternative<ActivateInstall>(action)) {
-				throw std::logic_error("snapshot installation requires worker transfer API");
+			else if (auto value = std::get_if<PersistInstall>(&action)) {
+				if (!checkpoint_ || !std::holds_alternative<Incoming>(checkpoint_->mode) || checkpoint_->phase != Phase::Cutover || value->prepared != checkpoint_->token) { throw std::logic_error("installation lacks owned replacement"); }
+				std::get<Incoming>(checkpoint_->mode).admitted = true;
+				checkpoint_->sequence = store_.frontier().sequence; checkpoint_->persistence_token = value->token;
+				checkpoint_->captured = std::move(value->state); checkpoint_->phase = Phase::EncodeBundle; release_pack();
+			}
+			else if (auto value = std::get_if<ActivateInstall>(&action)) {
+				if (!checkpoint_ || !std::holds_alternative<Incoming>(checkpoint_->mode) || checkpoint_->phase != Phase::Completion || value->prepared != checkpoint_->token || value->token != checkpoint_->persistence_token || value->boundary.index != std::get<Incoming>(checkpoint_->mode).context.descriptor.through || value->boundary.term != std::get<Incoming>(checkpoint_->mode).context.descriptor.term) { throw std::logic_error("activation lacks published image"); }
+				auto& incoming = std::get<Incoming>(checkpoint_->mode); if (incoming.activation) { throw std::logic_error("activation slot occupied"); } incoming.activation = *value;
+			}
+			else if (auto value = std::get_if<InstallRejected>(&action)) {
+				finish_snapshot(value->request, value->prepared, SnapshotReason::Rejected, value->reason);
+			}
+			else if (auto value = std::get_if<InstallCompleted>(&action)) {
+				if (!checkpoint_ || !std::holds_alternative<Incoming>(checkpoint_->mode) || checkpoint_->phase != Phase::Completion || !std::get<Incoming>(checkpoint_->mode).activation || value->boundary.index != std::get<Incoming>(checkpoint_->mode).context.descriptor.through || value->boundary.term != std::get<Incoming>(checkpoint_->mode).context.descriptor.term) { throw std::logic_error("installation completion boundary mismatch"); }
+				finish_snapshot(value->request, value->prepared, SnapshotReason::Installed);
 			}
 			else if (auto value = std::get_if<PersistCheckpoint>(&action)) {
 				if (!checkpoint_ || !std::holds_alternative<Local>(checkpoint_->mode) || checkpoint_->phase != Phase::Cutover || value->capture != checkpoint_->token) { throw std::logic_error("checkpoint lacks owned replacement"); }
 				checkpoint_->sequence = store_.frontier().sequence; checkpoint_->persistence_token = value->token;
-				checkpoint_->action = std::move(*value); checkpoint_->phase = Phase::EncodeBundle;
+				checkpoint_->captured = std::move(value->state); checkpoint_->phase = Phase::EncodeBundle;
 			}
 			else {
 				if (!output_.empty()) { throw std::logic_error("worker output batch occupied"); }
@@ -495,15 +571,25 @@ private:
 		}
 		Actions external;
 		for (auto& action : actions) {
-			if (!std::holds_alternative<Persist>(action) && !std::holds_alternative<PersistCheckpoint>(action) && !std::holds_alternative<Fenced>(action)) { external.push_back(std::move(action)); }
+			if (!std::holds_alternative<Persist>(action) && !std::holds_alternative<PersistCheckpoint>(action) && !std::holds_alternative<Fenced>(action) && !std::holds_alternative<PersistInstall>(action) && !std::holds_alternative<ActivateInstall>(action) && !std::holds_alternative<InstallRejected>(action) && !std::holds_alternative<InstallCompleted>(action)) { external.push_back(std::move(action)); }
 		}
 		if (!external.empty()) { output_ = std::move(external); }
 		if (!core_->busy()) { release_pack(); }
 	}
+	void finish_snapshot(RequestId request, Token prepared, SnapshotReason reason, std::optional<InstallRejectReason> rejection = {}) {
+		if (!checkpoint_ || !std::holds_alternative<Incoming>(checkpoint_->mode) || checkpoint_->token != prepared || snapshot_result_) { throw std::logic_error("snapshot terminal correlation mismatch"); }
+		auto context = std::get<Incoming>(checkpoint_->mode).context;
+		if (context.request != request) { throw std::logic_error("snapshot request correlation mismatch"); }
+		SnapshotId id(checkpoint_owner_, prepared);
+		if (reason != SnapshotReason::Installed) { store_.cancel_replacement(checkpoint_->replacement); }
+		checkpoint_.reset(); cutover_debt_ = false; release_pack();
+		snapshot_result_.emplace(SnapshotResult{id, std::move(context), reason, rejection, core_->durable_hard_state().term});
+	}
+
 	void fail(std::string reason) {
 		if (failed_) { return; } failed_ = true;
 		store_.fence_storage(); if (core_) { core_->step(StorageFault{reason}); }
-		persist_.reset(); completion_.reset(); application_.reset(); checkpoint_.reset(); release_pack(); terminal_ = Fenced{std::move(reason)};
+		persist_.reset(); completion_.reset(); application_.reset(); activation_completion_.reset(); checkpoint_.reset(); release_pack(); terminal_ = Fenced{std::move(reason)};
 	}
 	FixedConfiguration configuration_;
 	Limits limits_;
@@ -518,6 +604,7 @@ private:
 	std::optional<Persist> persist_;
 	std::optional<Persisted> completion_;
 	std::optional<Applied> application_;
+	std::optional<InstallActivated> activation_completion_;
 	std::optional<Fenced> terminal_;
 	std::shared_ptr<char> checkpoint_owner_ = std::make_shared<char>();
 	std::unique_ptr<Checkpoint> checkpoint_;

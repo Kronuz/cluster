@@ -14,7 +14,7 @@ kronuz::journal::AdmissionLimits admission() { return {{4000, 100}, {2000, 3}, {
 class FaultIO final : public kronuz::journal::IO {
 public:
 	explicit FaultIO(const std::filesystem::path& directory) : backend(directory) {}
-	bool fail_sync = false;
+	bool fail_sync = false; unsigned syncs_until_failure = 0;
 	bool fail_read = false, read_failure_after = false, corrupt_payload_read = false;
 	std::size_t artifact_read_chunk = 65536;
 	unsigned payload_reads = 0, artifact_opens = 0;
@@ -31,7 +31,7 @@ public:
 	auto scan_directory() -> std::unique_ptr<kronuz::journal::DirectoryCursor> override { ++scans; return backend.scan_directory(); }
 	auto entry_footprint(std::string_view name) -> std::optional<kronuz::journal::EntryFootprint> override { return backend.entry_footprint(name); }
 	auto open_reclaim_candidate(std::string_view name) -> std::unique_ptr<kronuz::journal::File> override { return backend.open_reclaim_candidate(name); }
-	void sync_directory() override { if (fail_sync) { fail_sync = false; throw std::runtime_error("injected worker directory barrier failure"); } backend.sync_directory(); ++directory_syncs; }
+	void sync_directory() override { if (fail_sync || (syncs_until_failure && --syncs_until_failure == 0)) { fail_sync = false; throw std::runtime_error("injected worker directory barrier failure"); } backend.sync_directory(); ++directory_syncs; }
 private:
 	class ReadFile final : public kronuz::journal::File {
 	public:
@@ -436,7 +436,7 @@ struct SnapshotFixture {
 	};
 	static FixedConfiguration fixed() { auto result = configuration(); result.voters = {1, 2, 3}; return result; }
 	static kronuz::journal::AdmissionLimits quota() { return {{512 * 1024, 4096}, {16 * 1024, 3}, {128 * 1024, 4}, 8, 3}; }
-	Directory directory; FaultIO io; Worker worker; bool unexpected_install = false;
+	Directory directory; FaultIO io; Worker worker; bool unexpected_install = false; std::string application_state;
 	explicit SnapshotFixture(std::string name, std::optional<SnapshotLimits> snapshots = SnapshotLimits{7, 100000}, kronuz::journal::AdmissionLimits capacity = quota())
 		: directory(std::move(name)), io(directory.path), worker(io, fixed(), capacity, limits(), {}, {4, 1}, snapshots) {
 		kronuz::journal::Identity identity{}; identity[0] = 'S'; worker.create(identity);
@@ -446,7 +446,10 @@ struct SnapshotFixture {
 	void drain() {
 		for (const auto& action : worker.take_actions()) {
 			unexpected_install |= std::holds_alternative<PersistInstall>(action) || std::holds_alternative<ActivateInstall>(action) || std::holds_alternative<InstallCompleted>(action) || std::holds_alternative<CheckpointPublished>(action);
-			if (auto range = std::get_if<Committed>(&action)) { worker.applied({range->entries.back().index}); }
+			if (auto range = std::get_if<Committed>(&action)) {
+				for (const auto& entry : range->entries) { if (entry.kind == EntryKind::Command) { application_state += "/" + entry.payload; } }
+				worker.applied({range->entries.back().index});
+			}
 		}
 	}
 	std::uint64_t staged_bytes() const {
@@ -670,7 +673,218 @@ void snapshot_protocol_progress() {
 	worker.cancel_snapshot(*id); worker.take_snapshot_result();
 }
 
+Token validate_incoming(SnapshotFixture& fixture, const SnapshotId& id, std::string_view payload) {
+	fixture.send(id, payload); Token eof = 0;
+	for (unsigned turn = 0; turn < 200 && !eof; ++turn) {
+		fixture.pump(); if (auto view = fixture.worker.validation_chunk()) {
+			if (view->verified_eof) { eof = view->chunk; }
+			fixture.worker.consume_validation(id, view->chunk);
+		}
+	}
+	check(eof && fixture.worker.validation_succeeded(id, eof) == ValidationAck::Accepted, "installation fixture reaches consumed integrity EOF and semantic validation"); return eof;
+}
+void snapshot_installation() {
+	for (unsigned callback_case = 0; callback_case < 3; ++callback_case) {
+		bool failure = callback_case != 0;
+		SnapshotFixture fixture("install-" + std::to_string(callback_case)); auto& worker = fixture.worker;
+		auto id = worker.reserve_snapshot(fixture.context("image")); if (!id) { check(false, "installation reserves incoming image"); continue; }
+		validate_incoming(fixture, *id, "image"); auto before = worker.storage_frontier();
+		check(worker.snapshot_activated(*id, 1) == ValidationAck::NotReady && worker.request_install(*id) == SubmitResult::Accepted && worker.request_install(*id) == SubmitResult::Accepted, "installation admission is explicit and matching retries own no extra permit");
+		std::optional<SnapshotActivation> activation;
+		for (unsigned turn = 0; turn < 200 && !activation && !worker.fenced(); ++turn) { worker.run_one({0, 100}); activation = worker.snapshot_activation(); }
+		check(activation && worker.busy() && worker.base_index() == 1 && worker.committed() == 1 && worker.applied_index() == 0 && worker.storage_frontier().generation > before.generation && worker.storage_frontier().sequence == before.sequence && !worker.take_snapshot_result(), "publication retains busy state and exact receiver sequence until application activation");
+		if (!activation) { continue; }
+		check(worker.cancel_snapshot(*id) == CancelResult::TooLate && worker.snapshot_activated(*id, activation->token + 1) == ValidationAck::Stale, "published installation rejects cancellation and wrong activation tokens");
+		if (!failure) {
+			SnapshotFixture foreign("install-foreign"); auto foreign_id = foreign.worker.reserve_snapshot(foreign.context("image"));
+			check(foreign_id && worker.snapshot_activated(*foreign_id, activation->token) == ValidationAck::Stale && worker.snapshot_activation_failed(*foreign_id, activation->token) == ValidationAck::Stale && worker.snapshot_activation() && !worker.fenced(), "foreign-session activation callbacks cannot consume or fence the current request");
+		}
+		if (failure) {
+			if (callback_case == 2) { fixture.application_state = "image"; check(worker.snapshot_activated(*id, activation->token) == ValidationAck::Accepted, "failure fixture holds a queued activation success under output pressure"); }
+			check(worker.snapshot_activation_failed(*id, activation->token) == ValidationAck::Accepted && worker.fenced() && !worker.take_snapshot_result(), "matching activation failure fences immediately under held ordinary output"); continue;
+		}
+		fixture.application_state = "image"; // Atomic application switch precedes its reliable acknowledgment.
+		check(worker.snapshot_activated(*id, activation->token) == ValidationAck::Accepted && worker.snapshot_activated(*id, activation->token) == ValidationAck::Stale && !worker.snapshot_activation(), "activation completion has a reliable independent slot and rejects duplicates");
+		auto scans = fixture.io.scans;
+		for (unsigned turn = 0; turn < 10; ++turn) { worker.run_one({10000, 100}); }
+		check(worker.busy() && !worker.take_snapshot_result() && fixture.io.scans > scans, "held ordinary output retains activation completion while reclamation continues");
+		fixture.drain(); worker.run_one({10000, 100}); fixture.drain(); auto result = worker.take_snapshot_result();
+		check(result && result->reason == SnapshotReason::Installed && result->receiver_term == 1 && !result->rejection && !worker.busy() && worker.applied_index() == 1 && !worker.fenced() && worker.role() == Role::Follower, "matching activation alone releases cutover and reports durable correlated success with a fresh election deadline");
+		unsigned ticks = 0; for (unsigned turn = 0; turn < 20; ++turn) { ticks += worker.try_submit(Tick{10000, 100}) == SubmitResult::Accepted; worker.run_one({10000, 100}); fixture.drain(); }
+		check(ticks && worker.term() == 1 && worker.role() == Role::Follower, "delayed activation refreshes the deadline before a same-time admitted Tick");
+		Receive append{2, AppendRequest{1, 19, 1, 1, 2, 0, {{2, 1, EntryKind::Command, "next"}}}};
+		for (unsigned turn = 0; turn < 100 && worker.try_submit(append) != SubmitResult::Accepted; ++turn) { worker.run_one({10000, 100}); fixture.drain(); }
+		for (unsigned turn = 0; turn < 100 && worker.applied_index() < 2; ++turn) { worker.run_one({10000, 100}); fixture.drain(); }
+		check(worker.applied_index() == 2 && worker.committed() == 2 && fixture.application_state == "image/next" && !worker.fenced(), "live installation resumes durable replication and application delivery");
+		auto local = worker.reserve_checkpoint(8); check(bool(local), "drained installation result permits another local checkpoint"); if (local) { worker.cancel_checkpoint(*local); }
+	}
+	SnapshotFixture fixture("install-cancel"); auto& worker = fixture.worker;
+	auto id = worker.reserve_snapshot(fixture.context("image")); if (!id) { return; } validate_incoming(fixture, *id, "image");
+	auto outstanding = worker.accounting()->outstanding;
+	check(worker.request_install(*id) == SubmitResult::Accepted && worker.accounting()->outstanding.logical_bytes > outstanding.logical_bytes && worker.cancel_snapshot(*id) == CancelResult::Canceled && !worker.busy(), "pre-Core cancellation refunds the dedicated control permit without mutating consensus");
+	worker.take_snapshot_result(); unsigned accepted = 0; for (unsigned turn = 0; turn < 10; ++turn) { accepted += worker.try_submit(Read{300 + turn}) == SubmitResult::Accepted; fixture.pump(); }
+	check(accepted >= 3 && worker.accounting()->outstanding.logical_bytes == 0, "canceling accepted install clears debt and all reservation ownership");
+}
+
+void snapshot_rejection_branches() {
+	for (unsigned branch = 0; branch < 3; ++branch) {
+		SnapshotFixture fixture("install-reject-" + std::to_string(branch)); auto& worker = fixture.worker;
+		if (branch) {
+			Receive prefix{2, AppendRequest{1, 30, 0, 0, 1, 0, {{1, 1, EntryKind::NoOp, ""}}}};
+			for (unsigned turn = 0; turn < 100 && worker.try_submit(prefix) != SubmitResult::Accepted; ++turn) { fixture.pump(); }
+			for (unsigned turn = 0; turn < 100 && worker.applied_index() != 1; ++turn) { fixture.pump(); }
+		}
+		auto context = fixture.context("image"); if (branch == 2) { context.leader_term = 2; }
+		auto id = worker.reserve_snapshot(context); if (!id) { check(false, "rejection fixture reserves candidate"); continue; } validate_incoming(fixture, *id, "image");
+		if (!branch) {
+			Receive newer{2, AppendRequest{2, 31, 0, 0, 0, 0, {}}};
+			for (unsigned turn = 0; turn < 100 && worker.try_submit(newer) != SubmitResult::Accepted; ++turn) { fixture.pump(); }
+			for (unsigned turn = 0; turn < 100 && (worker.busy() || worker.term() != 2); ++turn) { fixture.pump(); } fixture.drain();
+		}
+		auto before = worker.storage_frontier(); check(worker.request_install(*id) == SubmitResult::Accepted, "validated candidate admits each Core rejection branch");
+		bool saw_pending = false; std::optional<SnapshotResult> result;
+		for (unsigned turn = 0; turn < 100 && !result; ++turn) {
+			worker.run_one({0, 100});
+			if (branch == 2 && worker.busy() && worker.term() == 2 && worker.storage_frontier().sequence == before.sequence) {
+				saw_pending = true; check(worker.cancel_snapshot(*id) == CancelResult::TooLate && !worker.take_snapshot_result(), "higher-term caught-up rejection waits for owned ordinary persistence");
+			}
+			fixture.drain(); result = worker.take_snapshot_result();
+		}
+		check(result && result->reason == SnapshotReason::Rejected && result->rejection == (branch ? InstallRejectReason::CaughtUp : InstallRejectReason::StaleTerm) && result->receiver_term == (branch == 1 ? 1 : 2) && !worker.busy() && !worker.fenced() && !worker.snapshot_activation(), "Core rejection is correlated only after durable receiver state and never activates the image");
+		check(worker.storage_frontier().generation == before.generation && !worker.storage_frontier().checkpoint && (branch != 2 || (saw_pending && worker.storage_frontier().sequence == before.sequence + 1)), "rejection publishes no replacement and higher-term caught-up persists one local hard-state batch");
+	}
+}
+
+void snapshot_old_application() {
+	for (unsigned completion = 0; completion < 3; ++completion) {
+		SnapshotFixture fixture("install-old-application-" + std::to_string(completion)); auto& worker = fixture.worker;
+		Receive prefix{2, AppendRequest{1, 33, 0, 0, 1, 0, {{1, 1, EntryKind::Command, "old"}, {2, 1, EntryKind::Command, "captured"}}}};
+		for (unsigned turn = 0; turn < 100 && worker.try_submit(prefix) != SubmitResult::Accepted; ++turn) { fixture.pump(); }
+		Index old = 0;
+		for (unsigned turn = 0; turn < 100 && !old; ++turn) {
+			worker.run_one({0, 100}); for (const auto& action : worker.take_actions()) { if (auto range = std::get_if<Committed>(&action)) { old = range->entries.back().index; } }
+		}
+		check(old == 1 && worker.applied_index() == 0, "installation holds a real previously delivered application range");
+		auto context = fixture.context("image"); context.descriptor.through = 2; auto id = worker.reserve_snapshot(context); if (!id) { continue; }
+		validate_incoming(fixture, *id, "image"); check(worker.request_install(*id) == SubmitResult::Accepted, "installation accepts while old application work remains delivered");
+		bool applied_while_persisting = false;
+		for (unsigned turn = 0; turn < 200 && !worker.storage_frontier().checkpoint; ++turn) {
+			fixture.pump(); if (completion == 0 && !applied_while_persisting && worker.busy() && !worker.storage_frontier().checkpoint) { worker.applied({old}); applied_while_persisting = true; }
+		}
+		check(completion != 0 || applied_while_persisting, "pre-publication application completion occurs while installation owns Core persistence");
+		for (unsigned turn = 0; turn < 10; ++turn) { fixture.pump(); }
+		if (completion) { check(worker.busy() && !worker.snapshot_activation() && !worker.take_snapshot_result(), "published incoming boundary cannot activate before old application work drains"); }
+		if (completion == 2) { worker.application_failed(old, "old application failed"); check(worker.fenced(), "old application failure fences after incoming publication"); continue; }
+		if (completion == 1) { worker.applied({old}); }
+		auto activation = worker.snapshot_activation(); check(bool(activation), "old application completion releases the dedicated activation request");
+		if (activation) { fixture.application_state = "image"; worker.snapshot_activated(*id, activation->token); fixture.pump(); }
+		auto result = worker.take_snapshot_result(); check(result && result->reason == SnapshotReason::Installed && worker.applied_index() == 2 && fixture.application_state == "image" && !worker.fenced(), "application completion before or after publication installs the same immutable image");
+	}
+}
+
+void snapshot_install_reopening() {
+	for (bool matching : {false, true}) { for (unsigned close_phase = 0; close_phase < 3; ++close_phase) {
+		SnapshotFixture::Directory directory("install-reopen-" + std::to_string(matching) + "-" + std::to_string(close_phase));
+		std::uint64_t sequence = 0; std::string live_application = "old"; Term incoming_term = matching && close_phase == 0 ? 1 : 2;
+		{
+			FaultIO io(directory.path); Worker worker(io, SnapshotFixture::fixed(), SnapshotFixture::quota(), limits(), {}, {4, 1}, SnapshotLimits{7, 100000});
+			kronuz::journal::Identity identity{}; identity[0] = 'S'; worker.create(identity); while (!worker.ready()) { worker.run_one({0, 100}); }
+			auto drain = [&] { for (const auto& action : worker.take_actions()) { if (auto range = std::get_if<Committed>(&action)) { worker.applied({range->entries.back().index}); } } };
+			auto pump = [&] { worker.run_one({0, 100}); drain(); }; worker.try_submit(Start{}); drain();
+			Receive vote{2, VoteRequest{1, 0, 0}};
+			for (unsigned turn = 0; turn < 100 && worker.try_submit(vote) != SubmitResult::Accepted; ++turn) { pump(); }
+			for (unsigned turn = 0; turn < 100 && worker.busy(); ++turn) { pump(); }
+			Receive prefix{2, AppendRequest{1, 35, 0, 0, 1, 0, {{1, 1, EntryKind::NoOp, ""}, {2, 1, EntryKind::Command, "captured"}, {3, 1, EntryKind::Command, "retained"}}}};
+			for (unsigned turn = 0; turn < 100 && worker.try_submit(prefix) != SubmitResult::Accepted; ++turn) { pump(); }
+			for (unsigned turn = 0; turn < 100 && worker.applied_index() != 1; ++turn) { pump(); }
+			auto fixed = SnapshotFixture::fixed(); SnapshotContext context{2, incoming_term, 13, 17, {fixed.cluster, fixed.configuration, 7, 2, matching ? Term{1} : Term{2}, 5, kronuz::journal::crc32c("image")}};
+			auto id = worker.reserve_snapshot(context); if (!id) { check(false, "reopen fixture reserves incoming image"); continue; }
+			worker.offer_snapshot_chunk(*id, 0, "image", true); Token eof = 0; std::string candidate;
+			for (unsigned turn = 0; turn < 200 && !eof; ++turn) { pump(); if (auto view = worker.validation_chunk()) { if (view->verified_eof) { eof = view->chunk; } else { candidate.append(view->bytes.data(), view->bytes.size()); } worker.consume_validation(*id, view->chunk); } }
+			check(candidate == "image", "reopen fixture builds its unpublished application candidate from verified data");
+			worker.validation_succeeded(*id, eof); sequence = worker.storage_frontier().sequence; worker.request_install(*id);
+			for (unsigned turn = 0; turn < 200 && !worker.storage_frontier().checkpoint; ++turn) { pump(); }
+			check(worker.storage_frontier().checkpoint && worker.storage_frontier().sequence == sequence && worker.base_index() == 0 && !worker.fenced(), "reopen fixture reaches Store publication before Core durable completion");
+			if (close_phase) {
+				for (unsigned turn = 0; turn < 20 && !worker.snapshot_activation(); ++turn) { pump(); }
+				check(worker.snapshot_activation() && worker.base_index() == 2 && worker.applied_index() == 1 && !worker.take_snapshot_result(), "reopen fixture can close after Core publication and before application activation");
+				if (close_phase == 2) { live_application = candidate; }
+			}
+			// Normal close deliberately loses transient activation/correlation state.
+		}
+		{
+			FaultIO io(directory.path); kronuz::journal::Journal journal(io); bool decoded = false;
+			auto frontier = journal.recover([](auto, auto) {}, [&](const auto& selected, auto& reader, auto dependencies) {
+				std::string bytes(static_cast<std::size_t>(reader.descriptor().length), '\0'); reader.read_at(0, std::span<char>(bytes.data(), bytes.size()));
+				auto bundle = decode_checkpoint(bytes, SnapshotFixture::fixed(), selected.base_sequence, selected.dependencies.at(0), limits()); decoded = true;
+				check(dependencies.size() == 1 && bundle.storage_sequence == sequence && bundle.state.configuration == SnapshotFixture::fixed() && bundle.state.hard.term == incoming_term && bundle.state.hard.voted_for == (incoming_term == 1 ? std::optional<NodeId>{2} : std::nullopt), "persisted receiver bundle preserves fixed identity and same-term ballot or clears a higher-term ballot");
+				check(bundle.state.entries.size() == (matching ? 1 : 0) && (!matching || bundle.state.entries[0].payload == "retained"), "persisted receiver bundle retains only the correctly matching local suffix");
+			});
+			check(decoded && frontier.identity[0] == 'S' && frontier.sequence == sequence, "receiver storage identity and exact covered sequence survive publication");
+		}
+		{
+			FaultIO io(directory.path); Worker worker(io, SnapshotFixture::fixed(), SnapshotFixture::quota(), limits(), {}, {4, 1}, SnapshotLimits{7, 100000});
+			std::string application;
+			worker.recover([&](auto& reader) { application.resize(static_cast<std::size_t>(reader.descriptor().length)); reader.read_at(0, std::span<char>(application.data(), application.size())); });
+			while (!worker.ready()) { worker.run_one({0, 100}); }
+			check(application == "image" && live_application == (close_phase == 2 ? "image" : "old") && worker.term() == incoming_term && worker.base_index() == 2 && worker.committed() == 2 && worker.applied_index() == 2 && worker.storage_frontier().sequence == sequence && !worker.snapshot_activation() && !worker.take_snapshot_result(), "recovery selects the installed image and receiver-local boundary without transient transfer state");
+			auto drain = [&] { for (const auto& action : worker.take_actions()) { if (auto range = std::get_if<Committed>(&action)) { for (const auto& entry : range->entries) { if (entry.kind == EntryKind::Command) { application += "/" + entry.payload; } } worker.applied({range->entries.back().index}); } } };
+			auto pump = [&] { worker.run_one({0, 100}); drain(); }; worker.try_submit(Start{}); drain();
+			for (unsigned turn = 0; turn < 10; ++turn) { pump(); }
+			check(application == "image", "recovery does not replay the uncommitted retained suffix");
+			Receive next{2, matching ? AppendRequest{2, 36, 3, 1, 3, 0, {}} : AppendRequest{2, 36, 2, 2, 3, 0, {{3, 2, EntryKind::Command, "retained"}}}};
+			for (unsigned turn = 0; turn < 100 && worker.try_submit(next) != SubmitResult::Accepted; ++turn) { pump(); }
+			for (unsigned turn = 0; turn < 100 && worker.applied_index() != 3; ++turn) { pump(); }
+			check(application == "image/retained" && worker.applied_index() == 3 && worker.committed() == 3 && !worker.fenced(), "recovered matching/conflicting suffixes resume replication and reconstruct the same application contents");
+		}
+	} }
+}
+
+void snapshot_install_admission() {
+	for (bool all_control_slots : {false, true}) {
+		SnapshotFixture fixture("install-admission-" + std::to_string(all_control_slots)); auto& worker = fixture.worker;
+		auto context = fixture.context("image"); context.descriptor.through = 2;
+		auto id = worker.reserve_snapshot(context); if (!id) { continue; } validate_incoming(fixture, *id, "image");
+		Event event = all_control_slots ? Event{Tick{100, 100}} : Event{Receive{2, AppendRequest{1, 39, 0, 0, 1, 0, {{1, 1, EntryKind::NoOp, ""}}}}};
+		for (unsigned turn = 0; turn < 100 && worker.try_submit(event) != SubmitResult::Accepted; ++turn) { fixture.pump(); }
+		check(worker.busy(), "installation admission fixture holds a real ordinary persistence continuation");
+		auto reservations = worker.accounting()->outstanding; auto before = worker.storage_frontier(); auto result = worker.request_install(*id);
+		if (all_control_slots) {
+			check(result == SubmitResult::Pressure && worker.snapshot_validated(*id) && worker.accounting()->outstanding == reservations && worker.storage_frontier().sequence == before.sequence, "control pressure preserves ordinary pack, validated candidate and storage frontier");
+			for (unsigned turn = 0; turn < 100 && worker.busy(); ++turn) { worker.run_one({100, 100}); fixture.drain(); }
+			check(!worker.busy() && !worker.fenced() && worker.request_install(*id) == SubmitResult::Accepted && worker.cancel_snapshot(*id) == CancelResult::Canceled, "pressure creates no cutover debt and ordinary completion releases control capacity"); worker.take_snapshot_result();
+		} else {
+			check(result == SubmitResult::Accepted && worker.accounting()->outstanding.logical_bytes > reservations.logical_bytes, "incoming cutover permit coexists with an active ordinary pack");
+			for (unsigned turn = 0; turn < 200 && !worker.snapshot_activation(); ++turn) { fixture.pump(); }
+			auto activation = worker.snapshot_activation(); check(activation && worker.storage_frontier().sequence > before.sequence && !worker.fenced(), "ordinary pack finishes intact and incoming publication covers its later exact receiver sequence");
+			if (activation) { fixture.application_state = "image"; worker.snapshot_activated(*id, activation->token); fixture.pump(); }
+			check(worker.take_snapshot_result().has_value() && worker.applied_index() == 2, "admitted installation follows an existing ordinary persistence continuation");
+		}
+	}
+}
+void snapshot_publication_faults() {
+	for (unsigned fault = 0; fault < 3; ++fault) {
+		SnapshotFixture::Directory directory("install-publication-fault-" + std::to_string(fault));
+		{
+			FaultIO io(directory.path); Worker worker(io, SnapshotFixture::fixed(), SnapshotFixture::quota(), limits(), {}, {4, 1}, SnapshotLimits{7, 100000});
+			kronuz::journal::Identity identity{}; identity[0] = 'S'; worker.create(identity); while (!worker.ready()) { worker.run_one({0, 100}); } worker.try_submit(Start{}); worker.take_actions();
+			auto fixed = SnapshotFixture::fixed(); SnapshotContext context{2, 1, 13, 17, {fixed.cluster, fixed.configuration, 7, 1, 1, 5, kronuz::journal::crc32c("image")}};
+			auto id = worker.reserve_snapshot(context); if (!id) { continue; } worker.offer_snapshot_chunk(*id, 0, "image", true); Token eof = 0;
+			for (unsigned turn = 0; turn < 200 && !eof; ++turn) { worker.run_one({0, 100}); worker.take_actions(); if (auto view = worker.validation_chunk()) { if (view->verified_eof) { eof = view->chunk; } worker.consume_validation(*id, view->chunk); } }
+			worker.validation_succeeded(*id, eof); io.syncs_until_failure = fault + 1; worker.request_install(*id);
+			for (unsigned turn = 0; turn < 200 && !worker.fenced(); ++turn) { worker.run_one({0, 100}); worker.take_actions(); }
+			check(worker.fenced() && !worker.snapshot_activation() && !worker.take_snapshot_result() && worker.accounting()->tainted, "bundle sealing and both publication barriers fence without activation or success on uncertainty");
+		}
+		{
+			FaultIO io(directory.path); Worker worker(io, SnapshotFixture::fixed(), SnapshotFixture::quota(), limits()); std::string image;
+			worker.recover([&](auto& reader) { image.resize(static_cast<std::size_t>(reader.descriptor().length)); reader.read_at(0, std::span<char>(image.data(), image.size())); });
+			while (!worker.ready()) { worker.run_one({0, 100}); }
+			check(!worker.fenced() && (fault == 2 ? image == "image" && worker.base_index() == 1 && worker.committed() == 1 : image.empty() && worker.base_index() == 0 && worker.committed() == 0), "reopen selects the exact old or renamed new frontier after each publication failure boundary");
+		}
+	}
+}
+
 int main() {
-	try { snapshot_reception_and_validation(); snapshot_policy_and_rejection(); snapshot_cancellation_phases(); snapshot_read_faults(); snapshot_restart_cleanup(); snapshot_protocol_progress(); maintenance_preserves_protocol_timers(); real_worker(); partial_control_pack(); failures_and_multi_action_output(); interrupted_initialization(); checkpoint_crash_and_progress(); preparation_preserves_protocol_timers(); checkpoint_cancellation_and_completion(); checkpoint_faults(); } catch (const std::exception& error) { check(false, error.what()); }
+	try { snapshot_reception_and_validation(); snapshot_policy_and_rejection(); snapshot_cancellation_phases(); snapshot_read_faults(); snapshot_restart_cleanup(); snapshot_protocol_progress(); snapshot_installation(); snapshot_rejection_branches(); snapshot_old_application(); snapshot_install_reopening(); snapshot_install_admission(); snapshot_publication_faults(); maintenance_preserves_protocol_timers(); real_worker(); partial_control_pack(); failures_and_multi_action_output(); interrupted_initialization(); checkpoint_crash_and_progress(); preparation_preserves_protocol_timers(); checkpoint_cancellation_and_completion(); checkpoint_faults(); } catch (const std::exception& error) { check(false, error.what()); }
 	std::cout << checks << " worker checks, " << failures << " failures\n"; return failures ? 1 : 0;
 }
