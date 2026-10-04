@@ -26,7 +26,7 @@ public:
 		if (limits.command_bytes == 0 || limits.rpc_entries == 0 || limits.log_entries == 0 || limits.reads == 0 || limits.uncommitted_entries == 0 ||
 			limits.control_entries == 0 || limits.control_entries > limits.log_entries ||
 			limits.command_bytes > limits.rpc_bytes || limits.rpc_bytes > limits.log_bytes ||
-			timing.heartbeat == 0 || timing.rpc_timeout == 0 || timing.election_min <= timing.heartbeat ||
+			timing.heartbeat == 0 || timing.rpc_timeout == 0 || timing.snapshot_timeout == 0 || timing.election_min <= timing.heartbeat ||
 			timing.election_max < timing.election_min) { throw std::invalid_argument("invalid consensus limits or timing"); }
 		if (base_index_ >= maximum || ((base_index_ == 0) != (base_term_ == 0)) || base_term_ > hard_.term ||
 			entries_.size() >= maximum - base_index_ || recovered.applied_index != base_index_ || hard_.commit_index < base_index_) {
@@ -69,8 +69,10 @@ private:
 		Token token, prepared; RequestId request; LogBoundary boundary; HardState hard;
 		Actions deferred; bool retain_suffix, published = false;
 	};
-	struct Flight { Token rpc; Index previous, through; Token read_probe; std::uint64_t sent; };
-	struct Peer { Index next = 1, matched = 0; std::optional<Flight> flight; std::uint64_t retry_after = 0; bool snapshot_requested = false; };
+	struct Flight { Token rpc; Index previous, through; Token read_probe; std::uint64_t sent; bool keepalive = false; };
+	enum class SnapshotPhase { AwaitSource, Sending };
+	struct SnapshotFlight { SnapshotKey key; SnapshotPhase phase; std::uint64_t started; };
+	struct Peer { Index next = 1, matched = 0; std::optional<Flight> flight; std::uint64_t retry_after = 0; std::optional<SnapshotFlight> snapshot{}; std::optional<std::uint64_t> snapshot_retry_clock{}; };
 	struct PendingRead { RequestId request; Token probe; Term term; Index index; std::set<NodeId> acknowledgements; };
 	static constexpr auto maximum = std::numeric_limits<std::uint64_t>::max();
 	bool member(NodeId node) const { return std::find(configuration_.voters.begin(), configuration_.voters.end(), node) != configuration_.voters.end(); }
@@ -98,11 +100,13 @@ private:
 		return ++next_token_;
 	}
 	void fence(std::string reason, Actions& output) {
+		output.clear(); release_snapshots(SnapshotReleaseReason::Fenced, output);
 		role_ = Role::Fenced; pending_.reset(); install_.reset(); peers_.clear(); reads_.clear();
-		output.clear(); output.emplace_back(Fenced{std::move(reason)});
+		output.emplace_back(Fenced{std::move(reason)});
 	}
 	void follower(NodeId leader, Actions& deferred) {
 		if (role_ != Role::Follower || leader_ != leader) { deferred.emplace_back(RoleChanged{Role::Follower, hard_.term, leader}); }
+		release_snapshots(SnapshotReleaseReason::LeadershipLost, deferred);
 		role_ = Role::Follower; leader_ = leader; peers_.clear(); grants_.clear();
 		for (const auto& read : reads_) { deferred.emplace_back(Reject{read.request, RejectReason::NotLeader}); }
 		reads_.clear(); reset_election();
@@ -191,12 +195,38 @@ private:
 	void handle(InstallActivationFailed failure, Actions& output) {
 		if (install_ && install_->published && failure.token == install_->token) { fence(std::move(failure.error), output); }
 	}
+	void release_snapshots(SnapshotReleaseReason reason, Actions& output) {
+		for (const auto& [id, peer] : peers_) { if (peer.snapshot) { output.emplace_back(SnapshotReleased{id, peer.snapshot->key, reason}); } }
+	}
+	void release_snapshot(NodeId id, Peer& peer, SnapshotReleaseReason reason, Actions& output, bool probe = false) {
+		auto key = peer.snapshot->key; output.emplace_back(SnapshotReleased{id, key, reason}); peer.snapshot.reset();
+		if (peer.flight && peer.flight->keepalive) { peer.flight.reset(); }
+		peer.retry_after = deadline(timing_.rpc_timeout); peer.snapshot_retry_clock = now_;
+		if (probe) { peer.next = std::max(peer.matched + 1, key.boundary.index + 1); }
+	}
+	void handle(SnapshotSourceReady ready, Actions& output) {
+		if (busy() || role_ != Role::Leader || !valid_snapshot_key(ready.key)) { return; }
+		auto found = peers_.find(ready.peer); if (found == peers_.end()) { return; } auto& peer = found->second;
+		if (!peer.snapshot || peer.snapshot->key != ready.key || peer.snapshot->phase != SnapshotPhase::AwaitSource || ready.key.leader_term != durable_.term) { return; }
+		if (ready.key.boundary != LogBoundary{base_index_, base_term_}) { release_snapshot(ready.peer, peer, SnapshotReleaseReason::Stale, output); return; }
+		peer.snapshot->phase = SnapshotPhase::Sending; peer.snapshot->started = now_; output.emplace_back(SnapshotTransmit{ready.peer, ready.key});
+	}
+	void handle(SnapshotTransferFailed failure, Actions& output) {
+		if (busy() || role_ != Role::Leader || !valid_snapshot_key(failure.key)) { return; }
+		auto found = peers_.find(failure.peer); if (found == peers_.end() || !found->second.snapshot || found->second.snapshot->key != failure.key) { return; }
+		bool probe = found->second.snapshot->phase == SnapshotPhase::Sending;
+		release_snapshot(failure.peer, found->second, SnapshotReleaseReason::Unavailable, output, probe);
+	}
+
 	void handle(LocalCheckpoint request, Actions& output) {
 		if (!started_ || busy()) { output.emplace_back(Reject{request.request, RejectReason::Busy}); return; }
 		if (request.capture == 0 || request.cluster != configuration_.cluster || request.configuration != configuration_.configuration ||
 			request.through <= base_index_ || request.through > applied_ || applied_ > durable_.commit_index ||
 			log_term(request.through) != request.term) {
 			output.emplace_back(Reject{request.request, RejectReason::InvalidCheckpoint}); return;
+		}
+		for (const auto& [id, peer] : peers_) {
+			if (peer.snapshot && peer.snapshot->phase == SnapshotPhase::Sending && request.through > peer.snapshot->key.boundary.index) { output.emplace_back(Reject{request.request, RejectReason::Busy}); return; }
 		}
 		RecoveredState state{configuration_, durable_, request.through, request.term, {}, request.through};
 		auto first = static_cast<std::size_t>(request.through - base_index_);
@@ -276,6 +306,7 @@ private:
 	}
 	bool valid(const VoteRequest& request) const { return request.term > 0 && request.last_index < maximum && request.last_term <= request.term && ((request.last_index == 0) == (request.last_term == 0)); }
 	bool valid(const VoteResponse&) const { return true; }
+	bool valid(const SnapshotResponse& response) const { return valid_snapshot_response(response); }
 	bool valid(const AppendResponse& response) const {
 		return response.rpc != 0 && response.matched < maximum && response.next_hint > 0 &&
 			(!response.compacted || (!response.success && response.compacted->index > 0 && response.compacted->index < maximum &&
@@ -357,6 +388,9 @@ private:
 		if (!peer.flight || peer.flight->rpc != response.rpc) { return; }
 		auto flight = *peer.flight;
 		if (response.read_probe != flight.read_probe) { return; }
+		// Preserve its send time across replies so fixed-time callbacks cannot
+		// turn independent snapshot contact into an immediate request loop.
+		if (flight.keepalive) { return; }
 		if (response.success) {
 			if (response.matched != flight.through) { return; }
 			peer.matched = std::max(peer.matched, response.matched); peer.next = peer.matched + 1; peer.retry_after = 0;
@@ -387,6 +421,19 @@ private:
 			replicate(source, peer, output, needed);
 		}
 	}
+	void receive_message(NodeId source, SnapshotResponse response, StorageBatch&, Actions& output) {
+		if (role_ != Role::Leader || response.term != hard_.term || response.key.leader_term != durable_.term) { return; }
+		auto& peer = peers_.at(source);
+		if (!peer.snapshot || peer.snapshot->phase != SnapshotPhase::Sending || peer.snapshot->key != response.key) { return; }
+		if (response.result == SnapshotReply::Installed) {
+			auto boundary = peer.snapshot->key.boundary;
+			output.emplace_back(SnapshotReleased{source, response.key, SnapshotReleaseReason::Installed}); peer.snapshot.reset();
+			if (peer.flight && peer.flight->keepalive) { peer.flight.reset(); }
+			peer.matched = std::max(peer.matched, boundary.index); peer.next = peer.matched + 1; peer.retry_after = 0; peer.snapshot_retry_clock.reset();
+			replicate(source, peer, output, needed_probe(source));
+		} else { release_snapshot(source, peer, response.result == SnapshotReply::CaughtUp ? SnapshotReleaseReason::CaughtUp : SnapshotReleaseReason::Rejected, output, response.result == SnapshotReply::CaughtUp); }
+	}
+
 	void drive(Actions& output, bool allow_campaign) {
 		if (!started_ || busy()) { return; }
 		if (role_ != Role::Leader) {
@@ -403,8 +450,10 @@ private:
 		}
 		bool heartbeat = now_ >= heartbeat_deadline_;
 		for (auto& [id, peer] : peers_) {
-			if (peer.flight && now_ - peer.flight->sent >= timing_.rpc_timeout) { peer.flight.reset(); }
-			if (!peer.flight && (heartbeat || peer.next <= last_index())) {
+			if (peer.snapshot && peer.snapshot->phase == SnapshotPhase::AwaitSource && peer.snapshot->key.boundary != LogBoundary{base_index_, base_term_}) { release_snapshot(id, peer, SnapshotReleaseReason::Stale, output); }
+			if (peer.snapshot && now_ - peer.snapshot->started >= timing_.snapshot_timeout) { release_snapshot(id, peer, SnapshotReleaseReason::TimedOut, output, true); }
+			if (peer.flight && !peer.flight->keepalive && now_ - peer.flight->sent >= timing_.rpc_timeout) { peer.flight.reset(); }
+			if (peer.snapshot || (!peer.flight && (heartbeat || peer.next <= last_index()))) {
 				auto probe = needed_probe(id);
 				replicate(id, peer, output, probe);
 			}
@@ -423,11 +472,19 @@ private:
 		persist(StorageBatch{std::nullopt, LogMutation{noop.index, {noop}}}, std::move(deferred), output);
 		heartbeat_deadline_ = now_;
 	}
+	void snapshot_keepalive(NodeId id, Peer& peer, Actions& output) {
+		if (peer.flight && (!peer.flight->keepalive || now_ - peer.flight->sent < timing_.heartbeat)) { return; }
+		auto rpc = token(); peer.flight = Flight{rpc, 0, 0, 0, now_, true};
+		output.emplace_back(Send{id, AppendRequest{hard_.term, rpc, 0, 0, 0, 0, {}}});
+	}
+
 	void replicate(NodeId id, Peer& peer, Actions& output, Token probe) {
-		if (peer.flight || now_ < peer.retry_after) { return; }
+		if (peer.snapshot) { snapshot_keepalive(id, peer, output); return; }
+		if (peer.flight || now_ < peer.retry_after || (peer.snapshot_retry_clock && now_ <= *peer.snapshot_retry_clock)) { return; }
 		if (peer.next <= base_index_) {
-			if (!peer.snapshot_requested) { output.emplace_back(SnapshotNeeded{id, base_index_, base_term_}); peer.snapshot_requested = true; }
-			return;
+			SnapshotKey key{durable_.term, token(), {base_index_, base_term_}};
+			peer.snapshot.emplace(SnapshotFlight{key, SnapshotPhase::AwaitSource, now_}); peer.snapshot_retry_clock.reset();
+			output.emplace_back(SnapshotNeeded{id, key}); snapshot_keepalive(id, peer, output); return;
 		}
 		Index previous = peer.next - 1;
 		std::vector<Entry> batch; std::size_t bytes = 0;

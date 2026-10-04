@@ -29,7 +29,7 @@ inline EventAdmissionPlan plan_event(const Event& event, bool busy, Limits limit
 		using T = std::decay_t<decltype(value)>;
 		if constexpr (std::is_same_v<T, Persisted> || std::is_same_v<T, LocalCheckpoint> ||
 			std::is_same_v<T, Applied> || std::is_same_v<T, StorageFault> || std::is_same_v<T, Failed> ||
-			std::is_same_v<T, InstallPrepared> || std::is_same_v<T, InstallActivated> || std::is_same_v<T, InstallActivationFailed>) {
+			std::is_same_v<T, InstallPrepared> || std::is_same_v<T, InstallActivated> || std::is_same_v<T, InstallActivationFailed> || std::is_same_v<T, SnapshotSourceReady> || std::is_same_v<T, SnapshotTransferFailed>) {
 			throw std::invalid_argument("internal worker event cannot be submitted");
 		} else if constexpr (std::is_same_v<T, Tick>) {
 			if (!busy) { add(AdmissionClass::Control, hard); add(AdmissionClass::Control, noop); add(AdmissionClass::Control, hard); }
@@ -56,7 +56,8 @@ inline EventAdmissionPlan plan_event(const Event& event, bool busy, Limits limit
 					if (!busy) { add(command ? AdmissionClass::Normal : AdmissionClass::Control, storage_batch_size(true, true, message.entries.size(), payload)); }
 				} else if constexpr (std::is_same_v<M, VoteResponse>) {
 					if (!busy) { add(AdmissionClass::Control, noop); add(AdmissionClass::Control, hard); }
-				} else if constexpr (std::is_same_v<M, VoteRequest> || std::is_same_v<M, AppendResponse>) {
+				} else if constexpr (std::is_same_v<M, VoteRequest> || std::is_same_v<M, AppendResponse> || std::is_same_v<M, SnapshotResponse>) {
+					if constexpr (std::is_same_v<M, SnapshotResponse>) { if (!valid_snapshot_response(message)) { throw std::invalid_argument("invalid snapshot response"); } }
 					if (!busy) { add(AdmissionClass::Control, hard); }
 				} else {
 					static_assert(std::is_same_v<M, void>, "new consensus message requires an admission plan");

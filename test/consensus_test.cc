@@ -958,8 +958,183 @@ void portable_snapshot_installation() {
 	}
 }
 
+void snapshot_timeout_retries() {
+	auto state = empty(1); state.hard = HardState{1, 1, 2}; state.base_index = state.applied_index = 2; state.base_term = 1; state.entries = {{3, 1, EntryKind::Command, "tail"}};
+	Core core(config(1), state); auto election = elect_checkpoint_fixture(core); auto first = append_to(election, 2); if (!first) { throw std::runtime_error("snapshot retry fixture flight"); }
+	auto needed = core.step(Receive{2, AppendResponse{2, first->rpc, false, 0, 1, 0}}); check(find<SnapshotNeeded>(needed), "snapshot timeout fixture requests missing history");
+	core.step(Tick{60100, 100}); auto retry = core.step(Tick{60140, 100}); auto probe = append_to(retry, 2);
+	check(probe && probe->previous == 2, "expired snapshot request retries through a fresh ordinary prefix probe");
+	if (probe) { auto replacement = core.step(Receive{2, AppendResponse{2, probe->rpc, false, 0, 1, 0}}); check(find<SnapshotNeeded>(replacement), "an empty peer after timeout receives another snapshot request"); }
+}
+
+struct SnapshotSenderFixture {
+	static RecoveredState state() {
+		auto result = empty(1); result.hard = {1, 1, 2}; result.base_index = result.applied_index = 2; result.base_term = 1; result.entries = {{3, 1, EntryKind::Command, "tail"}}; return result;
+	}
+	Core core; SnapshotKey key{}; Actions requested, election;
+	explicit SnapshotSenderFixture(Timing timing = {}) : core(config(1), state(), {}, timing) {
+		election = elect_checkpoint_fixture(core); auto first = append_to(election, 2); if (!first) { throw std::runtime_error("sender fixture initial data flight"); }
+		requested = core.step(Receive{2, AppendResponse{2, first->rpc, false, 0, 1, 0}}); auto needed = find<SnapshotNeeded>(requested); if (!needed) { throw std::runtime_error("sender fixture snapshot request"); } key = needed->key;
+	}
+	Actions ready() { return core.step(SnapshotSourceReady{2, key}); }
+	Actions reply(SnapshotReply result) { return core.step(Receive{2, SnapshotResponse{core.term(), key, result}}); }
+	Actions commit_healthy_peer() {
+		auto request = append_to(election, 3); if (!request) { throw std::runtime_error("sender fixture healthy flight"); }
+		auto response = core.step(Receive{3, AppendResponse{core.term(), request->rpc, true, request->previous + request->entries.size(), request->previous + request->entries.size() + 1, request->read_probe}});
+		auto persisted = find<Persist>(response); if (!persisted) { throw std::runtime_error("sender fixture healthy commit"); }
+		auto completed = core.step(Persisted{persisted->token}); core.step(Applied{4}); return completed;
+	}
+};
+void snapshot_sender_correlation() {
+	SnapshotSenderFixture fixture; auto& core = fixture.core;
+	check(!find<SnapshotReleased>(fixture.reply(SnapshotReply::Installed)), "snapshot result before source readiness cannot complete a flight");
+	for (unsigned mismatch = 0; mismatch < 4; ++mismatch) {
+		auto key = fixture.key; NodeId peer = 2;
+		switch (mismatch) { case 0: peer = 3; break; case 1: ++key.transfer; break; case 2: key.leader_term = 1; break; case 3: ++key.boundary.index; break; }
+		check(!find<SnapshotTransmit>(core.step(SnapshotSourceReady{peer, key})), "source readiness requires exact peer, epoch, token and boundary");
+	}
+	check(find<SnapshotTransmit>(fixture.ready()) && !find<SnapshotTransmit>(fixture.ready()), "exact source readiness transitions once to Sending");
+	for (unsigned mismatch = 0; mismatch < 5; ++mismatch) {
+		auto key = fixture.key; NodeId peer = 2; Term term = 2;
+		switch (mismatch) { case 0: peer = 3; break; case 1: ++key.transfer; break; case 2: key.leader_term = 1; break; case 3: ++key.boundary.index; break; case 4: term = 1; break; }
+		check(!find<SnapshotReleased>(core.step(Receive{peer, SnapshotResponse{term, key, SnapshotReply::Installed}})) && core.committed() == 2, "incorrect snapshot reply correlation supplies no progress");
+	}
+	auto installed = fixture.reply(SnapshotReply::Installed); auto next = append_to(installed, 2);
+	check(find<SnapshotReleased>(installed) && next && next->previous == 2 && core.committed() == 2 && !find<Persist>(installed), "Installed advances only its included boundary and does not commit the newer tail");
+	check(!find<SnapshotReleased>(fixture.reply(SnapshotReply::Installed)), "duplicate installed response cannot complete another flight");
+
+	SnapshotSenderFixture reads; auto healthy = reads.commit_healthy_peer(); reads.ready(); auto& reader = reads.core; reader.step(Read{80});
+	if (auto request = append_to(healthy, 3)) { reader.step(Receive{3, AppendResponse{2, request->rpc, true, 4, 5, request->read_probe}}); }
+	auto success = reads.reply(SnapshotReply::Installed); auto probe = append_to(success, 2);
+	check(!find<ReadReady>(success) && probe && probe->read_probe, "Installed contributes no read quorum and resumes a separately correlated read probe");
+	if (probe) { auto through = probe->previous + probe->entries.size(); auto result = reader.step(Receive{2, AppendResponse{2, probe->rpc, true, through, through + 1, probe->read_probe}}); check(find<ReadReady>(result), "fresh ordinary prefix verification can complete the pending quorum read"); }
+}
+void snapshot_sender_keepalive_pacing() {
+	Timing timing; timing.rpc_timeout = 10; SnapshotSenderFixture fixture(timing); fixture.commit_healthy_peer(); auto& core = fixture.core; auto request = append_to(fixture.requested, 2);
+	check(request && request->previous == 0 && request->previous_term == 0 && request->commit == 0 && request->read_probe == 0 && request->entries.empty(), "snapshot contact uses an empty independent genesis keepalive");
+	if (!request) { return; } auto rpc = request->rpc;
+	core.step(Receive{2, AppendResponse{2, rpc, true, 4, 5, 0}});
+	for (unsigned repeat = 0; repeat < 10; ++repeat) {
+		auto tick = core.step(Tick{100, 100}); auto read = core.step(Read{100 + repeat});
+		check(!append_to(tick, 2) && !append_to(read, 2) && !find<Reject>(read), "fixed-time keepalive acknowledgment then Tick/accepted Read cannot create an immediate contact loop");
+	}
+	check(!append_to(core.step(Tick{110, 100}), 2), "shorter ordinary RPC timeout cannot bypass snapshot keepalive pacing");
+	auto later = core.step(Tick{120, 100}); auto refreshed = append_to(later, 2);
+	check(refreshed && refreshed->rpc != rpc && refreshed->previous == 0 && core.committed() == 4 && !find<ReadReady>(later), "periodic keepalive replacement is fresh and supplies neither replication nor read evidence");
+	fixture.ready();
+	for (std::uint64_t now = 140; now <= 400; now += 20) { auto actions = core.step(Tick{now, 100}); auto keepalive = append_to(actions, 2); check(keepalive && keepalive->previous == 0 && !keepalive->read_probe && !find<SnapshotNeeded>(actions), "source and transfer delays keep periodic contact even when replies are dropped"); }
+}
+void snapshot_sender_retries_and_retention() {
+	Timing timing; timing.snapshot_timeout = 300;
+	for (SnapshotReply result : {SnapshotReply::CaughtUp, SnapshotReply::Rejected}) {
+		SnapshotSenderFixture fixture(timing); fixture.ready(); auto released = fixture.reply(result);
+		check(find<SnapshotReleased>(released) && !find<Persist>(released) && fixture.core.committed() == 2, "caught-up or rejected snapshots release without fabricated progress");
+		for (unsigned repeat = 0; repeat < 10; ++repeat) { check(!find<SnapshotNeeded>(fixture.core.step(Tick{100, 100})), "fixed-time rejection cannot immediately request another image"); }
+		auto retry = fixture.core.step(Tick{140, 100}); auto prefix = append_to(retry, 2);
+		if (result == SnapshotReply::CaughtUp) {
+			check(prefix && prefix->previous == 2 && !find<SnapshotNeeded>(retry), "CaughtUp selects fresh ordinary prefix verification without snapshot acknowledgment");
+			if (prefix) { auto through = prefix->previous + prefix->entries.size(); auto commit = fixture.core.step(Receive{2, AppendResponse{2, prefix->rpc, true, through, through + 1, 0}}); check(find<Persist>(commit), "verified CaughtUp prefix can subsequently commit the replicated tail"); }
+		} else { auto needed = find<SnapshotNeeded>(retry); check(needed && needed->key.transfer != fixture.key.transfer, "rejected image retries with a new transfer token after backoff"); }
+	}
+	SnapshotSenderFixture failure(timing); auto unavailable = failure.core.step(SnapshotTransferFailed{2, failure.key});
+	check(find<SnapshotReleased>(unavailable), "source unavailability retires its exact AwaitSource flight");
+	auto replacement = failure.core.step(Tick{140, 100}); auto needed = find<SnapshotNeeded>(replacement);
+	check(needed && needed->key.transfer != failure.key.transfer && !find<SnapshotTransmit>(failure.ready()), "stale source completion cannot replace a fresh retry flight");
+
+	for (bool sending : {false, true}) {
+		SnapshotSenderFixture fixture(timing); fixture.commit_healthy_peer(); if (sending) { fixture.ready(); }
+		auto cfg = config(1); LocalCheckpoint checkpoint{90, 70, 4, 2, cfg.cluster, cfg.configuration}; auto action = fixture.core.step(checkpoint);
+		if (sending) {
+			auto rejected = find<Reject>(action); check(rejected && rejected->reason == RejectReason::Busy && !find<PersistCheckpoint>(action), "active Sending preserves the suffix by rejecting compaction beyond its boundary");
+			auto expired = fixture.core.step(Tick{400, 100}); check(find<SnapshotReleased>(expired), "bounded transfer timeout releases suffix retention");
+			action = fixture.core.step(checkpoint); check(find<PersistCheckpoint>(action), "compaction becomes available after sending timeout");
+		} else {
+			auto capture = find<PersistCheckpoint>(action); check(capture, "AwaitSource permits local checkpoint advancement");
+			if (capture) { auto published = fixture.core.step(Persisted{capture->token}); check(find<SnapshotReleased>(published) && !find<SnapshotTransmit>(fixture.ready()), "changed base invalidates old source readiness and retires its request"); }
+		}
+	}
+}
+
+void snapshot_sender_lost_ack_and_terms() {
+	SnapshotSenderFixture lost; lost.ready(); auto failure = lost.core.step(SnapshotTransferFailed{2, lost.key});
+	check(find<SnapshotReleased>(failure) && lost.core.committed() == 2 && !find<Persist>(failure) && !append_to(lost.core.step(Tick{100, 100}), 2), "lost install acknowledgment releases Sending without progress or same-time retry");
+	auto retry = lost.core.step(Tick{140, 100}); auto probe = append_to(retry, 2);
+	check(probe && probe->previous == 2 && !find<SnapshotNeeded>(retry), "post-send failure tries a fresh prefix before another complete image");
+	if (probe) { auto through = probe->previous + probe->entries.size(); auto verified = lost.core.step(Receive{2, AppendResponse{2, probe->rpc, true, through, through + 1, 0}}); auto durable = find<Persist>(verified); check(durable && lost.core.committed() == 2, "only fresh prefix proof stages post-snapshot tail commitment"); if (durable) { lost.core.step(Persisted{durable->token}); check(lost.core.committed() == 4, "lost acknowledgment recovery commits only after owned durability completion"); } }
+	for (bool obsolete : {false, true}) { for (bool fail : {false, true}) {
+		SnapshotSenderFixture fixture; fixture.ready(); auto key = fixture.key; if (obsolete) { ++key.transfer; }
+		auto observed = fixture.core.step(Receive{2, SnapshotResponse{3, key, SnapshotReply::Rejected}}); auto persist = find<Persist>(observed);
+		check(persist && !find<RoleChanged>(observed) && !find<SnapshotReleased>(observed) && fixture.core.durable_hard_state().term == 2 && fixture.core.role() == Role::Follower, "valid higher durable receiver term suppresses leadership but holds dependent flight releases behind persistence");
+		if (!persist) { continue; }
+		if (fail) { auto fenced = fixture.core.step(Failed{FailureSource::Storage, persist->token, "injected term failure"}); check(find<Fenced>(fenced) && fixture.core.role() == Role::Fenced, "higher-term storage uncertainty fences with current or obsolete transfer tokens"); }
+		else { auto completed = fixture.core.step(Persisted{persist->token}); auto released = find<SnapshotReleased>(completed); check(released && released->key == fixture.key && fixture.core.durable_hard_state().term == 3 && !fixture.core.durable_hard_state().voted_for && find<RoleChanged>(completed), "higher receiver term durably clears the ballot before exposing role and exact old-resource release"); }
+	} }
+	SnapshotSenderFixture malformed; malformed.ready();
+	for (unsigned invalid = 0; invalid < 5; ++invalid) {
+		auto key = malformed.key; SnapshotReply result = SnapshotReply::Installed; NodeId peer = 2;
+		switch (invalid) { case 0: key.transfer = 0; break; case 1: key.boundary.term = 3; break; case 2: result = static_cast<SnapshotReply>(99); break; case 3: peer = 99; break; case 4: peer = 1; break; }
+		auto output = malformed.core.step(Receive{peer, SnapshotResponse{99, key, result}}); check(output.empty() && malformed.core.term() == 2 && malformed.core.role() == Role::Leader, "invalid response or unauthenticated member assertion cannot mutate term or flight state");
+	}
+	auto fenced = malformed.core.step(StorageFault{"uncertain storage"}); auto released = find<SnapshotReleased>(fenced);
+	check(released && released->key == malformed.key && released->reason == SnapshotReleaseReason::Fenced && find<Fenced>(fenced), "direct fencing retires active source resources without a progress acknowledgment");
+}
+void snapshot_sender_receiver_contact() {
+	SnapshotSenderFixture fixture; auto& leader = fixture.core; Core follower(config(2), empty(2)); follower.step(Tick{100, 100}); follower.step(Start{});
+	auto initial = append_to(fixture.requested, 2); if (!initial) { throw std::runtime_error("contact fixture genesis keepalive"); }
+	auto contact = follower.step(Receive{1, *initial}); if (auto persist = find<Persist>(contact)) { follower.step(Tick{100, 100}); follower.step(Persisted{persist->token}); }
+	fixture.ready(); unsigned delivered = 1;
+	for (std::uint64_t now = 120; now <= 400; now += 20) {
+		auto actions = leader.step(Tick{now, 100}); follower.step(Tick{now, 100});
+		if (auto request = append_to(actions, 2)) { ++delivered; auto output = follower.step(Receive{1, *request}); check(!find<Persist>(output) && follower.role() == Role::Follower && follower.term() == 2, "long transfer keepalive refreshes the actual receiver without campaigning or data progress"); }
+		if (auto request = append_to(actions, 3)) {
+			auto through = request->previous + request->entries.size(); auto output = leader.step(Receive{3, AppendResponse{2, request->rpc, true, through, through + 1, request->read_probe}});
+			if (auto persist = find<Persist>(output)) { leader.step(Tick{now, 100}); auto completed = leader.step(Persisted{persist->token}); if (auto range = find<Committed>(completed)) { leader.step(Applied{range->entries.back().index}); } }
+		}
+		// Deliberately drop every receiver keepalive response.
+	}
+	check(delivered >= 14 && follower.committed() == 0 && follower.last_index() == 0 && leader.committed() == 4 && leader.role() == Role::Leader, "dropped contact replies neither starve healthy replication nor manufacture receiver progress");
+}
+void snapshot_sender_restart_clock_and_admission() {
+	SnapshotSenderFixture old; old.ready(); auto recovered = SnapshotSenderFixture::state(); recovered.hard = {2, 1, 2}; recovered.entries.push_back({4, 2, EntryKind::NoOp, ""});
+	Core restarted(config(1), recovered); auto election = elect_checkpoint_fixture(restarted); auto first = append_to(election, 2); if (!first) { throw std::runtime_error("restarted sender initial flight"); }
+	auto requested = restarted.step(Receive{2, AppendResponse{3, first->rpc, false, 0, 1, 0}}); auto needed = find<SnapshotNeeded>(requested); if (!needed) { throw std::runtime_error("restarted sender snapshot request"); }
+	auto key = needed->key; check(key.transfer == old.key.transfer && key.leader_term == 3 && old.key.leader_term == 2, "restart can reuse numeric transfers only under a newly persisted leader epoch"); restarted.step(SnapshotSourceReady{2, key});
+	check(!find<SnapshotReleased>(restarted.step(Receive{2, SnapshotResponse{3, old.key, SnapshotReply::Installed}})), "old incarnation cannot complete a same-numbered restarted flight");
+	check(find<SnapshotReleased>(restarted.step(Receive{2, SnapshotResponse{3, key, SnapshotReply::Installed}})), "restarted leader accepts its exact new epoch and transfer");
+
+	SnapshotSenderFixture saturated; saturated.ready(); auto expired = saturated.core.step(Tick{std::numeric_limits<std::uint64_t>::max(), 100}); check(find<SnapshotReleased>(expired), "clock saturation retires an earlier transfer exactly once");
+	for (unsigned repeat = 0; repeat < 10; ++repeat) { auto actions = saturated.core.step(Tick{std::numeric_limits<std::uint64_t>::max(), 100}); check(!find<SnapshotNeeded>(actions) && !append_to(actions, 2), "saturated-clock backoff cannot spin snapshot or prefix retries"); }
+	for (bool busy : {false, true}) {
+		auto plan = plan_event(Receive{2, SnapshotResponse{2, old.key, SnapshotReply::Installed}}, busy); check(plan.count == (busy ? 0 : 1) && (busy || (plan.appends[0].kind == kronuz::journal::AdmissionClass::Control && plan.appends[0].encoded_bytes == storage_batch_size(true, false))), "snapshot response owns one conservative control hard-state budget");
+		check(throws([&] { plan_event(SnapshotSourceReady{2, old.key}, busy); }) && throws([&] { plan_event(SnapshotTransferFailed{2, old.key}, busy); }), "trusted source transitions reject ordinary Worker submission even while busy");
+		auto invalid = old.key; invalid.transfer = 0; check(throws([&] { plan_event(Receive{2, SnapshotResponse{99, invalid, SnapshotReply::Installed}}, busy); }), "malformed response validates before Worker backpressure or term effects");
+	}
+}
+
+void snapshot_sender_maximum_fanout() {
+	auto cfg = config(1); cfg.voters.clear(); for (NodeId peer = 1; peer <= 31; ++peer) { cfg.voters.push_back(peer); }
+	auto state = SnapshotSenderFixture::state(); state.configuration = cfg; Limits capacity; capacity.voters = 31;
+	Core core(cfg, state, capacity); core.step(Start{}); auto campaign = core.step(Tick{100, 100}); auto ballot = find<Persist>(campaign); if (!ballot) { throw std::runtime_error("fanout ballot"); } core.step(Persisted{ballot->token});
+	Actions traffic;
+	for (NodeId voter = 2; voter <= 16; ++voter) { auto actions = core.step(Receive{voter, VoteResponse{2, true}}); if (auto noop = find<Persist>(actions)) { traffic = core.step(Persisted{noop->token}); } }
+	std::map<NodeId, SnapshotKey> keys;
+	for (NodeId peer = 2; peer <= 31; ++peer) {
+		auto append = append_to(traffic, peer); if (!append) { throw std::runtime_error("fanout data flight"); }
+		auto request = core.step(Receive{peer, AppendResponse{2, append->rpc, false, 0, 1, 0}}); auto needed = find<SnapshotNeeded>(request); if (!needed) { throw std::runtime_error("fanout snapshot request"); } keys.emplace(peer, needed->key);
+		check(find<SnapshotTransmit>(core.step(SnapshotSourceReady{peer, needed->key})), "maximum-voter source readiness owns one bounded flight per peer");
+	}
+	auto heartbeat = core.step(Tick{120, 100}); unsigned contacts = 0;
+	for (const auto& action : heartbeat) { if (auto send = std::get_if<Send>(&action)) { if (auto append = std::get_if<AppendRequest>(&send->message)) { contacts += append->previous == 0 && append->commit == 0 && !append->read_probe && append->entries.empty(); } } }
+	auto bound = 2 * capacity.reads + 4 * capacity.voters + 16;
+	check(keys.size() == 30 && contacts == 30 && heartbeat.size() <= bound, "maximum-voter simultaneous keepalives fit the existing Worker action bound without payload");
+	auto transition = core.step(Receive{2, SnapshotResponse{3, keys.at(2), SnapshotReply::Rejected}}); auto persisted = find<Persist>(transition); if (!persisted) { throw std::runtime_error("fanout higher-term persistence"); }
+	auto released = core.step(Persisted{persisted->token}); unsigned count = 0;
+	for (const auto& action : released) { if (auto flight = std::get_if<SnapshotReleased>(&action)) { ++count; check(flight->key == keys.at(flight->peer), "leadership loss releases each exact maximum-fanout capability"); } }
+	check(count == 30 && released.size() <= bound && core.durable_hard_state().term == 3, "simultaneous source releases and role effects fit the old action bound after durable term change");
+}
+
 int main() {
-	try { portable_snapshot_installation(); portable_snapshot_descriptors(); event_admission_plans(); storage_footprint_plans(); persistence_barriers(); delayed_completions_do_not_campaign(); replication_and_restart(); affirmative_majority_and_inheritance(); simultaneous_completions(); reads_and_partitions(); overlapping_reads_preserve_data(); application_lag_does_not_spin_reads(); stale_rpc_and_failure_transitions(); bounds_and_semantic_recovery(); local_checkpoint_core(); compacted_index_exhaustion(); compacted_replication(); checkpoint_semantic_recovery(); real_journal_integration(); real_store_integration(); reordered_crash_schedules(3, 0x52414654); reordered_crash_schedules(5, 0x434c5553); }
+	try { snapshot_sender_maximum_fanout(); snapshot_sender_lost_ack_and_terms(); snapshot_sender_receiver_contact(); snapshot_sender_restart_clock_and_admission(); snapshot_sender_correlation(); snapshot_sender_keepalive_pacing(); snapshot_sender_retries_and_retention(); snapshot_timeout_retries(); portable_snapshot_installation(); portable_snapshot_descriptors(); event_admission_plans(); storage_footprint_plans(); persistence_barriers(); delayed_completions_do_not_campaign(); replication_and_restart(); affirmative_majority_and_inheritance(); simultaneous_completions(); reads_and_partitions(); overlapping_reads_preserve_data(); application_lag_does_not_spin_reads(); stale_rpc_and_failure_transitions(); bounds_and_semantic_recovery(); local_checkpoint_core(); compacted_index_exhaustion(); compacted_replication(); checkpoint_semantic_recovery(); real_journal_integration(); real_store_integration(); reordered_crash_schedules(3, 0x52414654); reordered_crash_schedules(5, 0x434c5553); }
 	catch (const std::exception& error) { check(false, error.what()); }
 	std::cout << checks << " consensus checks, " << failures << " failures\n";
 	return failures ? 1 : 0;

@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <limits>
 #include <string>
 #include <variant>
 #include <vector>
@@ -64,6 +65,7 @@ struct Limits {
 struct Timing {
 	std::uint64_t heartbeat = 20, rpc_timeout = 40;
 	std::uint64_t election_min = 100, election_max = 200;
+	std::uint64_t snapshot_timeout = 60000;
 };
 
 struct VoteRequest { Term term; Index last_index; Term last_term; };
@@ -77,7 +79,20 @@ struct AppendRequest {
 	Token read_probe;
 	std::vector<Entry> entries;
 };
-struct LogBoundary { Index index; Term term; };
+struct LogBoundary { Index index; Term term; bool operator==(const LogBoundary&) const = default; };
+struct SnapshotKey { Term leader_term; Token transfer; LogBoundary boundary; bool operator==(const SnapshotKey&) const = default; };
+enum class SnapshotReply { Installed, CaughtUp, Rejected };
+struct SnapshotResponse { Term term; SnapshotKey key; SnapshotReply result; };
+inline bool valid_snapshot_key(const SnapshotKey& key) {
+	return key.leader_term && key.transfer && key.boundary.index && key.boundary.index < std::numeric_limits<Index>::max() && key.boundary.term && key.boundary.term <= key.leader_term;
+}
+inline bool valid_snapshot_response(const SnapshotResponse& response) {
+	if (!response.term || !valid_snapshot_key(response.key)) { return false; }
+	switch (response.result) {
+	case SnapshotReply::Installed: case SnapshotReply::CaughtUp: return response.term >= response.key.leader_term;
+	case SnapshotReply::Rejected: return true;
+	} return false;
+}
 struct AppendResponse {
 	Term term;
 	Token rpc;
@@ -87,7 +102,7 @@ struct AppendResponse {
 	Token read_probe;
 	std::optional<LogBoundary> compacted{};
 };
-using Message = std::variant<VoteRequest, VoteResponse, AppendRequest, AppendResponse>;
+using Message = std::variant<VoteRequest, VoteResponse, AppendRequest, AppendResponse, SnapshotResponse>;
 
 struct Start {};
 // The host supplies absolute monotonic time and a fresh randomized election
@@ -107,10 +122,12 @@ struct InstallPrepared {
 };
 struct InstallActivated { Token token; };
 struct InstallActivationFailed { Token token; std::string error; };
+struct SnapshotSourceReady { NodeId peer; SnapshotKey key; };
+struct SnapshotTransferFailed { NodeId peer; SnapshotKey key; };
 struct StorageFault { std::string error; };
 enum class FailureSource { Storage, Application };
 struct Failed { FailureSource source; Token token; std::string error; };
-using Event = std::variant<Start, Tick, Receive, Propose, Read, Persisted, Applied, Failed, LocalCheckpoint, StorageFault, InstallPrepared, InstallActivated, InstallActivationFailed>;
+using Event = std::variant<Start, Tick, Receive, Propose, Read, Persisted, Applied, Failed, LocalCheckpoint, StorageFault, InstallPrepared, InstallActivated, InstallActivationFailed, SnapshotSourceReady, SnapshotTransferFailed>;
 
 enum class Role { Follower, Candidate, Leader, Fenced };
 enum class RejectReason { Busy, NotLeader, NotReady, LogFull, TooLarge, DuplicateRequest, InvalidCheckpoint };
@@ -122,7 +139,10 @@ enum class InstallRejectReason { Busy, Invalid, StaleTerm, CaughtUp };
 struct InstallRejected { RequestId request; Token prepared; InstallRejectReason reason; };
 struct InstallCompleted { RequestId request; Token prepared; LogBoundary boundary; };
 struct CheckpointPublished { RequestId request; Index through; };
-struct SnapshotNeeded { NodeId peer; Index through; Term term; };
+struct SnapshotNeeded { NodeId peer; SnapshotKey key; };
+struct SnapshotTransmit { NodeId peer; SnapshotKey key; };
+enum class SnapshotReleaseReason { Installed, CaughtUp, Rejected, Unavailable, Stale, TimedOut, LeadershipLost, Fenced };
+struct SnapshotReleased { NodeId peer; SnapshotKey key; SnapshotReleaseReason reason; };
 struct Send { NodeId peer; Message message; };
 struct ProposalPlaced { RequestId request; Term term; Index index; };
 struct Committed { Index first; std::vector<Entry> entries; };
@@ -130,7 +150,7 @@ struct ReadReady { RequestId request; Index index; };
 struct RoleChanged { Role role; Term term; NodeId leader; };
 struct Reject { RequestId request; RejectReason reason; };
 struct Fenced { std::string reason; };
-using Action = std::variant<Persist, Send, ProposalPlaced, Committed, ReadReady, RoleChanged, Reject, Fenced, PersistCheckpoint, CheckpointPublished, SnapshotNeeded, PersistInstall, ActivateInstall, InstallRejected, InstallCompleted>;
+using Action = std::variant<Persist, Send, ProposalPlaced, Committed, ReadReady, RoleChanged, Reject, Fenced, PersistCheckpoint, CheckpointPublished, SnapshotNeeded, PersistInstall, ActivateInstall, InstallRejected, InstallCompleted, SnapshotTransmit, SnapshotReleased>;
 using Actions = std::vector<Action>;
 
 } // namespace cluster::consensus
