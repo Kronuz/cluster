@@ -763,10 +763,101 @@ void store_incremental_verification() {
 	} }
 }
 
+void published_artifact_selection() {
+	for (bool legacy : {false, true}) { for (const std::string& payload : {std::string{}, std::string("published"), std::string(65553, 'p')}) {
+		auto model = initialized(); MemoryIO io(model); Journal journal(io, 1024); journal.recover([](auto, auto) {});
+		auto before = model.operations;
+		check(!journal.select_published_dependency(0) && model.operations == before, "publication selection without checkpoint performs no IO");
+		ArtifactDescriptor descriptor;
+		{ auto app = prepare(journal, payload), bundle = prepare(journal, "bundle"); descriptor = app.descriptor(); journal.publish_checkpoint(bundle, std::array{app}, 1); }
+		auto inode = model.visible.at(artifact_name(descriptor));
+		if (legacy) { inode->visible = detail::artifact_header_v1(journal.frontier().identity, descriptor) + payload; inode->durable = inode->visible; }
+		before = model.operations; auto selection = journal.select_published_dependency(0);
+		check(selection && selection->descriptor() == descriptor && selection->checkpoint() == *journal.frontier().checkpoint && selection->base_sequence() == 1 && !journal.select_published_dependency(1) && model.operations == before, "selection binds complete current publication without IO");
+		journal.append_batch("ordinary"); std::size_t reads = 0;
+		model.observe_read = [&](const Inode* source, auto offset, auto count) { if (source == inode.get() && offset + count > (legacy ? detail::artifact_v1_header_size : detail::artifact_header_size)) { ++reads; } };
+		auto verifier = journal.begin_published_verification(*selection);
+		check(verifier && reads == 0, "ordinary append preserves selection and opening reads only fixed metadata");
+		model.chunk = 3; std::array<char, 65536> buffer{}; std::string actual;
+		if (!payload.empty()) { check(throws([&] { auto reader = std::move(*verifier).finish(); }) && !journal.fenced(), "published premature promotion is a healthy caller error"); }
+		while (verifier->offset() < descriptor.length) {
+			before = model.operations; auto count = verifier->read_next(buffer);
+			check(count > 0 && count <= 65536 && model.operations == before + 1, "published verification makes one bounded partial payload read"); actual.append(buffer.data(), count);
+		}
+		before = model.operations; auto reader = std::move(*verifier).finish();
+		check(actual == payload && model.operations == before, "published verification promotes both formats without IO");
+		auto app = journal.pin_artifact(descriptor), next_bundle = prepare(journal, "next"); journal.publish_checkpoint(next_bundle, std::array{app}, 2);
+		before = model.operations;
+		check(!journal.begin_published_verification(*selection) && model.operations == before && !journal.fenced(), "replacement invalidates selection even when dependency is reused");
+	} }
+	{
+		auto model = initialized(); MemoryIO io(model); Journal journal(io, 1024); journal.recover([](auto, auto) {});
+		{ auto app = prepare(journal, "app"), bundle = prepare(journal, "bundle"); journal.publish_checkpoint(bundle, std::array{app}, 1); }
+		auto selection = journal.select_published_dependency(0); auto artifact = journal.pin_artifact(selection->descriptor());
+		auto staged = journal.begin_artifact_verification(artifact); std::vector<ArtifactVerifier> handles;
+		for (unsigned i = 0; i < 8; ++i) { auto handle = journal.begin_published_verification(*selection); handles.push_back(std::move(*handle)); }
+		auto before = model.operations;
+		check(!journal.begin_published_verification(*selection) && !journal.begin_artifact_verification(artifact) && model.operations == before && !journal.fenced(), "staged and published verification share nine slots before IO");
+		Model other_model; MemoryIO other_io(other_model); Journal other(other_io, 1024); other.create(identity());
+		{ auto app = prepare(other, "app"), bundle = prepare(other, "bundle"); other.publish_checkpoint(bundle, std::array{app}, 0); }
+		auto foreign = other.select_published_dependency(0); before = model.operations;
+		check(throws([&] { journal.begin_published_verification(*foreign); }) && model.operations == before && !journal.fenced(), "foreign selection rejects before shared verification pressure and IO");
+		std::array<char, 8> buffer{}; handles.back().read_next(buffer); std::optional<ArtifactReader> reader(std::move(handles.back()).finish()); handles.pop_back();
+		check(!journal.begin_published_verification(*selection), "promoted published reader retains its verification slot");
+		auto moved = std::move(handles.back()); handles.pop_back(); check(!journal.begin_published_verification(*selection), "moving published verifier retains its slot");
+		reader.reset(); check(journal.begin_published_verification(*selection).has_value(), "closing published reader releases its verification slot");
+		staged.reset(); handles.clear(); auto fresh = journal.begin_published_verification(*selection); moved = std::move(*fresh);
+		std::vector<PreparedArtifact> prepared; for (unsigned i = 1; i < 9; ++i) { prepared.push_back(journal.pin_artifact(selection->descriptor())); }
+		check(throws([&] { journal.pin_artifact(selection->descriptor()); }) && journal.begin_published_verification(*selection).has_value(), "published open does not consume an exhausted prepared-artifact slot");
+		auto copied = *selection; auto moved_selection = std::move(copied); before = model.operations;
+		check(throws([&] { journal.begin_published_verification(copied); }) && model.operations == before && !journal.fenced(), "moved selection rejects before IO without fencing");
+		check(journal.begin_published_verification(moved_selection).has_value(), "moved-to selection preserves session provenance");
+	}
+}
+
+void store_published_selection() {
+	Model model; MemoryIO io(model); std::optional<PublishedArtifactSelection> escaped;
+	{
+		Store store(io, store_limits, 1024); store.create(identity()); ready_store(store);
+		auto replacement = store.reserve_replacement(128, 128); store_replacement(store, *replacement);
+		escaped = store.select_published_dependency(0); auto selected = *escaped; auto old_name = artifact_name(selected.descriptor()); auto before = store.accounting()->used;
+		auto verifier = store.begin_published_verification(selected);
+		check(store.accounting()->used == before && store.accounting()->outstanding == StorageResources{}, "published opening reserves no Replacement bytes or tickets");
+		replacement = store.reserve_replacement(128, 128); store_replacement(store, *replacement);
+		while (!store.reclaim_step(1).complete) {}
+		check(model.visible.contains(old_name), "published verifier pins old dependency after replacement and reclamation");
+		std::array<char, 8> buffer{}; verifier->read_next(buffer); std::optional<ArtifactReader> reader(std::move(*verifier).finish()); verifier.reset();
+		while (!store.reclaim_step(1).complete) {}
+		check(model.visible.contains(old_name) && read_artifact(*reader) == "app", "promoted published reader retains old dependency pin");
+		before = store.accounting()->used; reader.reset(); while (!store.reclaim_step(1).complete) {}
+		check(!model.visible.contains(old_name) && store.accounting()->used.logical_bytes + 71 == before.logical_bytes, "selection alone does not pin and durable GC credits the exact old file"); store_exact(model, store);
+		escaped = store.select_published_dependency(0);
+	}
+	check(!model.locked, "escaped publication selection does not retain the owner lock");
+	{
+		Store store(io, store_limits, 1024); store.recover([](auto, auto) {}, [](auto&, auto&, auto) {}); ready_store(store); auto before = model.operations;
+		check(throws([&] { store.begin_published_verification(*escaped); }) && model.operations == before && !store.fenced(), "old selection rejects against identical recovered publication without IO");
+		auto fresh = store.select_published_dependency(0); check(store.begin_published_verification(*fresh).has_value(), "reopened Store creates a new usable selection");
+	}
+	for (bool after : {false, true}) { for (unsigned fault = 1; fault <= 5; ++fault) {
+		Model failed; MemoryIO backend(failed); Store owned(backend, store_limits, 1024); owned.create(identity()); ready_store(owned);
+		auto id = owned.reserve_replacement(128, 128); store_replacement(owned, *id); auto selected = owned.select_published_dependency(0);
+		failed.fail_operation = failed.operations + fault; failed.fail_after = after;
+		check(throws([&] { auto verifier = owned.begin_published_verification(*selected); std::array<char, 8> buffer{}; verifier->read_next(buffer); auto reader = std::move(*verifier).finish(); }) && owned.fenced(), "published metadata and payload IO faults fence Store before and after effects");
+	} }
+	for (bool header : {false, true}) {
+		Model failed; MemoryIO backend(failed); Store owned(backend, store_limits, 1024); owned.create(identity()); ready_store(owned);
+		auto id = owned.reserve_replacement(128, 128); store_replacement(owned, *id); auto selected = owned.select_published_dependency(0);
+		auto& bytes = failed.visible.at(artifact_name(selected->descriptor()))->visible; bytes[header ? 0 : bytes.size() - 1] ^= 1;
+		check(throws([&] { auto verifier = owned.begin_published_verification(*selected); std::array<char, 8> buffer{}; verifier->read_next(buffer); auto reader = std::move(*verifier).finish(); }) && owned.fenced(), "published header and CRC corruption fence shared owner");
+	}
+}
+
 void store_posix() {
 	auto directory = std::filesystem::current_path() / ".scratch" / ("store-test-" + std::to_string(::getpid()));
 	if (!std::filesystem::create_directory(directory)) { throw std::runtime_error("Store test directory exists"); } ::chmod(directory.c_str(), 0700);
 	struct Cleanup { std::filesystem::path path; ~Cleanup() { std::filesystem::remove_all(path); } } cleanup{directory};
+	std::optional<PublishedArtifactSelection> old_selection;
 	{
 		PosixIO io(directory); Store store(io, store_limits, 1024); store.create(identity()); ready_store(store);
 		auto append = store.reserve_append(AdmissionClass::Normal, 5); store.append(*append, "first");
@@ -775,11 +866,22 @@ void store_posix() {
 		while (!store.reclaim_step(1).complete) {}
 		Inventory census(io); while (!census.step(1).complete) {}
 		check(store.accounting()->used == StorageResources{census.stats().logical_bytes, census.stats().entries}, "real POSIX Store accounts for publication cancellation and cleanup exactly");
+		old_selection = store.select_published_dependency(0);
 	}
 	{
 		PosixIO io(directory); Store store(io, store_limits, 1024); std::string bundle, application;
 		store.recover([](auto, auto) {}, [&](auto&, auto& reader, auto deps) { bundle = read_artifact(reader); application = read_artifact(deps[0]); }); ready_store(store);
 		check(bundle == "bundle" && application == "app" && store.frontier().sequence == 1, "actual POSIX Store reopens acknowledged replacement");
+		check(throws([&] { store.begin_published_verification(*old_selection); }) && !store.fenced(), "POSIX reopen rejects previous selection while acquiring the stable lock");
+		auto selected = store.select_published_dependency(0); auto source_name = artifact_name(selected->descriptor()); auto source = store.begin_published_verification(*selected);
+		auto newer = store.reserve_replacement(128, 128); store_replacement(store, *newer);
+		while (!store.reclaim_step(1).complete) {}
+		check(std::filesystem::exists(directory / source_name), "POSIX published verifier pins old dependency across replacement");
+		std::array<char, 3> published_buffer{}; source->read_next(published_buffer); auto published_reader = std::move(*source).finish(); source.reset();
+		check(read_artifact(published_reader) == "app", "POSIX published verifier promotes exact old image");
+		{ auto released = std::move(published_reader); }
+		while (!store.reclaim_step(1).complete) {}
+		check(!std::filesystem::exists(directory / source_name), "POSIX published pin release permits durable old-file reclamation");
 		auto id = store.reserve_replacement(128, 128); store.begin_artifact(*id, ArtifactPart::Application); store.write_chunk(*id, "verified POSIX image"); auto descriptor = store.finish_artifact(*id);
 		auto verifier = store.begin_artifact_verification(*id, ArtifactPart::Application); store.cancel_replacement(*id);
 		while (!store.reclaim_step(1).complete) {}
@@ -1083,7 +1185,7 @@ void posix() {
 } // namespace
 
 int main() {
-	try { basics(); append_failures(); append_failures(3); append_failures(std::numeric_limits<std::size_t>::max(), true); append_failures(3, true); recovery_failures(); recovery_failures(true); recovery_failures(false, true); recovery_failures(true, true); corruption(); initialization_failures(); checkpoint_basics(); checkpoint_successive_generations(); incremental_artifact_verification(); store_incremental_verification(); artifact_verification(); preparation_ownership_and_failures(); checkpoint_publication_failures(); checkpoint_corruption(); reclamation_roots_and_unknowns(); reclamation_failures(); durable_staging_ownership(); mixed_artifact_formats(); footprint_plans(); store_basics(); store_failures(); store_append_and_cleanup_failures(); store_limits_and_pins(); store_posix(); posix(); }
+	try { basics(); append_failures(); append_failures(3); append_failures(std::numeric_limits<std::size_t>::max(), true); append_failures(3, true); recovery_failures(); recovery_failures(true); recovery_failures(false, true); recovery_failures(true, true); corruption(); initialization_failures(); checkpoint_basics(); checkpoint_successive_generations(); incremental_artifact_verification(); store_incremental_verification(); published_artifact_selection(); store_published_selection(); artifact_verification(); preparation_ownership_and_failures(); checkpoint_publication_failures(); checkpoint_corruption(); reclamation_roots_and_unknowns(); reclamation_failures(); durable_staging_ownership(); mixed_artifact_formats(); footprint_plans(); store_basics(); store_failures(); store_append_and_cleanup_failures(); store_limits_and_pins(); store_posix(); posix(); }
 	catch (const std::exception& error) { check(false, error.what()); }
 	std::cout << checks << " journal checks, " << failures << " failures\n";
 	return failures ? 1 : 0;

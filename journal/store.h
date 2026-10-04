@@ -159,6 +159,14 @@ public:
 		try { return journal_.begin_artifact_verification(*operation.prepared[index]); }
 		catch (...) { if (journal_.fenced()) { fence(); } throw; }
 	}
+	std::optional<PublishedArtifactSelection> select_published_dependency(std::size_t index) const {
+		ready(); return journal_.select_published_dependency(index);
+	}
+	std::optional<ArtifactVerifier> begin_published_verification(const PublishedArtifactSelection& selection) {
+		ready();
+		try { return journal_.begin_published_verification(selection); }
+		catch (...) { if (journal_.fenced()) { fence(); } throw; }
+	}
 	void verify_artifact(const ReplacementId& id, ArtifactPart part) {
 		auto& operation = replacement(id); auto index = part_index(part);
 		if (!operation.prepared[index]) { throw std::logic_error("artifact not sealed"); }

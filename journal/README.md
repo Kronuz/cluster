@@ -175,3 +175,14 @@ Artifact version 2 adds one file synchronization per preparation before payload 
 | 67,108,864 | 0.766365 | 0.671041 | 0.062841 | 0.001165 |
 
 The preceding version 1 artifact samples took 0.077054 and 0.706718 seconds preparing and verifying the same workloads. These individual runs expose the additional barrier cost but do not isolate it statistically. Publication remains approximately 63 ms in these samples. The format adds 12 header bytes per artifact, does not duplicate payloads, and does not change the checkpoint encoder. Reproduce with `checkpoint_bench`; no power or hosting-cost conversion is available.
+
+
+## Selecting published dependencies
+
+`Journal` and `Store` expose `select_published_dependency(index)` and `begin_published_verification(selection)`. A selection binds the storage session and a fixed-size publication stamp: storage identity, generation, journal identity, checkpoint base sequence/descriptor and dependency index/descriptor. It performs no IO, consumes no preparation or verification slot and pins no artifact. Its weak session provenance does not retain the stable storage lock. Const accessors expose the dependency, checkpoint, base sequence and generation.
+
+Selection returns no value when no checkpoint or that dependency exists. Opening first rejects expired, moved or foreign session provenance without IO or fencing. A stale publication or exhausted shared nine-verifier capacity returns no value. Ordinary appends preserve the selection because their mutable sequence and offset are excluded; checkpoint replacement invalidates it even when it reuses the same dependency.
+
+Opening validates fixed artifact metadata without scanning the payload, using the existing incremental verifier directly without a prepared-artifact slot. Each bounded `read_next()` makes at most one backend call. Complete checksum verification precedes IO-free promotion. The verifier and promoted reader pin the selected immutable artifact across later publication and reclamation. Opening consumes no Replacement reservation: existing bytes stay charged, and obsolete bytes are credited only after the final pin closes and durable reclamation succeeds. IO or corruption fences the shared storage owner; routine unavailability and caller errors leave it healthy.
+
+This is a local storage capability. It neither establishes a Raft application boundary nor authenticates a transfer. The Worker source adapter must separately bind its completed compacted boundary to the selected publication. All operations remain on the owning executor, and IO must outlive escaped verifier/readers.

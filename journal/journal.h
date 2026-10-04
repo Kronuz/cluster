@@ -23,6 +23,31 @@ struct Frontier {
 	std::vector<ArtifactDescriptor> dependencies;
 };
 
+// A session-bound publication selection, not a file pin or durable identifier.
+class PublishedArtifactSelection {
+public:
+	PublishedArtifactSelection(const PublishedArtifactSelection&) = default;
+	PublishedArtifactSelection& operator=(const PublishedArtifactSelection&) = default;
+	PublishedArtifactSelection(PublishedArtifactSelection&&) noexcept = default;
+	PublishedArtifactSelection& operator=(PublishedArtifactSelection&&) noexcept = default;
+	const ArtifactDescriptor& descriptor() const noexcept { return dependency_; }
+	const ArtifactDescriptor& checkpoint() const noexcept { return checkpoint_; }
+	std::uint64_t base_sequence() const noexcept { return base_sequence_; }
+	std::uint64_t generation() const noexcept { return generation_; }
+private:
+	friend class Journal;
+	PublishedArtifactSelection(const Frontier& publication, std::size_t index, const std::shared_ptr<detail::OwnerSession>& owner)
+		: owner_(owner), identity_(publication.identity), journal_identity_(publication.journal_identity),
+		generation_(publication.generation), base_sequence_(publication.base_sequence), checkpoint_(*publication.checkpoint),
+		index_(index), dependency_(publication.dependencies[index]) {}
+	std::weak_ptr<detail::OwnerSession> owner_;
+	Identity identity_, journal_identity_;
+	std::uint64_t generation_, base_sequence_;
+	ArtifactDescriptor checkpoint_;
+	std::size_t index_;
+	ArtifactDescriptor dependency_;
+};
+
 struct ReclaimStats {
 	std::size_t scanned = 0, removed = 0, protected_files = 0, unknown_files = 0;
 	std::uint64_t logical_bytes = 0;
@@ -116,6 +141,26 @@ public:
 		if (owner_->verification_handles >= detail::maximum_verification_handles) { return std::nullopt; }
 		auto lease = std::make_shared<detail::VerificationLease>(owner_);
 		try { return ArtifactVerifier(io_, owner_, frontier_.identity, artifact.descriptor(), std::move(lease)); }
+		catch (...) { owner_->failed = true; throw; }
+	}
+
+	std::optional<PublishedArtifactSelection> select_published_dependency(std::size_t index) const {
+		available();
+		if (!frontier_.checkpoint || index >= frontier_.dependencies.size()) { return std::nullopt; }
+		return PublishedArtifactSelection(frontier_, index, owner_);
+	}
+	std::optional<ArtifactVerifier> begin_published_verification(const PublishedArtifactSelection& selection) {
+		available();
+		if (selection.owner_.lock() != owner_) { throw std::invalid_argument("foreign, expired or moved publication selection"); }
+		if (selection.identity_ != frontier_.identity || selection.generation_ != frontier_.generation ||
+			selection.journal_identity_ != frontier_.journal_identity || selection.base_sequence_ != frontier_.base_sequence ||
+			!frontier_.checkpoint || selection.checkpoint_ != *frontier_.checkpoint ||
+			selection.index_ >= frontier_.dependencies.size() || selection.dependency_ != frontier_.dependencies[selection.index_]) {
+			return std::nullopt;
+		}
+		if (owner_->verification_handles >= detail::maximum_verification_handles) { return std::nullopt; }
+		auto lease = std::make_shared<detail::VerificationLease>(owner_);
+		try { return ArtifactVerifier(io_, owner_, frontier_.identity, selection.dependency_, std::move(lease)); }
 		catch (...) { owner_->failed = true; throw; }
 	}
 
