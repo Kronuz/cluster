@@ -55,13 +55,15 @@ void actual_reads(const std::filesystem::path& parent) {
 	{ auto builder = journal->prepare_artifact();
 	for (std::size_t offset = 0; offset < payload.size();) { auto count = std::min(std::size_t{65536}, payload.size() - offset); builder.append_chunk(std::string_view(payload).substr(offset, count)); offset += count; }
 	artifact.emplace(builder.finish()); }
-	auto verifier = journal->begin_artifact_verification(*artifact); BsdCompletionQueue queue; std::string candidate;
+	BsdCompletionQueue queue; auto opening = *journal->begin_artifact_open(*artifact); drive(queue, opening);
+	std::optional<ArtifactVerifier> verifier(opening->take_verifier()); opening.reset(); auto metadata = queue.stats(); std::string candidate;
+	check(metadata.native_completed >= 2 && metadata.file_read_bytes == 8 + detail::artifact_header_size && metadata.fallback_completed == 2, "actual metadata opening uses native bounded header reads and reserved open/size fallback");
 	while (verifier->offset() < payload.size()) {
 		auto operation = verifier->begin_read_next(65536); auto offset = verifier->offset(); drive(queue, operation);
 		check(verifier->offset() == offset, "native read reaping cannot skip explicit checksum settlement");
 		auto bytes = operation->result(); candidate.append(bytes.data(), bytes.size()); verifier->finish_read_next(operation);
 	}
-	auto stats = queue.stats(); check(stats.native_completed >= 3 && stats.native_completed == stats.native_submitted && stats.file_read_bytes == payload.size() && stats.fallback_submitted == 0, "actual payload verification uses exact reaped native read bytes without fallback");
+	auto stats = queue.stats(); check(stats.native_completed - metadata.native_completed >= 3 && stats.native_completed == stats.native_submitted && stats.file_read_bytes - metadata.file_read_bytes == payload.size() && stats.fallback_submitted == metadata.fallback_submitted, "actual payload verification uses exact reaped native read bytes without fallback");
 	check(candidate == payload, "native verification returns exact multi-chunk payload");
 	std::optional<ArtifactReader> reader(std::move(*verifier).finish()); verifier.reset(); artifact.reset();
 	auto operation = reader->begin_read_at(0, 65536); queue.submit(operation); reader.reset(); journal.reset(); io.reset();

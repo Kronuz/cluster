@@ -359,6 +359,112 @@ private:
 	bool done_ = false, in_flight_ = false, gated_ = false;
 };
 
+class ArtifactReader;
+// Pin and reserve all capabilities before metadata IO. Opening never reads
+// payload bytes and never turns a candidate into verified application state.
+class ArtifactOpen final : public IOOperation {
+public:
+	ArtifactOpen(const ArtifactOpen&) = delete;
+	ArtifactOpen& operator=(const ArtifactOpen&) = delete;
+	~ArtifactOpen() override { if (in_flight_) { std::terminate(); } }
+	const MutationRequest& request() const override {
+		if (done()) { throw std::logic_error("artifact metadata open has completed"); } return request_;
+	}
+	void submitted() override {
+		if (done() || in_flight_ || owner_->failed) { throw std::logic_error("artifact metadata submission unavailable"); } in_flight_ = true;
+	}
+	bool complete(MutationCompletion completion) noexcept override {
+		if (!in_flight_ || completion.token != request_.token) { return false; }
+		in_flight_ = false;
+		try {
+			if (owner_->failed) { throw std::logic_error("artifact owner fenced during metadata open"); }
+			if (completion.error) { std::rethrow_exception(completion.error); }
+			switch (phase_) {
+			case Phase::Open:
+				if (!completion.file) { throw std::runtime_error("artifact open returned no file"); }
+				file_ = std::move(completion.file); phase_ = Phase::Magic; break;
+			case Phase::Magic:
+			case Phase::Header: {
+				auto limit = phase_ == Phase::Magic ? std::size_t{8} : payload_offset_;
+				if (!completion.count || completion.count > limit - written_) { throw Corruption("artifact metadata read made invalid progress"); }
+				written_ += completion.count;
+				if (written_ == limit) {
+					if (phase_ == Phase::Magic) {
+						std::string_view bytes(raw_.data(), 8); auto magic = get64(bytes);
+						if (magic != detail::artifact_magic && magic != detail::artifact_v2_magic) { throw Corruption("unsupported artifact format"); }
+						payload_offset_ = magic == detail::artifact_magic ? detail::artifact_v1_header_size : detail::artifact_header_size;
+						phase_ = Phase::Size; written_ = 0;
+					} else {
+						auto& expected = payload_offset_ == detail::artifact_v1_header_size ? expected_v1_ : expected_v2_;
+						if (std::string_view(raw_.data(), payload_offset_) != expected) { throw Corruption("artifact header mismatch"); }
+						phase_ = Phase::Done;
+					}
+				}
+				break;
+			}
+			case Phase::Size:
+				if (completion.length != payload_offset_ + descriptor_.length) { throw Corruption("artifact size mismatch"); }
+				phase_ = Phase::Header; break;
+			case Phase::Done: break;
+			}
+			if (!done()) { ++request_.token.step; refresh(); }
+		} catch (...) { error_ = std::current_exception(); owner_->failed = true; }
+		return true;
+	}
+	bool done() const noexcept override { return error_ || phase_ == Phase::Done; }
+	bool in_flight() const noexcept override { return in_flight_; }
+	IO& io() const noexcept override { return *io_; }
+	void result() const {
+		if (!done()) { throw std::logic_error("artifact metadata open has not completed"); }
+		if (error_) { std::rethrow_exception(error_); }
+	}
+	ArtifactVerifier take_verifier();
+private:
+	friend class Journal;
+	friend class ArtifactReader;
+	ArtifactOpen(IO& io, std::shared_ptr<detail::OwnerSession> owner, Identity storage, ArtifactDescriptor descriptor,
+		std::shared_ptr<detail::VerificationLease> verification, bool asynchronous)
+		: owner_(std::move(owner)), verification_(std::move(verification)), descriptor_(descriptor), name_(artifact_name(descriptor)),
+		  expected_v1_(detail::artifact_header_v1(storage, descriptor)), expected_v2_(detail::artifact_header(storage, descriptor)) {
+		if (owner_->failed) { throw std::logic_error("artifact metadata owner fenced"); }
+		if (asynchronous && !owner_->io_lifetime) { throw std::logic_error("completion metadata open requires owned IO"); }
+		if (descriptor.length > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()) - detail::artifact_header_size) { throw std::length_error("artifact metadata length exceeds offset bound"); }
+		if (owner_->mutation_sequence == std::numeric_limits<std::uint64_t>::max()) { throw std::overflow_error("IO operation token exhausted"); }
+		io_ = owner_->io_lifetime ? owner_->io_lifetime : std::shared_ptr<IO>(&io, [](IO*) {});
+		pin_ = std::make_shared<detail::ArtifactPin>(owner_, descriptor.identity);
+		request_.token = {owner_->mutation_identity, ++owner_->mutation_sequence, 0}; refresh();
+	}
+	ArtifactReader take_reader();
+	void refresh() {
+		auto token = request_.token; request_ = {}; request_.token = token;
+		if (phase_ == Phase::Open) { request_.kind = PrimitiveKind::Open; request_.source = name_; }
+		else {
+			request_.file = file_;
+			if (phase_ == Phase::Size) { request_.kind = PrimitiveKind::Size; }
+			else {
+				request_.kind = PrimitiveKind::Read; request_.offset = written_;
+				auto limit = phase_ == Phase::Magic ? std::size_t{8} : payload_offset_;
+				request_.destination_bytes = std::span<char>(raw_).subspan(written_, limit - written_);
+			}
+		}
+	}
+	enum class Phase { Open, Magic, Size, Header, Done };
+	std::shared_ptr<detail::OwnerSession> owner_;
+	std::shared_ptr<IO> io_;
+	std::shared_ptr<detail::ArtifactPin> pin_;
+	std::shared_ptr<detail::VerificationLease> verification_;
+	std::shared_ptr<File> file_;
+	std::shared_ptr<bool> pending_ = std::make_shared<bool>(false);
+	ArtifactDescriptor descriptor_;
+	std::string name_, expected_v1_, expected_v2_;
+	std::array<char, detail::artifact_header_size> raw_{};
+	MutationRequest request_;
+	std::exception_ptr error_;
+	std::size_t written_ = 0, payload_offset_ = 0;
+	Phase phase_ = Phase::Open;
+	bool in_flight_ = false, taken_ = false;
+};
+
 class ArtifactReader {
 public:
 	ArtifactReader(ArtifactReader&&) noexcept = default;
@@ -380,6 +486,7 @@ public:
 private:
 	friend class Journal;
 	friend class ArtifactVerifier;
+	friend class ArtifactOpen;
 	std::shared_ptr<ArtifactRead> start_read(std::uint64_t offset, std::size_t count, bool asynchronous, std::span<char> borrowed = {}) {
 		if (!owner_ || !file_ || owner_->failed) { throw std::logic_error("artifact owner fenced or reader moved"); }
 		if (count > detail::artifact_chunk_size || offset > descriptor_.length || count > descriptor_.length - offset) {
@@ -398,20 +505,18 @@ private:
 		}
 		if (checksum.value() != descriptor.checksum) { throw Corruption("artifact payload checksum mismatch"); }
 	}
-	// Header-only construction is private to the incremental verifier.
+	// The synchronous header path drives the same metadata operation.
 	ArtifactReader(IO& io, std::shared_ptr<detail::OwnerSession> owner, Identity storage, ArtifactDescriptor descriptor,
 		std::shared_ptr<detail::VerificationLease> verification)
-		: owner_(std::move(owner)), verification_(std::move(verification)), file_(io.open_existing(artifact_name(descriptor))), io_(&io), descriptor_(descriptor) {
-		std::array<char, 8> magic_bytes{}; detail::read_all(*file_, 0, magic_bytes);
-		std::string_view magic_view(magic_bytes.data(), magic_bytes.size()); auto magic = get64(magic_view);
-		if (magic != detail::artifact_magic && magic != detail::artifact_v2_magic) { throw Corruption("unsupported artifact format"); }
-		payload_offset_ = magic == detail::artifact_magic ? detail::artifact_v1_header_size : detail::artifact_header_size;
-		if (file_->size() != payload_offset_ + descriptor.length) { throw Corruption("artifact size mismatch"); }
-		std::array<char, detail::artifact_header_size> header{}; detail::read_all(*file_, 0, std::span<char>(header.data(), payload_offset_));
-		auto expected = magic == detail::artifact_magic ? detail::artifact_header_v1(storage, descriptor) : detail::artifact_header(storage, descriptor);
-		if (std::string_view(header.data(), payload_offset_) != expected) { throw Corruption("artifact header mismatch"); }
-		pin_ = std::make_shared<detail::ArtifactPin>(owner_, descriptor.identity);
+		: ArtifactReader(open_synchronously(io, std::move(owner), storage, descriptor, std::move(verification))) {}
+	static ArtifactReader open_synchronously(IO& io, std::shared_ptr<detail::OwnerSession> owner, Identity storage,
+		ArtifactDescriptor descriptor, std::shared_ptr<detail::VerificationLease> verification) {
+		auto operation = std::shared_ptr<ArtifactOpen>(new ArtifactOpen(io, std::move(owner), storage, descriptor, std::move(verification), false));
+		drive_synchronously(*operation); return operation->take_reader();
 	}
+	explicit ArtifactReader(ArtifactOpen& operation)
+		: owner_(operation.owner_), pin_(operation.pin_), verification_(operation.verification_), file_(operation.file_), pending_(operation.pending_), io_(operation.io_.get()), descriptor_(operation.descriptor_), payload_offset_(operation.payload_offset_) {}
+
 	std::shared_ptr<detail::OwnerSession> owner_;
 	std::shared_ptr<detail::ArtifactPin> pin_;
 	std::shared_ptr<detail::VerificationLease> verification_;
@@ -453,6 +558,8 @@ public:
 	}
 private:
 	friend class Journal;
+	friend class ArtifactOpen;
+	explicit ArtifactVerifier(ArtifactReader reader) : reader_(std::move(reader)) {}
 	ArtifactVerifier(IO& io, std::shared_ptr<detail::OwnerSession> owner, Identity storage, ArtifactDescriptor descriptor,
 		std::shared_ptr<detail::VerificationLease> verification)
 		: reader_(io, std::move(owner), storage, descriptor, std::move(verification)) {}
@@ -471,4 +578,10 @@ private:
 	Checksum checksum_;
 	std::uint64_t offset_ = 0;
 };
+inline ArtifactReader ArtifactOpen::take_reader() {
+	result(); if (taken_) { throw std::logic_error("artifact metadata capability already consumed"); }
+	if (owner_->failed) { throw std::logic_error("artifact metadata owner fenced before consumption"); }
+	ArtifactReader reader(*this); taken_ = true; return reader;
+}
+inline ArtifactVerifier ArtifactOpen::take_verifier() { return ArtifactVerifier(take_reader()); }
 } // namespace kronuz::journal

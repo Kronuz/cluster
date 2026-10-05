@@ -411,6 +411,14 @@ public:
 		try { return journal_->begin_published_verification(selection); }
 		catch (...) { if (journal_->fenced()) { fence(); } throw; }
 	}
+	std::optional<std::shared_ptr<ArtifactOpen>> begin_verification_open(const ReplacementId& id, ArtifactPart part) {
+		auto& operation = replacement(id); auto index = part_index(part);
+		if (!operation.prepared[index]) { throw std::invalid_argument("unfinished artifact part"); }
+		return journal_->begin_artifact_open(*operation.prepared[index]);
+	}
+	std::optional<std::shared_ptr<ArtifactOpen>> begin_published_open(const PublishedArtifactSelection& selection) {
+		ready(); return journal_->begin_published_open(selection);
+	}
 	void verify_artifact(const ReplacementId& id, ArtifactPart part) {
 		auto& operation = replacement(id); auto index = part_index(part);
 		if (!operation.prepared[index]) { throw std::logic_error("artifact not sealed"); }

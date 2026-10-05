@@ -842,6 +842,38 @@ void store_limits_and_pins() {
 	Store store(io, store_limits, 1024); store.recover([](auto, auto) {}, [](auto&, auto&, auto) {}); ready_store(store);
 	check(throws([&] { store.append(*foreign_append, "x"); }) && throws([&] { store.begin_artifact(*foreign_replacement, ArtifactPart::Application); }) && !store.fenced(), "foreign Store capabilities reject before mutation without fencing");
 }
+void suspended_artifact_open() {
+	for (bool legacy : {false, true}) { for (auto chunk : {std::size_t{3}, std::numeric_limits<std::size_t>::max()}) {
+		auto model = initialized(); auto io = std::make_shared<MemoryIO>(model); Journal journal(io, 1024); journal.recover([](auto, auto) {});
+		std::optional<PreparedArtifact> artifact(prepare(journal, "candidate")); auto descriptor = artifact->descriptor(); auto inode = model.visible.at(artifact_name(descriptor));
+		auto header = legacy ? detail::artifact_v1_header_size : detail::artifact_header_size;
+		if (legacy) { inode->visible = detail::artifact_header_v1(journal.frontier().identity, descriptor) + "candidate"; inode->durable = inode->visible; }
+		model.chunk = chunk; std::size_t payload_reads = 0; model.observe_read = [&](const Inode* source, auto offset, auto count) { if (source == inode.get() && offset + count > header) { ++payload_reads; } };
+		auto before = model.operations; auto operation = *journal.begin_artifact_open(*artifact);
+		check(model.operations == before && throws([&] { operation->take_verifier(); }) && !journal.fenced(), "metadata capability capture has no IO or premature verifier result");
+		artifact.reset(); journal.reclaim_step(4096); check(model.visible.contains(artifact_name(descriptor)), "pre-open metadata pin protects exact artifact after preparation interest disappears");
+		while (!operation->done()) {
+			operation->submitted(); auto completed = detail::execute_primitive(operation->io(), operation->request());
+			check(throws([&] { operation->take_verifier(); }) && !journal.fenced(), "executed metadata cannot produce a verifier before original reap");
+			MutationCompletion stale; stale.token = operation->request().token; ++stale.token.step;
+			check(!operation->complete(std::move(stale)) && operation->in_flight(), "stale metadata callback cannot release original primitive");
+			check(operation->complete(std::move(completed)), "original metadata callback advances bounded open states");
+		}
+		auto verifier = operation->take_verifier(); check(payload_reads == 0 && verifier.offset() == 0 && throws([&] { operation->take_verifier(); }), "metadata result is single-consumption and reads no payload bytes");
+		operation.reset(); std::array<char, 64> buffer{};
+		while (verifier.offset() < descriptor.length) { verifier.read_next(buffer); }
+		auto reader = std::move(verifier).finish(); check(read_artifact(reader) == "candidate", "both artifact formats promote from the same suspended metadata algorithm");
+	} }
+	{
+		auto model = initialized(); auto io = std::make_shared<MemoryIO>(model); auto journal = std::make_unique<Journal>(io, 1024); journal->recover([](auto, auto) {});
+		std::weak_ptr<MemoryIO> backend = io; std::optional<PreparedArtifact> artifact(prepare(*journal, "candidate")); auto operation = *journal->begin_artifact_open(*artifact); operation->submitted();
+		artifact.reset(); journal.reset(); io.reset(); check(!backend.expired() && model.locked, "accepted metadata open retains backend and owner lock after facade retirement");
+		auto completed = detail::execute_primitive(operation->io(), operation->request()); operation->complete(std::move(completed)); drive_synchronously(*operation);
+		{ auto verifier = operation->take_verifier(); std::array<char, 64> buffer{}; while (verifier.offset() < verifier.descriptor().length) { verifier.read_next(buffer); } auto reader = std::move(verifier).finish(); check(read_artifact(reader) == "candidate", "retired metadata owner can still produce and promote its exact verifier"); }
+		operation.reset(); check(backend.expired() && !model.locked, "final metadata capability release retires backend and owner lock together");
+	}
+}
+
 void suspended_artifact_reads() {
 	for (auto chunk : {std::size_t{3}, std::size_t{65536}}) {
 		auto model = initialized(); auto io = std::make_shared<MemoryIO>(model); Journal journal(io, 1024); journal.recover([](auto, auto) {});
@@ -1611,7 +1643,7 @@ void posix() {
 } // namespace
 
 int main() {
-	try { basics(); append_failures(); append_failures(3); append_failures(std::numeric_limits<std::size_t>::max(), true); append_failures(3, true); append_failures(std::numeric_limits<std::size_t>::max(), false, true); append_failures(3, false, true); append_failures(std::numeric_limits<std::size_t>::max(), true, true); append_failures(3, true, true); suspended_artifact_operations(); suspended_artifact_ownership(); suspended_append_ownership(); fenced_append_submission(); suspended_append_retirement(); recovery_failures(); recovery_failures(true); recovery_failures(false, true); recovery_failures(true, true); corruption(); initialization_failures(); checkpoint_basics(); checkpoint_successive_generations(); suspended_artifact_reads(); incremental_artifact_verification(); store_incremental_verification(); published_artifact_selection(); store_published_selection(); artifact_verification(); preparation_ownership_and_failures(); checkpoint_publication_failures(); checkpoint_publication_failures(3); checkpoint_publication_failures(std::numeric_limits<std::size_t>::max(), true); checkpoint_publication_failures(3, true); checkpoint_corruption(); reclamation_roots_and_unknowns(); reclamation_failures(); durable_staging_ownership(); mixed_artifact_formats(); footprint_plans(); checkpoint_publication_retirement(); store_publication_completions(); store_artifact_completions(); detached_old_artifact_lease(); store_append_completions(); store_basics(); store_failures(); store_append_and_cleanup_failures(); store_limits_and_pins(); store_posix(); posix(); }
+	try { basics(); append_failures(); append_failures(3); append_failures(std::numeric_limits<std::size_t>::max(), true); append_failures(3, true); append_failures(std::numeric_limits<std::size_t>::max(), false, true); append_failures(3, false, true); append_failures(std::numeric_limits<std::size_t>::max(), true, true); append_failures(3, true, true); suspended_artifact_operations(); suspended_artifact_ownership(); suspended_append_ownership(); fenced_append_submission(); suspended_append_retirement(); recovery_failures(); recovery_failures(true); recovery_failures(false, true); recovery_failures(true, true); corruption(); initialization_failures(); checkpoint_basics(); checkpoint_successive_generations(); suspended_artifact_open(); suspended_artifact_reads(); incremental_artifact_verification(); store_incremental_verification(); published_artifact_selection(); store_published_selection(); artifact_verification(); preparation_ownership_and_failures(); checkpoint_publication_failures(); checkpoint_publication_failures(3); checkpoint_publication_failures(std::numeric_limits<std::size_t>::max(), true); checkpoint_publication_failures(3, true); checkpoint_corruption(); reclamation_roots_and_unknowns(); reclamation_failures(); durable_staging_ownership(); mixed_artifact_formats(); footprint_plans(); checkpoint_publication_retirement(); store_publication_completions(); store_artifact_completions(); detached_old_artifact_lease(); store_append_completions(); store_basics(); store_failures(); store_append_and_cleanup_failures(); store_limits_and_pins(); store_posix(); posix(); }
 	catch (const std::exception& error) { check(false, error.what()); }
 	std::cout << checks << " journal checks, " << failures << " failures\n";
 	return failures ? 1 : 0;

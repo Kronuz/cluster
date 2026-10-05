@@ -148,14 +148,10 @@ public:
 
 
 	std::optional<ArtifactVerifier> begin_artifact_verification(const PreparedArtifact& artifact) {
-		available();
-		if (!artifact.lease_ || artifact.lease_->owner != owner_) { throw std::invalid_argument("foreign or moved artifact preparation"); }
-		validate_artifact_bound(artifact.descriptor());
-		if (owner_->verification_handles >= detail::maximum_verification_handles) { return std::nullopt; }
-		auto lease = std::make_shared<detail::VerificationLease>(owner_);
-		try { return ArtifactVerifier(io_, owner_, frontier_.identity, artifact.descriptor(), std::move(lease)); }
-		catch (...) { owner_->failed = true; throw; }
+		auto operation = start_artifact_open(artifact, false); if (!operation) { return std::nullopt; }
+		drive_synchronously(**operation); return (*operation)->take_verifier();
 	}
+	std::optional<std::shared_ptr<ArtifactOpen>> begin_artifact_open(const PreparedArtifact& artifact) { return start_artifact_open(artifact, true); }
 
 	std::optional<PublishedArtifactSelection> select_published_dependency(std::size_t index) const {
 		available();
@@ -163,19 +159,10 @@ public:
 		return PublishedArtifactSelection(frontier_, index, owner_);
 	}
 	std::optional<ArtifactVerifier> begin_published_verification(const PublishedArtifactSelection& selection) {
-		available();
-		if (selection.owner_.lock() != owner_) { throw std::invalid_argument("foreign, expired or moved publication selection"); }
-		if (selection.identity_ != frontier_.identity || selection.generation_ != frontier_.generation ||
-			selection.journal_identity_ != frontier_.journal_identity || selection.base_sequence_ != frontier_.base_sequence ||
-			!frontier_.checkpoint || selection.checkpoint_ != *frontier_.checkpoint ||
-			selection.index_ >= frontier_.dependencies.size() || selection.dependency_ != frontier_.dependencies[selection.index_]) {
-			return std::nullopt;
-		}
-		if (owner_->verification_handles >= detail::maximum_verification_handles) { return std::nullopt; }
-		auto lease = std::make_shared<detail::VerificationLease>(owner_);
-		try { return ArtifactVerifier(io_, owner_, frontier_.identity, selection.dependency_, std::move(lease)); }
-		catch (...) { owner_->failed = true; throw; }
+		auto operation = start_published_open(selection, false); if (!operation) { return std::nullopt; }
+		drive_synchronously(**operation); return (*operation)->take_verifier();
 	}
+	std::optional<std::shared_ptr<ArtifactOpen>> begin_published_open(const PublishedArtifactSelection& selection) { return start_published_open(selection, true); }
 
 	void verify_artifact(const PreparedArtifact& artifact) {
 		available();
@@ -424,6 +411,31 @@ private:
 	static constexpr std::size_t manifest_size = 52, file_header_size = 28, batch_header_size = 24;
 	static constexpr std::size_t manifest_v2_size = 108, file_header_v2_size = 60, maximum_dependencies = 8;
 	static constexpr std::size_t maximum_manifest_size = manifest_v2_size + maximum_dependencies * 28;
+	std::optional<std::shared_ptr<ArtifactOpen>> start_artifact_open(const PreparedArtifact& artifact, bool asynchronous) {
+		available();
+		if (!artifact.lease_ || artifact.lease_->owner != owner_) { throw std::invalid_argument("foreign or moved artifact preparation"); }
+		validate_artifact_bound(artifact.descriptor());
+		if (owner_->verification_handles >= detail::maximum_verification_handles) { return std::nullopt; }
+		if (asynchronous && !owner_->io_lifetime) { throw std::logic_error("completion metadata open requires owned IO"); }
+		auto lease = std::make_shared<detail::VerificationLease>(owner_);
+		return std::shared_ptr<ArtifactOpen>(new ArtifactOpen(io_, owner_, frontier_.identity, artifact.descriptor(), std::move(lease), asynchronous));
+	}
+	std::optional<std::shared_ptr<ArtifactOpen>> start_published_open(const PublishedArtifactSelection& selection, bool asynchronous) {
+		available();
+		if (selection.owner_.lock() != owner_) { throw std::invalid_argument("foreign, expired or moved publication selection"); }
+		if (selection.identity_ != frontier_.identity || selection.generation_ != frontier_.generation ||
+			selection.journal_identity_ != frontier_.journal_identity || selection.base_sequence_ != frontier_.base_sequence ||
+			!frontier_.checkpoint || selection.checkpoint_ != *frontier_.checkpoint ||
+			selection.index_ >= frontier_.dependencies.size() || selection.dependency_ != frontier_.dependencies[selection.index_]) {
+			return std::nullopt;
+		}
+		if (owner_->verification_handles >= detail::maximum_verification_handles) { return std::nullopt; }
+		if (asynchronous && !owner_->io_lifetime) { throw std::logic_error("completion metadata open requires owned IO"); }
+		validate_artifact_bound(selection.dependency_);
+		auto lease = std::make_shared<detail::VerificationLease>(owner_);
+		return std::shared_ptr<ArtifactOpen>(new ArtifactOpen(io_, owner_, frontier_.identity, selection.dependency_, std::move(lease), asynchronous));
+	}
+
 	static constexpr std::uint64_t maximum_offset = std::numeric_limits<std::int64_t>::max();
 
 	static bool hexadecimal_name(std::string_view name, std::string_view prefix, std::size_t digits) {
