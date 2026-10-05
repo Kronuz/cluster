@@ -1263,6 +1263,31 @@ void suspended_append_ownership() {
 	check(replay(model) == std::vector<std::string>({"first", "second"}), "owner disappearance does not interrupt accepted durable sequencing");
 }
 
+void fenced_append_submission() {
+	for (bool started : {false, true}) {
+		auto model = initialized();
+		{
+			auto io = std::make_shared<MemoryIO>(model); Journal journal(io, 1024); journal.recover([](auto, auto) {});
+			auto operation = journal.begin_append("second");
+			if (started) { operation->submitted(); operation->complete(detail::execute_primitive(operation->io(), operation->request())); }
+			journal.fence_storage(); auto before = model.operations; bool rejected = false;
+			try { operation->submitted(); } catch (const std::exception&) { rejected = true; }
+			// Reap a pre-correction accepted primitive instead of dropping in-flight IO.
+			if (!rejected) { operation->complete(detail::execute_primitive(operation->io(), operation->request())); }
+			check(rejected && model.operations == before && !operation->in_flight(), "fencing blocks new append primitives both before submission and between reaped steps");
+		}
+		check(replay(model) == std::vector<std::string>{"first"}, "rejected fenced submission preserves acknowledged history");
+	}
+	auto model = initialized();
+	{
+		auto io = std::make_shared<MemoryIO>(model); Journal journal(io, 1024); journal.recover([](auto, auto) {});
+		auto operation = journal.begin_append("second"); operation->submitted();
+		auto original = detail::execute_primitive(operation->io(), operation->request()); journal.fence_storage(); auto before = model.operations;
+		check(operation->complete(std::move(original)) && operation->done() && !operation->in_flight() && throws([&] { operation->result(); }) && model.operations == before, "fencing still reaps the original accepted primitive without executing a later step");
+	}
+	check(replay(model) == std::vector<std::string>{"first"}, "original reaping after fencing cannot acknowledge interrupted append");
+}
+
 void suspended_append_retirement() {
 	auto model = initialized(); auto io = std::make_shared<MemoryIO>(model); Journal journal(io, 1024);
 	journal.recover([](auto, auto) {});
@@ -1457,7 +1482,7 @@ void posix() {
 } // namespace
 
 int main() {
-	try { basics(); append_failures(); append_failures(3); append_failures(std::numeric_limits<std::size_t>::max(), true); append_failures(3, true); append_failures(std::numeric_limits<std::size_t>::max(), false, true); append_failures(3, false, true); append_failures(std::numeric_limits<std::size_t>::max(), true, true); append_failures(3, true, true); suspended_artifact_operations(); suspended_artifact_ownership(); suspended_append_ownership(); suspended_append_retirement(); recovery_failures(); recovery_failures(true); recovery_failures(false, true); recovery_failures(true, true); corruption(); initialization_failures(); checkpoint_basics(); checkpoint_successive_generations(); incremental_artifact_verification(); store_incremental_verification(); published_artifact_selection(); store_published_selection(); artifact_verification(); preparation_ownership_and_failures(); checkpoint_publication_failures(); checkpoint_corruption(); reclamation_roots_and_unknowns(); reclamation_failures(); durable_staging_ownership(); mixed_artifact_formats(); footprint_plans(); store_artifact_completions(); detached_old_artifact_lease(); store_append_completions(); store_basics(); store_failures(); store_append_and_cleanup_failures(); store_limits_and_pins(); store_posix(); posix(); }
+	try { basics(); append_failures(); append_failures(3); append_failures(std::numeric_limits<std::size_t>::max(), true); append_failures(3, true); append_failures(std::numeric_limits<std::size_t>::max(), false, true); append_failures(3, false, true); append_failures(std::numeric_limits<std::size_t>::max(), true, true); append_failures(3, true, true); suspended_artifact_operations(); suspended_artifact_ownership(); suspended_append_ownership(); fenced_append_submission(); suspended_append_retirement(); recovery_failures(); recovery_failures(true); recovery_failures(false, true); recovery_failures(true, true); corruption(); initialization_failures(); checkpoint_basics(); checkpoint_successive_generations(); incremental_artifact_verification(); store_incremental_verification(); published_artifact_selection(); store_published_selection(); artifact_verification(); preparation_ownership_and_failures(); checkpoint_publication_failures(); checkpoint_corruption(); reclamation_roots_and_unknowns(); reclamation_failures(); durable_staging_ownership(); mixed_artifact_formats(); footprint_plans(); store_artifact_completions(); detached_old_artifact_lease(); store_append_completions(); store_basics(); store_failures(); store_append_and_cleanup_failures(); store_limits_and_pins(); store_posix(); posix(); }
 	catch (const std::exception& error) { check(false, error.what()); }
 	std::cout << checks << " journal checks, " << failures << " failures\n";
 	return failures ? 1 : 0;

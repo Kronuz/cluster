@@ -116,7 +116,7 @@ class AppendMutation : public IOOperation {
 		return request_;
 	}
 	void submitted() override {
-		if (in_flight_ || done()) {
+		if (in_flight_ || done() || owner_->failed) {
 			throw std::logic_error("append submission is not available");
 		}
 		started_ = in_flight_ = true;
