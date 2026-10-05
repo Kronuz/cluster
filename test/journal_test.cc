@@ -327,26 +327,51 @@ void preparation_ownership_and_failures() {
 	}
 }
 
-void checkpoint_publication_failures() {
-	auto baseline = initialized(); std::size_t operations;
+void checkpoint_publication_failures(std::size_t chunk = std::numeric_limits<std::size_t>::max(), bool suspended = false) {
+	auto publish = [&](Journal& journal, const PreparedArtifact& bundle, std::span<const PreparedArtifact> dependencies) {
+		if (!suspended) { return journal.publish_checkpoint(bundle, dependencies, 1); }
+		auto job = journal.begin_checkpoint(bundle, dependencies, 1);
+		while (!job->done()) {
+			job->submitted(); auto completed = detail::execute_primitive(job->io(), job->request());
+			check(journal.frontier().generation == 1 && throws([&] { job->result(); }), "executed checkpoint primitive cannot expose selected generation before original completion");
+			MutationCompletion stale; stale.token = completed.token; ++stale.token.operation;
+			check(!job->complete(std::move(stale)) && job->in_flight(), "stale publication completion retains original primitive");
+			auto token = completed.token; check(job->complete(std::move(completed)), "matching publication primitive reaped");
+			MutationCompletion repeated; repeated.token = token; check(!job->complete(std::move(repeated)), "duplicate publication completion cannot advance another phase");
+		}
+		job->result(); check(journal.frontier().generation == 1, "final publication barrier still requires explicit owner settlement");
+		return journal.finish_checkpoint(job);
+	};
+	auto baseline = initialized(); baseline.chunk = chunk; std::size_t operations;
 	{
-		auto complete = baseline.clone(); MemoryIO io(complete); Journal journal(io, 1024); journal.recover([](auto, auto) {});
+		auto complete = baseline.clone(); auto io = std::make_shared<MemoryIO>(complete); Journal journal(io, 1024); journal.recover([](auto, auto) {});
 		auto bundle = prepare(journal, "first"); std::array dependencies{prepare(journal, "application")};
-		complete.operations = 0; journal.publish_checkpoint(bundle, dependencies, 1); operations = complete.operations;
+		complete.operations = 0; publish(journal, bundle, dependencies); operations = complete.operations;
 	}
 	for (std::size_t operation = 1; operation <= operations; ++operation) {
 		for (bool after : {false, true}) {
 			auto failed = baseline.clone();
 			{
-				MemoryIO io(failed); Journal journal(io, 1024); journal.recover([](auto, auto) {});
+				auto io = std::make_shared<MemoryIO>(failed); Journal journal(io, 1024); journal.recover([](auto, auto) {});
 				auto bundle = prepare(journal, "first"); std::array dependencies{prepare(journal, "application")};
 				failed.operations = 0; failed.fail_operation = operation; failed.fail_after = after;
-				check(throws([&] { journal.publish_checkpoint(bundle, dependencies, 1); }) && journal.fenced(), "uncertain generation publication fences writer");
+				check(throws([&] { publish(journal, bundle, dependencies); }) && journal.fenced(), "uncertain generation publication fences writer");
 				check(throws([&] { journal.append_batch("after failure"); }), "ambiguous publication cannot resume old generation");
+			}
+			std::optional<Model> reference;
+			if (suspended) {
+				reference = baseline.clone(); MemoryIO io(*reference); Journal journal(io, 1024); journal.recover([](auto, auto) {});
+				auto bundle = prepare(journal, "first"); std::array dependencies{prepare(journal, "application")};
+				reference->operations = 0; reference->fail_operation = operation; reference->fail_after = after;
+				check(throws([&] { journal.publish_checkpoint(bundle, dependencies, 1); }) && journal.fenced(), "synchronous publication receives identical injected fault");
 			}
 			for (bool visible : {false, true}) {
 				auto crashed = failed.clone(); crashed.power_loss(visible);
 				auto [frontier, batches] = replay_checkpoint(crashed);
+				if (reference) {
+					auto comparison = reference->clone(); comparison.power_loss(visible); auto [selected, values] = replay_checkpoint(comparison);
+					check(selected.generation == frontier.generation && values == batches, "both publication drivers recover identical generation and history under identical faults");
+				}
 				check(batches == std::vector<std::string>{"first"} && frontier.sequence == 1, "either recovered generation preserves covered history");
 				if (operation == operations && after) { check(frontier.generation == 2, "completed generation directory barrier survives reported failure"); }
 			}
@@ -541,6 +566,68 @@ void store_replacement(Store& store, const ReplacementId& replacement) {
 	store.begin_artifact(replacement, ArtifactPart::Bundle); store.write_chunk(replacement, "bundle"); store.finish_artifact(replacement);
 	store.publish(replacement, store.frontier().sequence);
 }
+void checkpoint_publication_retirement() {
+	for (bool terminal : {false, true}) {
+		auto model = initialized();
+		{
+			auto io = std::make_shared<MemoryIO>(model); Journal journal(io, 1024); journal.recover([](auto, auto) {});
+			auto bundle = prepare(journal, "first"); std::array dependencies{prepare(journal, "application")};
+			{
+				auto canceled = journal.begin_checkpoint(bundle, dependencies, 1); auto before = model.operations;
+				check(throws([&] { journal.append_batch("overlap"); }) && !journal.fenced() && model.operations == before, "unsubmitted publication exclusively owns mutation gate before IO");
+			}
+			check(!journal.fenced() && journal.frontier().generation == 1, "unsubmitted checkpoint cancellation leaves old facade usable");
+			{
+				auto dropped = journal.begin_checkpoint(bundle, dependencies, 1);
+				if (terminal) { drive_synchronously(*dropped); dropped->result(); }
+				else { dropped->submitted(); dropped->complete(detail::execute_primitive(dropped->io(), dropped->request())); }
+			}
+			check(journal.fenced(), "discarding a started publication without frontier settlement fences stale metadata");
+		}
+		auto [frontier, values] = replay_checkpoint(model);
+		check(values == std::vector<std::string>{"first"} && frontier.generation == (terminal ? 2 : 1), "retired unsettled publication recovers the physically selected acknowledged history");
+	}
+}
+
+void store_publication_completions() {
+	for (bool detached : {false, true}) {
+		for (bool uncertain : {false, true}) {
+			auto model = initialized(); auto io = std::make_shared<MemoryIO>(model);
+			AdmissionLimits limits{{10000, 128}, {2048, 4}, {4096, 4}, 16, 3}; auto store = std::make_unique<Store>(io, limits, 1024);
+			store->recover([](auto, auto) {}); store->inventory_step(128); auto id = store->reserve_replacement(128, 128);
+			store->begin_artifact(*id, ArtifactPart::Application); store->write_chunk(*id, "application"); store->finish_artifact(*id);
+			store->begin_artifact(*id, ArtifactPart::Bundle); store->write_chunk(*id, "first"); store->finish_artifact(*id);
+			auto job = store->begin_publication(*id, 1); auto used = store->accounting()->used; auto outstanding = store->accounting()->outstanding;
+			job->submitted(); auto original = detail::execute_primitive(job->io(), job->request());
+			auto before = model.operations;
+			check(store->frontier().generation == 1 && store->accounting()->used == used && store->accounting()->outstanding == outstanding && throws([&] { store->cancel_replacement(*id); }) && model.operations == before, "held publication owns the whole cycle and exposes only the previous frontier");
+			if (uncertain) { original.error = std::make_exception_ptr(std::runtime_error("injected publication uncertainty")); }
+			if (detached) { store.reset(); io.reset(); check(model.locked, "detached publication retains storage and accounting ownership"); }
+			check(job->complete(std::move(original)), "original publication primitive reaped after possible facade retirement");
+			while (!job->done()) {
+				job->submitted(); auto completion = detail::execute_primitive(job->io(), job->request());
+				check(throws([&] { job->result(); }), "publication result remains hidden before owner applies original final barrier");
+				if (store) { check(store->frontier().generation == 1 && store->accounting()->outstanding == outstanding, "every publication primitive retains old frontier and full reservation until terminal settlement"); }
+				check(job->complete(std::move(completion)), "publication owner applies matching primitive");
+			}
+			if (uncertain) {
+				check(throws([&] { job->result(); }), "uncertain detached publication preserves storage failure");
+				if (store) { check(store->fenced() && store->accounting()->tainted && store->accounting()->outstanding == outstanding, "uncertain publication retains conservative whole-cycle capacity"); }
+			} else {
+				check(job->result().generation == 2 && job->result().sequence == 1, "publication reaches selected durable generation despite facade retirement");
+				if (store) {
+					check(store->frontier().generation == 2 && !store->accounting()->tainted && store->accounting()->outstanding == StorageResources{}, "owner terminal publication atomically selects frontier and settles reservation");
+					check(throws([&] { store->cancel_replacement(*id); }), "published cycle capability becomes stale");
+					auto next = store->reserve_replacement(128, 128); check(bool(next), "completed async publication permits a fresh replacement cycle"); if (next) { store->cancel_replacement(*next); }
+				}
+			}
+			job.reset(); store.reset(); io.reset(); check(!model.locked, "publication drain releases backend and stable lock");
+			model.fail_operation = 0; auto [frontier, values] = replay_checkpoint(model);
+			check(values == std::vector<std::string>{"first"} && frontier.generation == (uncertain ? 1 : 2), "detached publication recovers selected history rather than becoming canceled preparation");
+		}
+	}
+}
+
 void store_artifact_completions() {
 	for (unsigned phase = 0; phase < 3; ++phase) {
 		for (bool detached : {false, true}) {
@@ -1482,7 +1569,7 @@ void posix() {
 } // namespace
 
 int main() {
-	try { basics(); append_failures(); append_failures(3); append_failures(std::numeric_limits<std::size_t>::max(), true); append_failures(3, true); append_failures(std::numeric_limits<std::size_t>::max(), false, true); append_failures(3, false, true); append_failures(std::numeric_limits<std::size_t>::max(), true, true); append_failures(3, true, true); suspended_artifact_operations(); suspended_artifact_ownership(); suspended_append_ownership(); fenced_append_submission(); suspended_append_retirement(); recovery_failures(); recovery_failures(true); recovery_failures(false, true); recovery_failures(true, true); corruption(); initialization_failures(); checkpoint_basics(); checkpoint_successive_generations(); incremental_artifact_verification(); store_incremental_verification(); published_artifact_selection(); store_published_selection(); artifact_verification(); preparation_ownership_and_failures(); checkpoint_publication_failures(); checkpoint_corruption(); reclamation_roots_and_unknowns(); reclamation_failures(); durable_staging_ownership(); mixed_artifact_formats(); footprint_plans(); store_artifact_completions(); detached_old_artifact_lease(); store_append_completions(); store_basics(); store_failures(); store_append_and_cleanup_failures(); store_limits_and_pins(); store_posix(); posix(); }
+	try { basics(); append_failures(); append_failures(3); append_failures(std::numeric_limits<std::size_t>::max(), true); append_failures(3, true); append_failures(std::numeric_limits<std::size_t>::max(), false, true); append_failures(3, false, true); append_failures(std::numeric_limits<std::size_t>::max(), true, true); append_failures(3, true, true); suspended_artifact_operations(); suspended_artifact_ownership(); suspended_append_ownership(); fenced_append_submission(); suspended_append_retirement(); recovery_failures(); recovery_failures(true); recovery_failures(false, true); recovery_failures(true, true); corruption(); initialization_failures(); checkpoint_basics(); checkpoint_successive_generations(); incremental_artifact_verification(); store_incremental_verification(); published_artifact_selection(); store_published_selection(); artifact_verification(); preparation_ownership_and_failures(); checkpoint_publication_failures(); checkpoint_publication_failures(3); checkpoint_publication_failures(std::numeric_limits<std::size_t>::max(), true); checkpoint_publication_failures(3, true); checkpoint_corruption(); reclamation_roots_and_unknowns(); reclamation_failures(); durable_staging_ownership(); mixed_artifact_formats(); footprint_plans(); checkpoint_publication_retirement(); store_publication_completions(); store_artifact_completions(); detached_old_artifact_lease(); store_append_completions(); store_basics(); store_failures(); store_append_and_cleanup_failures(); store_limits_and_pins(); store_posix(); posix(); }
 	catch (const std::exception& error) { check(false, error.what()); }
 	std::cout << checks << " journal checks, " << failures << " failures\n";
 	return failures ? 1 : 0;

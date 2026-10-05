@@ -3,6 +3,7 @@
 #include "artifact.h"
 #include "operation.h"
 #include <exception>
+#include <vector>
 
 namespace kronuz::journal {
 
@@ -214,6 +215,94 @@ class AppendMutation : public IOOperation {
 	Phase phase_ = Phase::Header;
 	bool started_ = false, in_flight_ = false, active_ = true;
 	std::exception_ptr error_;
+};
+
+// Publication owns every prepared artifact and the new generation until its
+// final directory barrier is reaped and Journal settles the selected frontier.
+class CheckpointMutation final : public IOOperation {
+public:
+	CheckpointMutation(const CheckpointMutation&) = delete;
+	CheckpointMutation& operator=(const CheckpointMutation&) = delete;
+	~CheckpointMutation() override {
+		if (in_flight_) { std::terminate(); }
+		if (started_ && gated_) { owner_->failed = true; }
+		if (gated_) { owner_->mutation_active = false; }
+	}
+	const MutationRequest& request() const override {
+		if (done()) { throw std::logic_error("checkpoint publication has completed"); }
+		return request_;
+	}
+	void submitted() override {
+		if (in_flight_ || done() || owner_->failed) { throw std::logic_error("checkpoint submission unavailable"); }
+		started_ = in_flight_ = true;
+	}
+	bool complete(MutationCompletion completion) noexcept override {
+		if (!in_flight_ || completion.token != request_.token) { return false; }
+		in_flight_ = false;
+		try {
+			if (owner_->failed) { throw std::runtime_error("storage owner fenced during checkpoint publication"); }
+			if (completion.error) { std::rethrow_exception(completion.error); }
+			switch (phase_) {
+			case Phase::Create:
+				if (!completion.file) { throw std::runtime_error("generation create returned no file"); }
+				file_ = std::move(completion.file); phase_ = Phase::Header; break;
+			case Phase::Header:
+				if (!completion.count || completion.count > header_.size() - written_) { throw std::runtime_error("generation write made invalid progress"); }
+				written_ += completion.count;
+				if (written_ == header_.size()) { phase_ = Phase::Sync; }
+				break;
+			case Phase::Sync: phase_ = Phase::DirectorySync; break;
+			case Phase::DirectorySync: phase_ = Phase::Publication; break;
+			case Phase::Publication: publication_.complete(std::move(completion)); break;
+			}
+			if (!done()) { ++request_.token.step; refresh_request(); }
+		} catch (...) { error_ = std::current_exception(); owner_->failed = true; }
+		return true;
+	}
+	bool done() const noexcept override { return error_ || (phase_ == Phase::Publication && publication_.done()); }
+	bool in_flight() const noexcept override { return in_flight_; }
+	IO& io() const noexcept override { return *io_; }
+	void result() const {
+		if (!done() || in_flight_) { throw std::logic_error("checkpoint publication has not completed"); }
+		if (error_) { std::rethrow_exception(error_); }
+	}
+private:
+	friend class Journal;
+	CheckpointMutation(std::shared_ptr<IO> io, std::shared_ptr<detail::OwnerSession> owner,
+		std::string name, std::string header, std::string manifest, std::vector<PreparedArtifact> artifacts, MutationToken token)
+		: io_(std::move(io)), owner_(std::move(owner)), artifacts_(std::move(artifacts)), name_(std::move(name)), header_(std::move(header)), publication_(std::move(manifest)) {
+		request_.token = token; refresh_request(); owner_->mutation_active = true;
+	}
+	void settled() noexcept { owner_->mutation_active = false; gated_ = false; }
+	void refresh_request() {
+		auto token = request_.token;
+		if (phase_ == Phase::Publication) { request_ = publication_.request(); }
+		else {
+			request_ = {};
+			switch (phase_) {
+			case Phase::Create: request_.kind = PrimitiveKind::Create; request_.source = name_; break;
+			case Phase::Header:
+				request_.kind = PrimitiveKind::Write; request_.file = file_; request_.offset = written_;
+				request_.bytes = std::string_view(header_).substr(written_); break;
+			case Phase::Sync: request_.kind = PrimitiveKind::Sync; request_.file = file_; break;
+			case Phase::DirectorySync: request_.kind = PrimitiveKind::DirectorySync; break;
+			case Phase::Publication: break;
+			}
+		}
+		request_.token = token;
+	}
+	enum class Phase { Create, Header, Sync, DirectorySync, Publication };
+	std::shared_ptr<IO> io_;
+	std::shared_ptr<detail::OwnerSession> owner_;
+	std::vector<PreparedArtifact> artifacts_;
+	std::shared_ptr<File> file_;
+	std::string name_, header_;
+	detail::PublicationSteps publication_;
+	MutationRequest request_;
+	Phase phase_ = Phase::Create;
+	std::size_t written_ = 0;
+	std::exception_ptr error_;
+	bool started_ = false, in_flight_ = false, gated_ = true;
 };
 
 inline void drive_synchronously(AppendMutation &operation) {

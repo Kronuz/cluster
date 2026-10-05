@@ -360,6 +360,25 @@ private:
 	}
 public:
 	Frontier publish_checkpoint(const PreparedArtifact& checkpoint, std::span<const PreparedArtifact> dependencies, std::uint64_t covered_sequence) {
+		auto operation = start_checkpoint(checkpoint, dependencies, covered_sequence, false);
+		try { drive_synchronously(*operation); return finish_checkpoint(operation); }
+		catch (...) { fence_storage(); throw; }
+	}
+	std::shared_ptr<CheckpointMutation> begin_checkpoint(const PreparedArtifact& checkpoint, std::span<const PreparedArtifact> dependencies, std::uint64_t covered_sequence) {
+		return start_checkpoint(checkpoint, dependencies, covered_sequence, true);
+	}
+	Frontier finish_checkpoint(const std::shared_ptr<CheckpointMutation>& operation) {
+		available();
+		if (!operation || operation != checkpoint_operation_.lock() || !checkpoint_target_) { throw std::invalid_argument("foreign or settled checkpoint publication"); }
+		operation->result();
+		// Both metadata copies were allocated before submission. Terminal
+		// publication settlement moves them without allocating a return copy.
+		frontier_ = std::move(checkpoint_target_->selected); data_ = operation->file_;
+		auto result = std::move(checkpoint_target_->returned); checkpoint_target_.reset();
+		operation->settled(); checkpoint_operation_.reset(); return result;
+	}
+private:
+	std::shared_ptr<CheckpointMutation> start_checkpoint(const PreparedArtifact& checkpoint, std::span<const PreparedArtifact> dependencies, std::uint64_t covered_sequence, bool asynchronous) {
 		writable();
 		if (covered_sequence != frontier_.sequence || dependencies.size() > maximum_dependencies ||
 			!checkpoint.lease_ || checkpoint.lease_->owner != owner_ || frontier_.generation == std::numeric_limits<std::uint64_t>::max()) {
@@ -375,21 +394,18 @@ public:
 				}) != next.dependencies.end()) { throw std::invalid_argument("foreign or duplicate checkpoint dependency"); }
 			next.dependencies.push_back(dependency.descriptor());
 		}
-		try {
-			validate_artifact_bound(*next.checkpoint);
-			for (const auto& descriptor : next.dependencies) {
-				validate_artifact_bound(descriptor);
-			}
-			// Prepared capabilities prove successfully sealed immutable bytes.
-			// Optional readback belongs before freezing the consensus cutover;
-			// recovery always validates all referenced payloads.
-			auto fresh = io_.create_exclusive(data_name(next));
-			write_all(*fresh, 0, file_header(next)); fresh->sync();
-			// All artifact names are already sealed; establish the new journal
-			// before any manifest can refer to this immutable generation.
-			io_.sync_directory(); publish(next);
-			data_ = std::move(fresh); frontier_ = next; return frontier_;
-		} catch (...) { owner_->failed = true; ready_ = false; throw; }
+		if (asynchronous && !io_lifetime_) { throw std::logic_error("completion checkpoint publication requires owned IO"); }
+		if (owner_->mutation_sequence == std::numeric_limits<std::uint64_t>::max()) { throw std::overflow_error("storage operation sequence exhausted"); }
+		validate_artifact_bound(*next.checkpoint);
+		for (const auto& descriptor : next.dependencies) {
+			validate_artifact_bound(descriptor);
+		}
+		std::vector<PreparedArtifact> retained; retained.reserve(dependencies.size() + 1); retained.push_back(checkpoint);
+		for (const auto& dependency : dependencies) { retained.push_back(dependency); }
+		CheckpointTarget target{next, next};
+		auto backend = io_lifetime_ ? io_lifetime_ : std::shared_ptr<IO>(&io_, [](IO*) {});
+		auto operation = std::shared_ptr<CheckpointMutation>(new CheckpointMutation(std::move(backend), owner_, data_name(next), file_header(next), encode_manifest(next), std::move(retained), {owner_->mutation_identity, owner_->mutation_sequence + 1, 1}));
+		checkpoint_target_.emplace(std::move(target)); checkpoint_operation_ = operation; ++owner_->mutation_sequence; return operation;
 	}
 
 private:
@@ -573,6 +589,9 @@ private:
 	// Data closes before the stable owner lock is released.
 	std::shared_ptr<detail::OwnerSession> owner_ = std::make_shared<detail::OwnerSession>();
 	std::shared_ptr<File> data_;
+	struct CheckpointTarget { Frontier selected, returned; };
+	std::weak_ptr<CheckpointMutation> checkpoint_operation_;
+	std::optional<CheckpointTarget> checkpoint_target_;
 	std::weak_ptr<AppendMutation> append_operation_;
 	std::optional<Frontier> append_target_;
 	Frontier frontier_;

@@ -163,7 +163,8 @@ void admitted_artifacts(const std::filesystem::path& parent) {
 			check(seal->descriptor().length == bytes.size(), "native admitted artifact quantum publishes exact sealed phase");
 		}
 		check(store.accounting()->tickets == 1 && !store.accounting()->tainted, "native preparation keeps one whole-cycle reservation through both artifacts");
-		store.publish(*replacement, 0);
+		auto publication = store.begin_publication(*replacement, 0); drive(queue, publication);
+		check(publication->result().generation == 2, "native publication owns the complete generation and manifest protocol");
 		check(store.accounting()->tickets == 0 && store.accounting()->outstanding == StorageResources{}, "publication settles the admitted completion-prepared replacement");
 	}
 	PosixIO io(directory); Journal journal(io, 1024); bool restored = false;
@@ -173,6 +174,22 @@ void admitted_artifacts(const std::filesystem::path& parent) {
 		restored = bytes == std::string(60000, 'q');
 	});
 	check(restored, "native admitted preparation recovers exact application after publication");
+}
+void retired_publication(const std::filesystem::path& parent) {
+	auto directory = parent / "retired-publication"; std::filesystem::create_directory(directory); ::chmod(directory.c_str(), 0700);
+	auto io = std::make_shared<PosixIO>(directory); AdmissionLimits limits{{16u << 20, 256}, {1u << 20, 4}, {4u << 20, 4}, 64, 3};
+	auto store = std::make_unique<Store>(io, limits, 1024); Identity id{}; id[0] = 'P'; store->create(id); store->inventory_step(128);
+	auto replacement = store->reserve_replacement(128, 128);
+	for (auto part : {ArtifactPart::Application, ArtifactPart::Bundle}) { store->begin_artifact(*replacement, part); store->write_chunk(*replacement, part == ArtifactPart::Application ? "application" : "first"); store->finish_artifact(*replacement); }
+	BsdCompletionQueue queue; auto publication = store->begin_publication(*replacement, 0);
+	check(queue.submit(publication), "native publication accepted before facade retirement"); store.reset(); io.reset();
+	{ auto original = await_step(queue); check(publication->complete(std::move(original.completion)), "original native generation creation reaped after facade retirement"); }
+	drive(queue, publication); check(publication->result().generation == 2, "native detached publication finishes full protocol"); publication.reset();
+	PosixIO recovered(directory); Journal journal(recovered, 1024); bool restored = false;
+	journal.recover([](auto, auto) {}, [&](const Frontier& frontier, ArtifactReader& reader, std::span<ArtifactReader> dependencies) {
+		std::array<char, 5> bytes{}; reader.read_at(0, bytes); restored = frontier.generation == 2 && std::string_view(bytes.data(), bytes.size()) == "first" && dependencies.size() == 1;
+	});
+	check(restored, "native detached publication recovers full selected checkpoint instead of staged orphans");
 }
 void admitted_store(const std::filesystem::path& parent) {
 	auto directory = parent / "store"; std::filesystem::create_directory(directory); ::chmod(directory.c_str(), 0700);
@@ -215,6 +232,7 @@ int main() {
 		admitted_store(directory);
 		actual_artifacts(directory);
 		admitted_artifacts(directory);
+		retired_publication(directory);
 	} catch (const std::exception &error) {
 		check(false, error.what());
 	}

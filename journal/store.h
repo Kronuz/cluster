@@ -194,6 +194,56 @@ private:
 	bool started_ = false, finished_ = false;
 };
 
+// Publication remains irreversible after submission. Detached jobs finish
+// the complete frontier protocol; they never become canceled preparation.
+class StorePublication final : public IOOperation {
+public:
+	StorePublication(const StorePublication&) = delete;
+	StorePublication& operator=(const StorePublication&) = delete;
+	~StorePublication() override {
+		if (!finished_ && (started_ || lease_.cycle().detached)) { journal_->fence_storage(); lease_.cycle().permit->abandon(); }
+	}
+	const MutationRequest& request() const override { return operation_->request(); }
+	void submitted() override {
+		if (done() || in_flight()) { throw std::logic_error("publication primitive unavailable"); }
+		if (!started_) { lease_.cycle().permit->mark_started(); started_ = true; }
+		operation_->submitted();
+	}
+	bool complete(MutationCompletion completion) noexcept override {
+		if (!operation_->complete(std::move(completion))) { return false; }
+		if (operation_->done()) {
+			auto& cycle = lease_.cycle();
+			try {
+				operation_->result(); result_.emplace(journal_->finish_checkpoint(operation_));
+				cycle.permit->settle(plan_.added, plan_.removed); cycle.permit.reset();
+				cycle.builder.reset(); cycle.prepared[0].reset(); cycle.prepared[1].reset(); cycle.disposed = true;
+			} catch (...) { error_ = std::current_exception(); journal_->fence_storage(); cycle.permit->abandon(); }
+			finished_ = true; lease_.release();
+		}
+		return true;
+	}
+	bool done() const noexcept override { return finished_; }
+	bool in_flight() const noexcept override { return operation_->in_flight(); }
+	IO& io() const noexcept override { return operation_->io(); }
+	const Frontier& result() const {
+		if (!finished_) { throw std::logic_error("publication has not completed"); }
+		if (error_) { std::rethrow_exception(error_); }
+		return *result_;
+	}
+private:
+	friend class Store;
+	StorePublication(std::shared_ptr<Journal> journal, std::shared_ptr<detail::StoreReplacement> cycle,
+		std::shared_ptr<CheckpointMutation> operation, MutationPlan plan)
+		: journal_(std::move(journal)), operation_(std::move(operation)), lease_(std::move(cycle)), plan_(plan) {}
+	std::shared_ptr<Journal> journal_;
+	std::shared_ptr<CheckpointMutation> operation_;
+	detail::ReplacementJobLease lease_;
+	MutationPlan plan_;
+	std::optional<Frontier> result_;
+	std::exception_ptr error_;
+	bool started_ = false, finished_ = false;
+};
+
 // Single ordered storage executor. IO outlives Store and escaped readers and
 // is used EXCLUSIVELY through Store while its session is open. No mutable
 // Journal, artifact builder, or prepared handle escapes this boundary.
@@ -215,6 +265,7 @@ public:
 	Store& operator=(const Store&) = delete;
 	~Store() {
 		if (replacement_ && replacement_->active_job) { replacement_->detached = true; replacement_.reset(); }
+		if (replacement_ && replacement_->disposed) { replacement_.reset(); }
 		if (replacement_) {
 			try { cancel_replacement(ReplacementId(owner_, replacement_->token)); }
 			catch (...) { fence(); replacement_.reset(); }
@@ -287,7 +338,7 @@ public:
 		return start_append(std::move(reservation), bytes, true);
 	}
 	std::optional<ReplacementId> reserve_replacement(std::uint64_t application_cap, std::uint64_t bundle_cap) {
-		ready(); if (replacement_) { return std::nullopt; }
+		ready(); if (replacement_ && replacement_->disposed) { replacement_.reset(); } if (replacement_) { return std::nullopt; }
 		if (next_replacement_ == std::numeric_limits<std::uint64_t>::max()) { throw std::overflow_error("replacement token exhausted"); }
 		std::array<std::uint64_t, 2> caps{bundle_cap, application_cap};
 		auto permit = admission_->reserve(AdmissionClass::Replacement, journal_->checkpoint_plan(caps).peak);
@@ -366,16 +417,12 @@ public:
 		try { journal_->verify_artifact(*operation.prepared[index]); } catch (...) { fence(); throw; }
 	}
 	Frontier publish(const ReplacementId& id, std::uint64_t expected_sequence) {
-		mutation_ready();
-		auto& operation = replacement(id); auto current = journal_->frontier();
-		if (operation.builder || !operation.prepared[0] || !operation.prepared[1] || expected_sequence != current.sequence ||
-			current.generation == std::numeric_limits<std::uint64_t>::max()) { throw std::invalid_argument("unfinished or stale replacement"); }
-		std::array<std::uint64_t, 2> lengths{operation.lengths[1], operation.lengths[0]};
-		auto plan = journal_->checkpoint_plan(lengths);
-		try {
-			auto result = journal_->publish_checkpoint(*operation.prepared[1], std::span<const PreparedArtifact>(&*operation.prepared[0], 1), expected_sequence);
-			operation.permit->settle(plan.added, plan.removed); replacement_.reset(); return result;
-		} catch (...) { fence(); throw; }
+		auto operation = start_publication(id, expected_sequence, false);
+		try { drive_synchronously(*operation); auto result = operation->result(); replacement_.reset(); return result; }
+		catch (...) { fence(); throw; }
+	}
+	std::shared_ptr<StorePublication> begin_publication(const ReplacementId& id, std::uint64_t expected_sequence) {
+		return start_publication(id, expected_sequence, true);
 	}
 	void cancel_replacement(const ReplacementId& id) {
 		auto& operation = replacement(id); operation.dispose_known(*journal_); replacement_.reset();
@@ -404,6 +451,13 @@ private:
 		auto append = journal_->start_append(bytes, asynchronous);
 		return std::shared_ptr<StoreAppend>(new StoreAppend(journal_, std::move(append), std::move(reservation), plan));
 	}
+	std::shared_ptr<StorePublication> start_publication(const ReplacementId& id, std::uint64_t expected_sequence, bool asynchronous) {
+		mutation_ready(); auto& cycle = replacement(id); auto current = journal_->frontier();
+		if (cycle.builder || !cycle.prepared[0] || !cycle.prepared[1] || expected_sequence != current.sequence || current.generation == std::numeric_limits<std::uint64_t>::max()) { throw std::invalid_argument("unfinished or stale replacement"); }
+		std::array<std::uint64_t, 2> lengths{cycle.lengths[1], cycle.lengths[0]}; auto plan = journal_->checkpoint_plan(lengths);
+		auto publication = journal_->start_checkpoint(*cycle.prepared[1], std::span<const PreparedArtifact>(&*cycle.prepared[0], 1), expected_sequence, asynchronous);
+		return std::shared_ptr<StorePublication>(new StorePublication(journal_, replacement_, std::move(publication), plan));
+	}
 	using Replacement = detail::StoreReplacement;
 	static unsigned part_index(ArtifactPart part) {
 		if (part != ArtifactPart::Application && part != ArtifactPart::Bundle) { throw std::invalid_argument("invalid artifact part"); }
@@ -411,7 +465,7 @@ private:
 	}
 	Replacement& replacement(const ReplacementId& id) {
 		ready();
-		if (id.owner_ != owner_ || !replacement_ || id.token_ != replacement_->token) { throw std::invalid_argument("stale or foreign replacement"); }
+		if (id.owner_ != owner_ || !replacement_ || id.token_ != replacement_->token || replacement_->disposed) { throw std::invalid_argument("stale or foreign replacement"); }
 		if (replacement_->active_job) { throw std::logic_error("replacement quantum is pending"); }
 		return *replacement_;
 	}
