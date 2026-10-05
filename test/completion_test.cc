@@ -1,6 +1,7 @@
 #include "journal/bsd_completion.h"
 #include "journal/journal.h"
 #include "journal/store.h"
+#include <algorithm>
 #include <chrono>
 #include <filesystem>
 #include <iostream>
@@ -46,6 +47,33 @@ void drive(BsdCompletionQueue &queue, const std::shared_ptr<IOOperation> &operat
 			  "original token advances shared sequencing on owner");
 	}
 }
+void actual_reads(const std::filesystem::path& parent) {
+	auto directory = parent / "reads"; std::filesystem::create_directory(directory); ::chmod(directory.c_str(), 0700);
+	auto io = std::make_shared<PosixIO>(directory); std::weak_ptr<PosixIO> backend = io;
+	auto journal = std::make_unique<Journal>(io, 1024); Identity id{}; id[0] = 'r'; journal->create(id);
+	std::optional<PreparedArtifact> artifact; std::string payload(150000, 'r');
+	{ auto builder = journal->prepare_artifact();
+	for (std::size_t offset = 0; offset < payload.size();) { auto count = std::min(std::size_t{65536}, payload.size() - offset); builder.append_chunk(std::string_view(payload).substr(offset, count)); offset += count; }
+	artifact.emplace(builder.finish()); }
+	auto verifier = journal->begin_artifact_verification(*artifact); BsdCompletionQueue queue; std::string candidate;
+	while (verifier->offset() < payload.size()) {
+		auto operation = verifier->begin_read_next(65536); auto offset = verifier->offset(); drive(queue, operation);
+		check(verifier->offset() == offset, "native read reaping cannot skip explicit checksum settlement");
+		auto bytes = operation->result(); candidate.append(bytes.data(), bytes.size()); verifier->finish_read_next(operation);
+	}
+	auto stats = queue.stats(); check(stats.native_completed >= 3 && stats.native_completed == stats.native_submitted && stats.file_read_bytes == payload.size() && stats.fallback_submitted == 0, "actual payload verification uses exact reaped native read bytes without fallback");
+	check(candidate == payload, "native verification returns exact multi-chunk payload");
+	std::optional<ArtifactReader> reader(std::move(*verifier).finish()); verifier.reset(); artifact.reset();
+	auto operation = reader->begin_read_at(0, 65536); queue.submit(operation); reader.reset(); journal.reset(); io.reset();
+	check(!backend.expired(), "accepted read retains backend, exact file and pin after all facades disappear");
+	{
+		PosixIO other(directory); Journal contender(other); check(throws([&] { contender.recover([](auto, auto) {}); }), "outstanding read retains original stable owner lock");
+	}
+	auto completed = await_step(queue); check(operation->complete(std::move(completed.completion)), "retired reader still reaps original native completion");
+	auto bytes = operation->result(); check(bytes.size() == 65536 && std::all_of(bytes.begin(), bytes.end(), [](char value) { return value == 'r'; }), "owned read buffer survives interest cancellation and facade retirement");
+	operation.reset(); completed.operation.reset(); check(backend.expired(), "terminal read capability releases backend and owner lock together");
+}
+
 void actual_backend(const std::filesystem::path &directory) {
 	auto io = std::make_shared<PosixIO>(directory);
 	Journal journal(io, 1024 * 1024);
@@ -227,6 +255,7 @@ int main() {
 			throw std::runtime_error("completion test directory already exists");
 		}
 		::chmod(directory.c_str(), 0700);
+		actual_reads(directory);
 		actual_backend(directory);
 		owner_retirement(directory);
 		admitted_store(directory);

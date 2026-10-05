@@ -17,7 +17,7 @@ namespace kronuz::journal {
 struct CompletionStats {
 	std::uint64_t native_submitted = 0, native_completed = 0, native_rejected = 0;
 	std::uint64_t fallback_submitted = 0, fallback_completed = 0;
-	std::uint64_t file_write_bytes = 0;
+	std::uint64_t file_write_bytes = 0, file_read_bytes = 0;
 	std::uint64_t notification_errors = 0;
 };
 struct OwnedCompletion {
@@ -27,7 +27,7 @@ struct OwnedCompletion {
 
 // One funded primitive and one reserved completion slot. The owning executor
 // submits and polls; the fallback worker performs IO only, never state changes.
-// macOS uses native AIO writes with bounded owner-side completion polling.
+// macOS uses native AIO reads/writes with bounded owner-side completion polling.
 // FreeBSD also uses native aio_fsync and SIGEV_KEVENT notification.
 class BsdCompletionQueue {
   public:
@@ -87,7 +87,7 @@ class BsdCompletionQueue {
 		auto request = operation->request();
 		// Validate every native argument before marking this primitive submitted.
 		auto file = std::dynamic_pointer_cast<detail::PosixFile>(request.file);
-		bool native = file && request.kind == PrimitiveKind::Write;
+		bool native = file && (request.kind == PrimitiveKind::Write || request.kind == PrimitiveKind::Read);
 #ifdef __FreeBSD__
 		native = native || (file && request.kind == PrimitiveKind::Sync);
 #endif
@@ -95,8 +95,8 @@ class BsdCompletionQueue {
 			control_ = {};
 			control_.aio_fildes = file->native_handle();
 			control_.aio_offset = detail::checked_offset(request.offset);
-			control_.aio_buf = const_cast<char *>(request.bytes.data());
-			control_.aio_nbytes = request.bytes.size();
+			control_.aio_buf = request.kind == PrimitiveKind::Read ? request.destination_bytes.data() : const_cast<char *>(request.bytes.data());
+			control_.aio_nbytes = request.kind == PrimitiveKind::Read ? request.destination_bytes.size() : request.bytes.size();
 #ifdef __FreeBSD__
 			control_.aio_sigevent.sigev_notify = SIGEV_KEVENT;
 			control_.aio_sigevent.sigev_notify_kqueue = queue_;
@@ -111,8 +111,10 @@ class BsdCompletionQueue {
 		pending_ = operation;
 		request_ = std::move(request);
 		if (native) {
-			int result = request_.kind == PrimitiveKind::Write ? ::aio_write(&control_)
-															   : ::aio_fsync(O_SYNC, &control_);
+			int result;
+			if (request_.kind == PrimitiveKind::Read) { result = ::aio_read(&control_); }
+			else if (request_.kind == PrimitiveKind::Write) { result = ::aio_write(&control_); }
+			else { result = ::aio_fsync(O_SYNC, &control_); }
 			if (result == 0) {
 				native_pending_ = true;
 				++stats_.native_submitted;
@@ -171,6 +173,8 @@ class BsdCompletionQueue {
 		}
 		if (request_.kind == PrimitiveKind::Write) {
 			stats_.file_write_bytes += result_.count;
+		} else if (request_.kind == PrimitiveKind::Read) {
+			stats_.file_read_bytes += result_.count;
 		}
 		OwnedCompletion completed{std::move(pending_), std::move(result_)};
 		request_ = {};

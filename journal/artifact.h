@@ -7,6 +7,7 @@
 #include <map>
 #include <optional>
 #include <utility>
+#include <vector>
 
 namespace kronuz::journal {
 struct ArtifactDescriptor {
@@ -286,31 +287,106 @@ inline ArtifactBuilder ArtifactMutation::take_builder() {
 }
 
 class ArtifactVerifier;
+// Own the destination buffer and exact file/pin through original read reaping.
+// The private synchronous driver borrows its caller's destination.
+// One read per reader can be outstanding; a terminal old capability cannot
+// release a later read's slot.
+class ArtifactRead final : public IOOperation {
+public:
+	ArtifactRead(const ArtifactRead&) = delete;
+	ArtifactRead& operator=(const ArtifactRead&) = delete;
+	~ArtifactRead() override {
+		if (in_flight_) { std::terminate(); }
+		release();
+	}
+	const MutationRequest& request() const override {
+		if (done_) { throw std::logic_error("artifact read has completed"); }
+		return request_;
+	}
+	void submitted() override {
+		if (done_ || in_flight_ || owner_->failed) { throw std::logic_error("artifact read submission unavailable"); }
+		in_flight_ = true;
+	}
+	bool complete(MutationCompletion completion) noexcept override {
+		if (!in_flight_ || completion.token != request_.token) { return false; }
+		in_flight_ = false;
+		try {
+			if (owner_->failed) { throw std::logic_error("artifact owner fenced during read"); }
+			if (completion.error) { std::rethrow_exception(completion.error); }
+			if (!completion.count || completion.count > destination_.size()) { throw Corruption("artifact read made invalid progress"); }
+			count_ = completion.count;
+		} catch (...) { error_ = std::current_exception(); owner_->failed = true; }
+		done_ = true; release(); return true;
+	}
+	bool done() const noexcept override { return done_; }
+	bool in_flight() const noexcept override { return in_flight_; }
+	IO& io() const noexcept override { return *io_; }
+	std::span<const char> result() const {
+		if (!done_) { throw std::logic_error("artifact read has not completed"); }
+		if (error_) { std::rethrow_exception(error_); }
+		return std::span<const char>(destination_.data(), count_);
+	}
+private:
+	friend class ArtifactReader;
+	friend class ArtifactVerifier;
+	ArtifactRead(IO& io, std::shared_ptr<detail::OwnerSession> owner, std::shared_ptr<File> file,
+		std::shared_ptr<detail::ArtifactPin> pin, std::shared_ptr<detail::VerificationLease> verification,
+		std::shared_ptr<bool> pending, std::uint64_t offset, std::size_t count, bool asynchronous, std::span<char> borrowed)
+		: owner_(std::move(owner)), file_(std::move(file)), pin_(std::move(pin)), verification_(std::move(verification)), pending_(std::move(pending)), buffer_(asynchronous ? count : 0) {
+		if (!asynchronous && borrowed.size() < count) { throw std::length_error("synchronous read destination too small"); }
+		destination_ = asynchronous ? std::span<char>(buffer_) : borrowed.first(count);
+		if (asynchronous && !owner_->io_lifetime) { throw std::logic_error("completion reads require owned IO"); }
+		if (owner_->failed || *pending_) { throw std::logic_error("artifact read unavailable"); }
+		if (owner_->mutation_sequence == std::numeric_limits<std::uint64_t>::max()) { throw std::overflow_error("IO operation token exhausted"); }
+		io_ = owner_->io_lifetime ? owner_->io_lifetime : std::shared_ptr<IO>(&io, [](IO*) {});
+		request_.token = {owner_->mutation_identity, ++owner_->mutation_sequence, 0};
+		request_.kind = PrimitiveKind::Read; request_.file = file_; request_.offset = offset;
+		request_.destination_bytes = destination_; done_ = count == 0;
+		if (!done_) { *pending_ = gated_ = true; }
+	}
+	void release() noexcept { if (gated_) { *pending_ = false; gated_ = false; } }
+	std::shared_ptr<detail::OwnerSession> owner_;
+	std::shared_ptr<IO> io_;
+	std::shared_ptr<File> file_;
+	std::shared_ptr<detail::ArtifactPin> pin_;
+	std::shared_ptr<detail::VerificationLease> verification_;
+	std::shared_ptr<bool> pending_;
+	std::vector<char> buffer_;
+	std::span<char> destination_;
+	MutationRequest request_;
+	std::exception_ptr error_;
+	std::size_t count_ = 0;
+	bool done_ = false, in_flight_ = false, gated_ = false;
+};
+
 class ArtifactReader {
 public:
 	ArtifactReader(ArtifactReader&&) noexcept = default;
 	ArtifactReader& operator=(ArtifactReader&& other) noexcept {
 		if (this != &other) {
-			file_.reset(); pin_ = std::move(other.pin_); verification_ = std::move(other.verification_); owner_ = std::move(other.owner_); file_ = std::move(other.file_); descriptor_ = other.descriptor_; payload_offset_ = other.payload_offset_;
+			file_.reset(); pin_ = std::move(other.pin_); verification_ = std::move(other.verification_); owner_ = std::move(other.owner_); file_ = std::move(other.file_); pending_ = std::move(other.pending_); io_ = other.io_; descriptor_ = other.descriptor_; payload_offset_ = other.payload_offset_;
 		}
 		return *this;
 	}
 	const ArtifactDescriptor& descriptor() const noexcept { return descriptor_; }
 	std::size_t read_at(std::uint64_t offset, std::span<char> bytes) {
-		if (!owner_ || !file_ || owner_->failed) { throw std::logic_error("artifact owner fenced or reader moved"); }
-		if (bytes.size() > detail::artifact_chunk_size || offset > descriptor_.length || bytes.size() > descriptor_.length - offset) {
-			throw std::length_error("artifact read exceeds chunk or payload bound");
-		}
-		try {
-			auto count = file_->read_at(payload_offset_ + offset, bytes);
-			if ((!bytes.empty() && count == 0) || count > bytes.size()) { throw Corruption("artifact read made invalid progress"); }
-			return count;
-		}
-		catch (...) { owner_->failed = true; throw; }
+		auto operation = start_read(offset, bytes.size(), false, bytes);
+		drive_synchronously(*operation); auto result = operation->result();
+		return result.size();
+	}
+	std::shared_ptr<ArtifactRead> begin_read_at(std::uint64_t offset, std::size_t count) {
+		return start_read(offset, count, true);
 	}
 private:
 	friend class Journal;
 	friend class ArtifactVerifier;
+	std::shared_ptr<ArtifactRead> start_read(std::uint64_t offset, std::size_t count, bool asynchronous, std::span<char> borrowed = {}) {
+		if (!owner_ || !file_ || owner_->failed) { throw std::logic_error("artifact owner fenced or reader moved"); }
+		if (count > detail::artifact_chunk_size || offset > descriptor_.length || count > descriptor_.length - offset) {
+			throw std::length_error("artifact read exceeds chunk or payload bound");
+		}
+		return std::shared_ptr<ArtifactRead>(new ArtifactRead(*io_, owner_, file_, pin_, verification_, pending_, payload_offset_ + offset, count, asynchronous, borrowed));
+	}
 	ArtifactReader(IO& io, std::shared_ptr<detail::OwnerSession> owner, Identity storage, ArtifactDescriptor descriptor)
 		: ArtifactReader(io, std::move(owner), storage, descriptor, {}) {
 		std::array<char, detail::artifact_chunk_size> buffer{}; Checksum checksum;
@@ -325,7 +401,7 @@ private:
 	// Header-only construction is private to the incremental verifier.
 	ArtifactReader(IO& io, std::shared_ptr<detail::OwnerSession> owner, Identity storage, ArtifactDescriptor descriptor,
 		std::shared_ptr<detail::VerificationLease> verification)
-		: owner_(std::move(owner)), verification_(std::move(verification)), file_(io.open_existing(artifact_name(descriptor))), descriptor_(descriptor) {
+		: owner_(std::move(owner)), verification_(std::move(verification)), file_(io.open_existing(artifact_name(descriptor))), io_(&io), descriptor_(descriptor) {
 		std::array<char, 8> magic_bytes{}; detail::read_all(*file_, 0, magic_bytes);
 		std::string_view magic_view(magic_bytes.data(), magic_bytes.size()); auto magic = get64(magic_view);
 		if (magic != detail::artifact_magic && magic != detail::artifact_v2_magic) { throw Corruption("unsupported artifact format"); }
@@ -339,7 +415,9 @@ private:
 	std::shared_ptr<detail::OwnerSession> owner_;
 	std::shared_ptr<detail::ArtifactPin> pin_;
 	std::shared_ptr<detail::VerificationLease> verification_;
-	std::unique_ptr<File> file_;
+	std::shared_ptr<File> file_;
+	std::shared_ptr<bool> pending_ = std::make_shared<bool>(false);
+	IO* io_ = nullptr;
 	ArtifactDescriptor descriptor_;
 	std::size_t payload_offset_ = 0;
 };
@@ -355,19 +433,19 @@ public:
 	const ArtifactDescriptor& descriptor() const noexcept { return reader_.descriptor(); }
 	std::uint64_t offset() const noexcept { return offset_; }
 	std::size_t read_next(std::span<char> destination) {
+		auto operation = start_read_next(destination.size(), false, destination);
+		drive_synchronously(*operation); return finish_read_next(operation);
+	}
+	std::shared_ptr<ArtifactRead> begin_read_next(std::size_t capacity) { return start_read_next(capacity, true); }
+	std::size_t finish_read_next(const std::shared_ptr<ArtifactRead>& operation) {
 		healthy();
-		if (destination.size() > detail::artifact_chunk_size || (destination.empty() && offset_ < descriptor().length)) {
-			throw std::length_error("invalid verification chunk bound");
-		}
-		auto count = static_cast<std::size_t>(std::min<std::uint64_t>(destination.size(), descriptor().length - offset_));
-		if (!count) { return 0; }
-		// One backend call. Partial progress stays visible to the scheduler.
-		auto actual = reader_.read_at(offset_, destination.first(count));
-		checksum_.update(std::string_view(destination.data(), actual)); offset_ += actual; return actual;
+		if (!operation || pending_.lock() != operation) { throw std::invalid_argument("stale or foreign verification read"); }
+		auto result = operation->result();
+		checksum_.update(std::string_view(result.data(), result.size())); offset_ += result.size(); pending_.reset(); return result.size();
 	}
 	ArtifactReader finish() && {
 		healthy();
-		if (offset_ != descriptor().length) { throw std::logic_error("artifact verification is incomplete"); }
+		if (pending_.lock() || offset_ != descriptor().length) { throw std::logic_error("artifact verification is incomplete"); }
 		if (checksum_.value() != descriptor().checksum) {
 			reader_.owner_->failed = true; throw Corruption("artifact payload checksum mismatch");
 		}
@@ -378,10 +456,18 @@ private:
 	ArtifactVerifier(IO& io, std::shared_ptr<detail::OwnerSession> owner, Identity storage, ArtifactDescriptor descriptor,
 		std::shared_ptr<detail::VerificationLease> verification)
 		: reader_(io, std::move(owner), storage, descriptor, std::move(verification)) {}
+	std::shared_ptr<ArtifactRead> start_read_next(std::size_t capacity, bool asynchronous, std::span<char> borrowed = {}) {
+		healthy();
+		if (pending_.lock()) { throw std::logic_error("verification read awaits settlement"); }
+		if (capacity > detail::artifact_chunk_size || (!capacity && offset_ < descriptor().length)) { throw std::length_error("invalid verification chunk bound"); }
+		auto count = static_cast<std::size_t>(std::min<std::uint64_t>(capacity, descriptor().length - offset_));
+		auto operation = reader_.start_read(offset_, count, asynchronous, borrowed); pending_ = operation; return operation;
+	}
 	void healthy() const {
 		if (!reader_.owner_ || !reader_.file_ || reader_.owner_->failed) { throw std::logic_error("artifact owner fenced or verifier moved"); }
 	}
 	ArtifactReader reader_;
+	std::weak_ptr<ArtifactRead> pending_;
 	Checksum checksum_;
 	std::uint64_t offset_ = 0;
 };

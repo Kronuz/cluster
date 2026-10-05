@@ -842,6 +842,48 @@ void store_limits_and_pins() {
 	Store store(io, store_limits, 1024); store.recover([](auto, auto) {}, [](auto&, auto&, auto) {}); ready_store(store);
 	check(throws([&] { store.append(*foreign_append, "x"); }) && throws([&] { store.begin_artifact(*foreign_replacement, ArtifactPart::Application); }) && !store.fenced(), "foreign Store capabilities reject before mutation without fencing");
 }
+void suspended_artifact_reads() {
+	for (auto chunk : {std::size_t{3}, std::size_t{65536}}) {
+		auto model = initialized(); auto io = std::make_shared<MemoryIO>(model); Journal journal(io, 1024); journal.recover([](auto, auto) {});
+		auto artifact = prepare(journal, "candidate"); auto verifier = journal.begin_artifact_verification(artifact); model.chunk = chunk;
+		auto before = model.operations; auto canceled = verifier->begin_read_next(64); canceled.reset();
+		check(model.operations == before && verifier->offset() == 0 && !journal.fenced(), "unsubmitted read cancellation leaves checksum cursor and storage unchanged");
+		std::string candidate; std::shared_ptr<ArtifactRead> old;
+		while (verifier->offset() < artifact.descriptor().length) {
+			auto offset = verifier->offset(); auto operation = verifier->begin_read_next(64);
+			old.reset(); check(throws([&] { verifier->begin_read_next(64); }) && !journal.fenced(), "held verifier read rejects overlapping work without fencing");
+			operation->submitted(); auto completed = detail::execute_primitive(operation->io(), operation->request());
+			check(verifier->offset() == offset && throws([&] { operation->result(); }) && throws([&] { verifier->finish_read_next(operation); }), "executed read cannot expose results or checksum progress before original reap");
+			MutationCompletion stale; stale.token = operation->request().token; stale.count = 1; ++stale.token.operation;
+			check(!operation->complete(std::move(stale)) && operation->in_flight(), "stale read completion cannot release original slot");
+			check(operation->complete(std::move(completed)) && verifier->offset() == offset, "matching reap exposes only owned candidate bytes before verification settlement");
+			auto bytes = operation->result(); candidate.append(bytes.data(), bytes.size());
+			check(verifier->finish_read_next(operation) == bytes.size() && verifier->offset() == offset + bytes.size(), "verification settlement advances exact cursor and checksum once");
+			check(throws([&] { verifier->finish_read_next(operation); }) && !journal.fenced(), "duplicate verification settlement rejects without changing cursor"); old = operation;
+		}
+		check(candidate == "candidate", "suspended verification preserves bounded short-read payload");
+		auto reader = std::move(*verifier).finish(); auto operation = reader.begin_read_at(0, 3); old.reset();
+		check(throws([&] { reader.begin_read_at(0, 3); }) && !journal.fenced(), "reader retains one original read slot despite old capability destruction");
+		drive_synchronously(*operation); auto bytes = operation->result(); check(std::string_view(bytes.data(), bytes.size()) == "can", "promoted exact file supports owned payload reads");
+	}
+	for (int fault : {0, 1, 2, 3}) {
+		auto model = initialized(); auto io = std::make_shared<MemoryIO>(model); Journal journal(io, 1024); journal.recover([](auto, auto) {});
+		auto artifact = prepare(journal, "candidate"); auto verifier = journal.begin_artifact_verification(artifact); auto operation = verifier->begin_read_next(64);
+		if (fault < 2) { model.fail_operation = model.operations + 1; model.fail_after = fault == 1; }
+		else if (fault == 2) { model.chunk = 0; } else { model.oversized_read = true; }
+		drive_synchronously(*operation);
+		check(operation->done() && throws([&] { operation->result(); }) && journal.fenced() && verifier->offset() == 0, "uncertain or invalid read fences without advancing verification");
+	}
+	{
+		auto model = initialized(); MemoryIO io(model); Journal journal(io, 1024); journal.recover([](auto, auto) {}); auto artifact = prepare(journal, "candidate"); auto verifier = journal.begin_artifact_verification(artifact); auto before = model.operations;
+		check(throws([&] { verifier->begin_read_next(64); }) && model.operations == before && !journal.fenced(), "borrowed backend rejects escaped completion read before IO");
+	}
+	{
+		auto model = initialized(); auto io = std::make_shared<MemoryIO>(model); Journal journal(io, 1024); journal.recover([](auto, auto) {}); auto artifact = prepare(journal, "candidate"); auto verifier = journal.begin_artifact_verification(artifact); auto operation = verifier->begin_read_next(64); operation->submitted(); auto completed = detail::execute_primitive(operation->io(), operation->request()); journal.fence_storage();
+		check(operation->complete(std::move(completed)) && operation->done() && throws([&] { operation->result(); }), "fenced owner still reaps original read and exposes no successful bytes");
+	}
+}
+
 void incremental_artifact_verification() {
 	for (bool legacy : {false, true}) { for (std::size_t chunk : {std::size_t{3}, std::numeric_limits<std::size_t>::max()}) {
 		for (const std::string& payload : {std::string{}, std::string("candidate"), std::string(65553, 'x')}) {
@@ -1569,7 +1611,7 @@ void posix() {
 } // namespace
 
 int main() {
-	try { basics(); append_failures(); append_failures(3); append_failures(std::numeric_limits<std::size_t>::max(), true); append_failures(3, true); append_failures(std::numeric_limits<std::size_t>::max(), false, true); append_failures(3, false, true); append_failures(std::numeric_limits<std::size_t>::max(), true, true); append_failures(3, true, true); suspended_artifact_operations(); suspended_artifact_ownership(); suspended_append_ownership(); fenced_append_submission(); suspended_append_retirement(); recovery_failures(); recovery_failures(true); recovery_failures(false, true); recovery_failures(true, true); corruption(); initialization_failures(); checkpoint_basics(); checkpoint_successive_generations(); incremental_artifact_verification(); store_incremental_verification(); published_artifact_selection(); store_published_selection(); artifact_verification(); preparation_ownership_and_failures(); checkpoint_publication_failures(); checkpoint_publication_failures(3); checkpoint_publication_failures(std::numeric_limits<std::size_t>::max(), true); checkpoint_publication_failures(3, true); checkpoint_corruption(); reclamation_roots_and_unknowns(); reclamation_failures(); durable_staging_ownership(); mixed_artifact_formats(); footprint_plans(); checkpoint_publication_retirement(); store_publication_completions(); store_artifact_completions(); detached_old_artifact_lease(); store_append_completions(); store_basics(); store_failures(); store_append_and_cleanup_failures(); store_limits_and_pins(); store_posix(); posix(); }
+	try { basics(); append_failures(); append_failures(3); append_failures(std::numeric_limits<std::size_t>::max(), true); append_failures(3, true); append_failures(std::numeric_limits<std::size_t>::max(), false, true); append_failures(3, false, true); append_failures(std::numeric_limits<std::size_t>::max(), true, true); append_failures(3, true, true); suspended_artifact_operations(); suspended_artifact_ownership(); suspended_append_ownership(); fenced_append_submission(); suspended_append_retirement(); recovery_failures(); recovery_failures(true); recovery_failures(false, true); recovery_failures(true, true); corruption(); initialization_failures(); checkpoint_basics(); checkpoint_successive_generations(); suspended_artifact_reads(); incremental_artifact_verification(); store_incremental_verification(); published_artifact_selection(); store_published_selection(); artifact_verification(); preparation_ownership_and_failures(); checkpoint_publication_failures(); checkpoint_publication_failures(3); checkpoint_publication_failures(std::numeric_limits<std::size_t>::max(), true); checkpoint_publication_failures(3, true); checkpoint_corruption(); reclamation_roots_and_unknowns(); reclamation_failures(); durable_staging_ownership(); mixed_artifact_formats(); footprint_plans(); checkpoint_publication_retirement(); store_publication_completions(); store_artifact_completions(); detached_old_artifact_lease(); store_append_completions(); store_basics(); store_failures(); store_append_and_cleanup_failures(); store_limits_and_pins(); store_posix(); posix(); }
 	catch (const std::exception& error) { check(false, error.what()); }
 	std::cout << checks << " journal checks, " << failures << " failures\n";
 	return failures ? 1 : 0;

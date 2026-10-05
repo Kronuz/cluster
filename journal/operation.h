@@ -11,7 +11,7 @@ struct MutationToken {
 	bool operator==(const MutationToken &) const = default;
 };
 
-enum class PrimitiveKind { Write, Sync, Create, Replace, DirectorySync };
+enum class PrimitiveKind { Write, Sync, Create, Replace, DirectorySync, Read };
 
 // Views belong to the operation. An accepted driver retains that operation
 // until the original primitive completes, including after cancellation.
@@ -21,6 +21,7 @@ struct MutationRequest {
 	std::shared_ptr<File> file;
 	std::uint64_t offset = 0;
 	std::string_view bytes, source, destination;
+	std::span<char> destination_bytes;
 };
 struct MutationCompletion {
 	MutationToken token;
@@ -46,6 +47,9 @@ inline MutationCompletion execute_primitive(IO &io, const MutationRequest &reque
 	result.token = request.token;
 	try {
 		switch (request.kind) {
+		case PrimitiveKind::Read:
+			result.count = request.file->read_at(request.offset, request.destination_bytes);
+			break;
 		case PrimitiveKind::Write:
 			result.count = request.file->write_at(request.offset, request.bytes);
 			break;
