@@ -160,3 +160,5 @@ the invariant documented). None was silently "improved".
 ## Completion-driven storage work
 
 `journal/mutation.h` provides explicit resumable append and shared manifest publication states. Both synchronous and completion drivers must execute these same states. Owned backend construction retains the directory, files and stable owner session across suspension. An accepted driver retains the operation until every original primitive is reaped; only matching owner/operation/step completions advance it. Final barriers precede frontier settlement. Never offload `Worker::run_one()` as a whole, invent completion after cancellation, or refund started storage permits before terminal settlement. Native submission and asynchronous Store/Worker integration are in progress; the existing Worker still uses synchronous IO.
+
+CTest configuration creates its build-local `.scratch/` parent before filesystem fixtures run. Fresh build directories must not depend on a developer having created that parent manually.

@@ -11,6 +11,7 @@ add_library(cluster::journal ALIAS cluster_journal)
 # This module can be built without fetching Asio or reactor.
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	enable_testing()
+	file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/.scratch")
 	add_executable(journal_demo demo.cc)
 	target_link_libraries(journal_demo PRIVATE cluster::journal)
 	add_executable(journal_bench bench.cc)

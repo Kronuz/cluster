@@ -41,6 +41,7 @@ add_subdirectory(consensus)
 # --- example + benchmark + tests (built only when this repo is top-level) ---
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	enable_testing()
+	file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/.scratch")
 
 	# A runnable gossip demo (three nodes announce themselves over the bus).
 	add_executable(cluster_gossip examples/gossip.cc)
