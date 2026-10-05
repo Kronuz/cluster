@@ -969,7 +969,24 @@ void basics() {
 	check(throws([&] { third.recover([](auto, auto) {}); }), "fenced owner retains stable lock");
 }
 
-void append_failures(std::size_t chunk = std::numeric_limits<std::size_t>::max(), bool checkpointed = false) {
+void append_failures(std::size_t chunk = std::numeric_limits<std::size_t>::max(), bool checkpointed = false, bool suspended = false) {
+	auto append = [&](Journal& journal) {
+		if (!suspended) { return journal.append_batch("second"); }
+		auto operation = journal.begin_append("second");
+		while (!operation->done()) {
+			check(journal.frontier().sequence == 1, "suspended append keeps public frontier unchanged");
+			operation->submitted();
+			auto completion = detail::execute_primitive(operation->io(), operation->request());
+			check(journal.frontier().sequence == 1, "executed but undelivered completion cannot publish frontier");
+			auto stale = MutationCompletion{}; stale.token = completion.token; ++stale.token.operation;
+			check(!operation->complete(std::move(stale)) && operation->in_flight(), "foreign completion cannot reap an accepted primitive");
+			auto token = completion.token;
+			check(operation->complete(std::move(completion)), "matching completion is reaped exactly once");
+			auto repeated = MutationCompletion{}; repeated.token = token;
+			check(!operation->complete(std::move(repeated)), "duplicate completion cannot advance another step");
+		}
+		return journal.finish_append(operation);
+	};
 	auto baseline = initialized(chunk);
 	if (checkpointed) {
 		MemoryIO io(baseline); Journal journal(io, 1024); journal.recover([](auto, auto) {});
@@ -979,22 +996,34 @@ void append_failures(std::size_t chunk = std::numeric_limits<std::size_t>::max()
 	auto recover_values = [&](Model& model) { return checkpointed ? replay_checkpoint(model).second : replay(model); };
 	std::size_t operation_count = 0;
 	{
-		auto model = baseline.clone(); MemoryIO io(model); Journal journal(io, 1024);
+		auto model = baseline.clone(); auto io = std::make_shared<MemoryIO>(model); Journal journal(io, 1024);
 		journal.recover([](auto, auto) {}, [](auto&, auto&, auto) {}); model.operations = 0;
-		journal.append_batch("second"); operation_count = model.operations;
+		append(journal); operation_count = model.operations;
 	}
 	for (std::size_t operation = 1; operation <= operation_count; ++operation) {
 		for (bool after : {false, true}) {
 			auto model = baseline.clone();
 			{
-				MemoryIO io(model); Journal journal(io, 1024); journal.recover([](auto, auto) {}, [](auto&, auto&, auto) {});
+				auto io = std::make_shared<MemoryIO>(model); Journal journal(io, 1024); journal.recover([](auto, auto) {}, [](auto&, auto&, auto) {});
 				model.operations = 0; model.fail_operation = operation; model.fail_after = after;
-				check(throws([&] { journal.append_batch("second"); }) && journal.fenced(), "each uncertain append operation fences");
+				check(throws([&] { append(journal); }) && journal.fenced(), "each uncertain append operation fences");
 				check(throws([&] { journal.append_batch("third"); }), "failure prevents subsequent acknowledgement");
+			}
+			std::optional<Model> synchronous;
+			if (suspended) {
+				synchronous = baseline.clone();
+				MemoryIO backend(*synchronous); Journal reference(backend, 1024);
+				reference.recover([](auto, auto) {}, [](auto&, auto&, auto) {});
+				synchronous->operations = 0; synchronous->fail_operation = operation; synchronous->fail_after = after;
+				check(throws([&] { reference.append_batch("second"); }) && reference.fenced(), "reference driver receives identical injected fault");
 			}
 			for (bool keep_visible : {false, true}) {
 				auto crash = model.clone(); crash.power_loss(keep_visible);
 				auto batches = recover_values(crash);
+				if (synchronous) {
+					auto comparison = synchronous->clone(); comparison.power_loss(keep_visible);
+					check(batches == recover_values(comparison), "synchronous and suspended drivers recover identical histories under identical faults");
+				}
 				check(batches == std::vector<std::string>{"first"} || batches == std::vector<std::string>({"first", "second"}),
 					"crash keeps the previous acknowledged prefix and at most the interrupted batch");
 				if (operation == operation_count && after) {
@@ -1010,6 +1039,60 @@ void append_failures(std::size_t chunk = std::numeric_limits<std::size_t>::max()
 		}
 	}
 	std::cout << "append publication operations tested: " << operation_count << '\n';
+}
+
+void suspended_append_ownership() {
+	auto model = initialized(3);
+	std::weak_ptr<MemoryIO> backend;
+	{
+	auto io = std::make_shared<MemoryIO>(model);
+	backend = io;
+	auto journal = std::make_unique<Journal>(io, 1024);
+	journal->recover([](auto, auto) {});
+	auto before = model.operations;
+	check(throws([&] { journal->begin_append(std::string(1025, 'x')); }) && model.operations == before && !journal->fenced(), "owned append validates before IO");
+	{
+		auto canceled = journal->begin_append("canceled");
+		check(model.operations == before, "begin append performs no IO");
+	}
+	check(!journal->fenced(), "unsubmitted cancellation keeps journal healthy");
+	auto builder = journal->prepare_artifact();
+	auto operation = journal->begin_append("second"); before = model.operations;
+	check(throws([&] { journal->append_batch("other"); }) && throws([&] { journal->reclaim_step(); }) && throws([&] { builder.append_chunk("other"); }) && throws([&] { builder.finish(); }) && model.operations == before && !journal->fenced(), "pending append excludes mutations before IO without fencing");
+	operation->submitted();
+	auto completion = detail::execute_primitive(operation->io(), operation->request());
+	journal.reset(); io.reset();
+	check(model.locked && !backend.expired() && operation->in_flight(), "accepted operation retains backend file and stable lock after facade closes");
+	check(operation->complete(std::move(completion)), "late completion returns to retained operation");
+	drive_synchronously(*operation);
+	check(model.locked && !backend.expired(), "completed operation retains storage lifetime until released");
+	operation.reset();
+	// The escaped builder continues to own the storage session until it closes.
+	check(model.locked && !backend.expired(), "escaped preparation retains owned backend lifetime");
+	}
+	check(!model.locked && backend.expired(), "drained operation and final pin release backend and owner lock");
+	check(replay(model) == std::vector<std::string>({"first", "second"}), "owner disappearance does not interrupt accepted durable sequencing");
+}
+
+void suspended_append_retirement() {
+	auto model = initialized(); auto io = std::make_shared<MemoryIO>(model); Journal journal(io, 1024);
+	journal.recover([](auto, auto) {});
+	auto first = journal.begin_append("second"); drive_synchronously(*first);
+	check(journal.frontier().sequence == 1 && journal.finish_append(first).sequence == 2, "only explicit terminal settlement advances public frontier");
+	auto second = journal.begin_append("third"); first.reset(); auto before = model.operations;
+	check(throws([&] { journal.begin_append("overlap"); }) && model.operations == before && !journal.fenced(), "retiring old settled operation cannot release a newer mutation gate");
+	drive_synchronously(*second); journal.finish_append(second); second.reset();
+	{
+		auto dropped = journal.begin_append("fourth"); drive_synchronously(*dropped);
+	}
+	check(journal.fenced(), "discarding durable but unsettled mutation fences stale facade metadata");
+
+	auto abandoned = initialized(); auto backend = std::make_shared<MemoryIO>(abandoned); Journal owned(backend, 1024); owned.recover([](auto, auto) {});
+	{
+		auto dropped = owned.begin_append("uncertain"); dropped->submitted();
+		dropped->complete(detail::execute_primitive(dropped->io(), dropped->request()));
+	}
+	check(owned.fenced(), "abandonment after a reaped mutating primitive fences without hidden IO");
 }
 
 void recovery_failures(bool extra_tail = false, bool checkpointed = false) {
@@ -1185,7 +1268,7 @@ void posix() {
 } // namespace
 
 int main() {
-	try { basics(); append_failures(); append_failures(3); append_failures(std::numeric_limits<std::size_t>::max(), true); append_failures(3, true); recovery_failures(); recovery_failures(true); recovery_failures(false, true); recovery_failures(true, true); corruption(); initialization_failures(); checkpoint_basics(); checkpoint_successive_generations(); incremental_artifact_verification(); store_incremental_verification(); published_artifact_selection(); store_published_selection(); artifact_verification(); preparation_ownership_and_failures(); checkpoint_publication_failures(); checkpoint_corruption(); reclamation_roots_and_unknowns(); reclamation_failures(); durable_staging_ownership(); mixed_artifact_formats(); footprint_plans(); store_basics(); store_failures(); store_append_and_cleanup_failures(); store_limits_and_pins(); store_posix(); posix(); }
+	try { basics(); append_failures(); append_failures(3); append_failures(std::numeric_limits<std::size_t>::max(), true); append_failures(3, true); append_failures(std::numeric_limits<std::size_t>::max(), false, true); append_failures(3, false, true); append_failures(std::numeric_limits<std::size_t>::max(), true, true); append_failures(3, true, true); suspended_append_ownership(); suspended_append_retirement(); recovery_failures(); recovery_failures(true); recovery_failures(false, true); recovery_failures(true, true); corruption(); initialization_failures(); checkpoint_basics(); checkpoint_successive_generations(); incremental_artifact_verification(); store_incremental_verification(); published_artifact_selection(); store_published_selection(); artifact_verification(); preparation_ownership_and_failures(); checkpoint_publication_failures(); checkpoint_corruption(); reclamation_roots_and_unknowns(); reclamation_failures(); durable_staging_ownership(); mixed_artifact_formats(); footprint_plans(); store_basics(); store_failures(); store_append_and_cleanup_failures(); store_limits_and_pins(); store_posix(); posix(); }
 	catch (const std::exception& error) { check(false, error.what()); }
 	std::cout << checks << " journal checks, " << failures << " failures\n";
 	return failures ? 1 : 0;

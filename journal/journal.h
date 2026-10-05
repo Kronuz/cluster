@@ -1,6 +1,7 @@
 #pragma once
 
 #include "artifact.h"
+#include "mutation.h"
 #include "resources.h"
 #include <array>
 #include <limits>
@@ -75,6 +76,11 @@ public:
 	}
 	Journal(const Journal&) = delete;
 	Journal& operator=(const Journal&) = delete;
+	Journal(std::shared_ptr<IO> io, std::size_t maximum_batch = 64u * 1024 * 1024,
+		std::uint64_t maximum_artifact = 512ull * 1024 * 1024)
+		: Journal(owned_io(io), maximum_batch, maximum_artifact) {
+		io_lifetime_ = std::move(io); owner_->io_lifetime = io_lifetime_;
+	}
 	bool fenced() const noexcept { return owner_->failed; }
 	// Trusted owning host: uncertainty outside a Journal method must fence
 	// escaped readers and capabilities from the same storage session too.
@@ -122,7 +128,7 @@ public:
 		return {added, added, {encode_manifest(frontier_).size(), 1}};
 	}
 	ArtifactBuilder prepare_artifact() {
-		available(); return ArtifactBuilder(io_, owner_, frontier_.identity, maximum_artifact_);
+		writable(); return ArtifactBuilder(io_, owner_, frontier_.identity, maximum_artifact_);
 	}
 	PreparedArtifact pin_artifact(const ArtifactDescriptor& artifact) {
 		available();
@@ -175,7 +181,7 @@ public:
 
 
 	ReclaimStats reclaim_step(std::size_t scan_budget = 128) {
-		available();
+		writable();
 		if (scan_budget == 0 || scan_budget > 4096) { throw std::invalid_argument("invalid reclamation scan budget"); }
 		ReclaimStats stats;
 		try {
@@ -302,7 +308,31 @@ public:
 	}
 
 	Frontier append_batch(std::string_view batch) {
+		auto operation = start_append(batch, false);
+		try { drive_synchronously(*operation); return finish_append(operation); }
+		catch (...) { owner_->failed = true; ready_ = false; throw; }
+	}
+	// The completion driver retains the returned operation through every submitted
+	// primitive. No mutation can interleave until finish_append settles it.
+	std::shared_ptr<AppendMutation> begin_append(std::string_view batch) {
+		return start_append(batch, true);
+	}
+	Frontier finish_append(const std::shared_ptr<AppendMutation>& operation) {
 		available();
+		if (!operation || operation != append_operation_.lock() || !append_target_) {
+			throw std::invalid_argument("foreign or settled append operation");
+		}
+		operation->result();
+		frontier_ = std::move(*append_target_); append_target_.reset();
+		operation->settled(); append_operation_.reset(); return frontier_;
+	}
+private:
+	std::shared_ptr<AppendMutation> start_append(std::string_view batch, bool asynchronous) {
+		writable();
+		if (asynchronous && !io_lifetime_) { throw std::logic_error("asynchronous append requires owned IO"); }
+		if (owner_->mutation_sequence == std::numeric_limits<std::uint64_t>::max()) {
+			throw std::length_error("storage operation identity exhausted");
+		}
 		auto growth = append_plan(batch.size()).added.logical_bytes;
 		Frontier next = frontier_;
 		++next.sequence;
@@ -313,18 +343,16 @@ public:
 		put64(header, next.sequence);
 		put32(header, crc32c(batch));
 		put32(header, crc32c(header));
-		try {
-			write_all(*data_, frontier_.offset, header);
-			write_all(*data_, frontier_.offset + batch_header_size, batch);
-			data_->sync();
-			publish(next);
-			frontier_ = next;
-			return frontier_;
-		} catch (...) { owner_->failed = true; ready_ = false; throw; }
+		auto backend = io_lifetime_ ? io_lifetime_ : std::shared_ptr<IO>(&io_, [](IO*) {});
+		auto operation = std::shared_ptr<AppendMutation>(new AppendMutation(std::move(backend), owner_, data_,
+			frontier_.offset, std::move(header), std::string(batch), encode_manifest(next),
+			{owner_->mutation_identity, owner_->mutation_sequence + 1, 1}));
+		append_target_ = std::move(next); append_operation_ = operation; ++owner_->mutation_sequence;
+		return operation;
 	}
-
+public:
 	Frontier publish_checkpoint(const PreparedArtifact& checkpoint, std::span<const PreparedArtifact> dependencies, std::uint64_t covered_sequence) {
-		available();
+		writable();
 		if (covered_sequence != frontier_.sequence || dependencies.size() > maximum_dependencies ||
 			!checkpoint.lease_ || checkpoint.lease_->owner != owner_ || frontier_.generation == std::numeric_limits<std::uint64_t>::max()) {
 			throw std::invalid_argument("stale checkpoint frontier, foreign preparation, or generation limit");
@@ -357,6 +385,9 @@ public:
 	}
 
 private:
+	static IO& owned_io(const std::shared_ptr<IO>& io) {
+		if (!io) { throw std::invalid_argument("null owned journal IO"); } return *io;
+	}
 	static std::string data_name(const Frontier& frontier) {
 		return frontier.version == 1 ? detail::generation_name(frontier.generation) : "generation-" + detail::hexadecimal(frontier.journal_identity);
 	}
@@ -435,6 +466,9 @@ private:
 		if (owner_->lock || ready_ || owner_->failed) { throw std::logic_error("journal already initialized or fenced"); }
 	}
 	void available() const { if (!ready_ || owner_->failed) { throw std::logic_error("journal unavailable"); } }
+	void writable() const {
+		available(); if (owner_->mutation_active) { throw std::logic_error("journal mutation is pending"); }
+	}
 	void validate_artifact_bound(const ArtifactDescriptor& artifact) const {
 		if (artifact.length > maximum_artifact_) { throw Corruption("checkpoint artifact exceeds configured bound"); }
 	}
@@ -520,21 +554,19 @@ private:
 	void publish(const Frontier& next) {
 		// Exclusive creation plus a random suffix leaves interrupted publication
 		// artifacts harmless. Automatic orphan cleanup is intentionally separate.
-		std::string temporary = "manifest.pending-" + detail::hexadecimal(detail::random_identity());
-		auto manifest = io_.create_exclusive(temporary);
-		auto encoded = encode_manifest(next);
-		write_all(*manifest, 0, encoded);
-		manifest->sync();
-		io_.replace(temporary, manifest_name);
-		io_.sync_directory();
+		detail::PublicationSteps operation(encode_manifest(next));
+		while (!operation.done()) { operation.complete(detail::execute_primitive(io_, operation.request())); }
 	}
 
 	IO& io_;
+	std::shared_ptr<IO> io_lifetime_;
 	std::size_t maximum_batch_;
 	std::uint64_t maximum_artifact_;
 	// Data closes before the stable owner lock is released.
 	std::shared_ptr<detail::OwnerSession> owner_ = std::make_shared<detail::OwnerSession>();
-	std::unique_ptr<File> data_;
+	std::shared_ptr<File> data_;
+	std::weak_ptr<AppendMutation> append_operation_;
+	std::optional<Frontier> append_target_;
 	Frontier frontier_;
 	std::unique_ptr<DirectoryCursor> reclaim_cursor_;
 	bool ready_ = false;

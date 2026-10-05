@@ -19,8 +19,12 @@ inline std::string artifact_name(const ArtifactDescriptor& artifact) { return "a
 
 namespace detail {
 struct OwnerSession {
+	std::shared_ptr<IO> io_lifetime;
 	std::unique_ptr<OwnerLock> lock;
 	bool failed = false;
+	bool mutation_active = false;
+	std::uint64_t mutation_sequence = 0;
+	Identity mutation_identity = random_identity();
 	unsigned preparing = 0, prepared = 0;
 	unsigned verification_handles = 0;
 	std::optional<Identity> preparing_identity;
@@ -111,6 +115,7 @@ public:
 	~ArtifactBuilder() { file_.reset(); if (active_) { --owner_->preparing; owner_->preparing_identity.reset(); } }
 	void append_chunk(std::string_view bytes) {
 		if (!active_ || owner_->failed) { throw std::logic_error("artifact preparation unavailable"); }
+		if (owner_->mutation_active) { throw std::logic_error("journal mutation is pending"); }
 		if (bytes.size() > detail::artifact_chunk_size || bytes.size() > maximum_ - descriptor_.length) {
 			throw std::length_error("artifact chunk or cumulative size exceeds bound");
 		}
@@ -121,6 +126,7 @@ public:
 	}
 	PreparedArtifact finish() {
 		if (!active_ || owner_->failed) { throw std::logic_error("artifact preparation unavailable"); }
+		if (owner_->mutation_active) { throw std::logic_error("journal mutation is pending"); }
 		try {
 			descriptor_.checksum = checksum_.value();
 			detail::write_all(*file_, detail::artifact_ownership_size, detail::artifact_seal(storage_, descriptor_));
