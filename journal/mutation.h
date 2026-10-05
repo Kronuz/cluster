@@ -276,11 +276,14 @@ class AppendMutation : public IOOperation {
 	std::exception_ptr error_;
 };
 
-inline void drive_synchronously(AppendMutation &operation) {
+inline void drive_synchronously(IOOperation &operation) {
 	while (!operation.done()) {
 		operation.submitted();
 		operation.complete(detail::execute_primitive(operation.io(), operation.request()));
 	}
+}
+inline void drive_synchronously(AppendMutation &operation) {
+	drive_synchronously(static_cast<IOOperation&>(operation));
 	operation.result();
 }
 } // namespace kronuz::journal

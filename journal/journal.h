@@ -327,6 +327,7 @@ public:
 		operation->settled(); append_operation_.reset(); return frontier_;
 	}
 private:
+	friend class Store;
 	std::shared_ptr<AppendMutation> start_append(std::string_view batch, bool asynchronous) {
 		writable();
 		if (asynchronous && !io_lifetime_) { throw std::logic_error("asynchronous append requires owned IO"); }

@@ -541,6 +541,32 @@ void store_replacement(Store& store, const ReplacementId& replacement) {
 	store.begin_artifact(replacement, ArtifactPart::Bundle); store.write_chunk(replacement, "bundle"); store.finish_artifact(replacement);
 	store.publish(replacement, store.frontier().sequence);
 }
+void store_append_completions() {
+	auto model = initialized(3); auto io = std::make_shared<MemoryIO>(model); Store store(io, store_limits, 1024);
+	store.recover([](auto, auto) {}); ready_store(store); auto initial = store.accounting()->used;
+	{
+		auto permit = store.reserve_append(AdmissionClass::Normal, 6); auto before = model.operations;
+		auto operation = store.begin_append(std::move(*permit), "second");
+		check(model.operations == before && store.accounting()->tickets == 1, "owned Store append reserves before IO");
+	}
+	check(!store.fenced() && store.accounting()->outstanding == StorageResources{} && store.accounting()->used == initial, "unsubmitted Store append cancellation refunds without fencing");
+	auto permit = store.reserve_append(AdmissionClass::Normal, 6); auto operation = store.begin_append(std::move(*permit), "second");
+	auto held = store.accounting()->outstanding;
+	while (!operation->done()) {
+		operation->submitted(); auto completion = detail::execute_primitive(operation->io(), operation->request());
+		check(store.frontier().sequence == 1 && store.accounting()->used == initial && store.accounting()->outstanding == held, "executed but undelivered Store completion cannot publish or refund");
+		check(operation->complete(std::move(completion)), "Store reaps matching primitive before accounting changes");
+	}
+	check(operation->result().sequence == 2 && store.frontier().sequence == 2 && store.accounting()->outstanding == StorageResources{} && !store.accounting()->tainted, "terminal barrier atomically settles journal and permit");
+	store_exact(model, store);
+
+	permit = store.reserve_append(AdmissionClass::Normal, 5); auto failed = store.begin_append(std::move(*permit), "third");
+	held = store.accounting()->outstanding; auto used = store.accounting()->used;
+	failed->submitted(); auto completion = detail::execute_primitive(failed->io(), failed->request()); store.fence_storage();
+	check(failed->complete(std::move(completion)) && failed->done() && throws([&] { failed->result(); }), "fencing during IO still reaps original completion without a success result");
+	check(store.accounting()->tainted && store.accounting()->outstanding == held && store.accounting()->used == used, "uncertain Store mutation retains conservative charges without refund");
+}
+
 void store_basics() {
 	Model model; model.chunk = 3; MemoryIO io(model);
 	{
@@ -1268,7 +1294,7 @@ void posix() {
 } // namespace
 
 int main() {
-	try { basics(); append_failures(); append_failures(3); append_failures(std::numeric_limits<std::size_t>::max(), true); append_failures(3, true); append_failures(std::numeric_limits<std::size_t>::max(), false, true); append_failures(3, false, true); append_failures(std::numeric_limits<std::size_t>::max(), true, true); append_failures(3, true, true); suspended_append_ownership(); suspended_append_retirement(); recovery_failures(); recovery_failures(true); recovery_failures(false, true); recovery_failures(true, true); corruption(); initialization_failures(); checkpoint_basics(); checkpoint_successive_generations(); incremental_artifact_verification(); store_incremental_verification(); published_artifact_selection(); store_published_selection(); artifact_verification(); preparation_ownership_and_failures(); checkpoint_publication_failures(); checkpoint_corruption(); reclamation_roots_and_unknowns(); reclamation_failures(); durable_staging_ownership(); mixed_artifact_formats(); footprint_plans(); store_basics(); store_failures(); store_append_and_cleanup_failures(); store_limits_and_pins(); store_posix(); posix(); }
+	try { basics(); append_failures(); append_failures(3); append_failures(std::numeric_limits<std::size_t>::max(), true); append_failures(3, true); append_failures(std::numeric_limits<std::size_t>::max(), false, true); append_failures(3, false, true); append_failures(std::numeric_limits<std::size_t>::max(), true, true); append_failures(3, true, true); suspended_append_ownership(); suspended_append_retirement(); recovery_failures(); recovery_failures(true); recovery_failures(false, true); recovery_failures(true, true); corruption(); initialization_failures(); checkpoint_basics(); checkpoint_successive_generations(); incremental_artifact_verification(); store_incremental_verification(); published_artifact_selection(); store_published_selection(); artifact_verification(); preparation_ownership_and_failures(); checkpoint_publication_failures(); checkpoint_corruption(); reclamation_roots_and_unknowns(); reclamation_failures(); durable_staging_ownership(); mixed_artifact_formats(); footprint_plans(); store_append_completions(); store_basics(); store_failures(); store_append_and_cleanup_failures(); store_limits_and_pins(); store_posix(); posix(); }
 	catch (const std::exception& error) { check(false, error.what()); }
 	std::cout << checks << " journal checks, " << failures << " failures\n";
 	return failures ? 1 : 0;

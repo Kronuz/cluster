@@ -57,6 +57,83 @@ private:
 	};
 	kronuz::journal::PosixIO backend;
 };
+void completion_appends() {
+	for (bool fail : {false, true}) {
+		auto directory = std::filesystem::current_path() / ".scratch" / ("worker-completion-" + std::to_string(fail) + "-" + std::to_string(::getpid()));
+		std::filesystem::create_directories(directory); ::chmod(directory.c_str(), 0700);
+		struct Cleanup { std::filesystem::path path; ~Cleanup() { std::filesystem::remove_all(path); } } cleanup{directory};
+		auto io = std::make_shared<kronuz::journal::PosixIO>(directory);
+		check(throws([&] { Worker rejected(*io, configuration(), admission(), limits(), {}, {16, 128, true}); }), "asynchronous worker rejects borrowed backend before IO");
+		Worker worker(io, configuration(), admission(), limits(), {}, {16, 128, true});
+		kronuz::journal::Identity identity{}; identity[0] = 'A'; worker.create(identity);
+		for (unsigned turn = 0; turn < 10; ++turn) {
+			// Bootstrap inventory is bounded; claim only after initialization is queued.
+			if (worker.run_one({100, 100}) == TurnResult::IOPending) { break; }
+		}
+		auto job = worker.take_io_operation();
+		check(job && !worker.ready() && !worker.take_io_operation(), "initialization job has one external owner claim and gates readiness");
+		if (!job) { return; }
+		auto frontier = worker.storage_frontier(); auto outstanding = worker.accounting()->outstanding;
+		job->submitted(); auto completion = kronuz::journal::detail::execute_primitive(job->io(), job->request());
+		check(worker.run_one({1000, 100}) == TurnResult::IOPending && worker.storage_frontier().sequence == frontier.sequence && worker.accounting()->outstanding == outstanding, "held initialization primitive retains frontier and admission");
+		if (fail) {
+			worker.storage_operation_failed(job, "injected driver failure after submission");
+			check(worker.fenced() && job->in_flight() && worker.accounting()->tainted, "driver failure fences without fabricating completion or refund");
+			check(job->complete(std::move(completion)) && job->done(), "original submitted primitive is reaped after worker fencing");
+			continue;
+		}
+		check(job->complete(std::move(completion)), "owner accepts original initialization completion");
+		kronuz::journal::drive_synchronously(*job);
+		check(!worker.ready() && worker.run_one({1000, 100}) == TurnResult::Stored && worker.ready(), "readiness follows final barrier and owner settlement");
+		worker.storage_operation_failed(job, "stale driver failure");
+		check(!worker.fenced(), "retired operation cannot fence current worker");
+		worker.try_submit(Start{}); worker.try_submit(Tick{1000, 100});
+		unsigned durable_jobs = 0; bool proposed = false; std::vector<std::string> commands;
+		for (unsigned turn = 0; turn < 200 && commands.empty(); ++turn) {
+			auto result = worker.run_one({1000 + turn, 100});
+			if (result == TurnResult::IOPending) {
+				auto next = worker.take_io_operation();
+				check(next && !worker.take_io_operation(), "each consensus append is dispatched exactly once");
+				if (!next) { break; }
+				auto committed = worker.committed();
+				next->submitted(); auto held = kronuz::journal::detail::execute_primitive(next->io(), next->request());
+				check(worker.run_one({2000 + turn, 100}) == TurnResult::IOPending && worker.committed() == committed, "pending consensus IO advances clock without releasing commit");
+				check(next->complete(std::move(held)), "matching consensus primitive completes");
+				kronuz::journal::drive_synchronously(*next); ++durable_jobs;
+			}
+			for (const auto& action : worker.take_actions()) {
+				check(!std::holds_alternative<Persist>(action), "completion worker retains persistence internally");
+				if (auto batch = std::get_if<Committed>(&action)) {
+					for (const auto& entry : batch->entries) { if (entry.kind == EntryKind::Command) { commands.push_back(entry.payload); } }
+					worker.applied({batch->entries.back().index});
+				}
+			}
+			if (!proposed && worker.role() == Role::Leader && worker.committed() >= 1) {
+				proposed = worker.try_submit(Propose{11, "completion-command"}) == SubmitResult::Accepted;
+			}
+		}
+		check(proposed && durable_jobs >= 5 && commands == std::vector<std::string>{"completion-command"} && !worker.fenced(), "election and command application require their complete durable append chain");
+	}
+}
+void retired_completion_worker() {
+	auto directory = std::filesystem::current_path() / ".scratch" / ("worker-retired-completion-" + std::to_string(::getpid()));
+	std::filesystem::create_directories(directory); ::chmod(directory.c_str(), 0700);
+	struct Cleanup { std::filesystem::path path; ~Cleanup() { std::filesystem::remove_all(path); } } cleanup{directory};
+	auto io = std::make_shared<kronuz::journal::PosixIO>(directory);
+	auto worker = std::make_unique<Worker>(io, configuration(), admission(), limits(), Timing{}, WorkerLimits{16, 128, true});
+	kronuz::journal::Identity identity{}; identity[0] = 'R'; worker->create(identity);
+	for (unsigned turn = 0; turn < 10; ++turn) { if (worker->run_one({100, 100}) == TurnResult::IOPending) { break; } }
+	auto operation = worker->take_io_operation(); check(bool(operation), "retired worker hands initialization to its driver");
+	if (!operation) { return; }
+	operation->submitted(); auto original = kronuz::journal::detail::execute_primitive(operation->io(), operation->request());
+	worker.reset(); io.reset();
+	check(operation->complete(std::move(original)), "accepted original completion survives Worker and backend facade retirement");
+	kronuz::journal::drive_synchronously(*operation); operation.reset();
+	kronuz::journal::PosixIO reopened(directory); Worker recovered(reopened, configuration(), admission(), limits());
+	recovered.recover([](auto&) { throw std::runtime_error("unexpected retired checkpoint"); });
+	for (unsigned turn = 0; turn < 10 && !recovered.ready(); ++turn) { recovered.run_one({100, 100}); }
+	check(recovered.ready() && !recovered.fenced(), "retired Worker operation completes typed durable initialization and releases lock");
+}
 void real_worker() {
 	auto directory = std::filesystem::current_path() / ".scratch" / ("consensus-worker-" + std::to_string(::getpid()));
 	std::filesystem::create_directories(directory); ::chmod(directory.c_str(), 0700);
@@ -1203,9 +1280,10 @@ void binary_transfer_codec() {
 
 int main(int argc, char** argv) {
 	try {
+		if (argc == 2 && std::string_view(argv[1]) == "--completion-regressions") { completion_appends(); retired_completion_worker(); std::cout << checks << " completion checks, " << failures << " failures\n"; return failures ? 1 : 0; }
 		if (argc == 2 && std::string_view(argv[1]) == "--review-regressions") { channel_dispatch_and_unstarted_result(); binary_transfer_integration(65553); binary_transfer_integration(65553, 5); owned_snapshot_sources(); std::cout << checks << " review checks, " << failures << " failures\n"; return failures ? 1 : 0; }
 		if (argc == 2 && std::string_view(argv[1]) == "--transfer-benchmark") { std::ofstream(std::filesystem::current_path() / ".scratch" / "snapshot-transfer-benchmark.csv") << "image_bytes,wall_s,cpu_s,wire_bytes,retained_frame_bytes,payload_buffer_capacity,process_maxrss_native,sender_payload_reads,receiver_payload_reads\n"; binary_transfer_integration(1048576, 0, true); binary_transfer_integration(67108864, 0, true); std::cout << checks << " benchmark checks, " << failures << " failures\n"; return failures ? 1 : 0; }
-		checkpoint_format_recovery(); legacy_source_export_rejection(); binary_channel_validation(); channel_dispatch_and_unstarted_result(); binary_transfer_codec(); for (std::size_t length : {std::size_t{0}, std::size_t{9}, std::size_t{65553}, std::size_t{1048576}}) { binary_transfer_integration(length); }
+		completion_appends(); retired_completion_worker(); checkpoint_format_recovery(); legacy_source_export_rejection(); binary_channel_validation(); channel_dispatch_and_unstarted_result(); binary_transfer_codec(); for (std::size_t length : {std::size_t{0}, std::size_t{9}, std::size_t{65553}, std::size_t{1048576}}) { binary_transfer_integration(length); }
 		for (unsigned mode : {1u, 2u, 3u, 5u}) { binary_transfer_integration(65553, mode); }
 		owned_snapshot_sources(); snapshot_reception_and_validation(); snapshot_policy_and_rejection(); snapshot_cancellation_phases(); snapshot_read_faults(); snapshot_restart_cleanup(); snapshot_protocol_progress(); snapshot_installation(); snapshot_rejection_branches(); snapshot_old_application(); snapshot_install_reopening(); snapshot_install_admission(); snapshot_publication_faults(); maintenance_preserves_protocol_timers(); real_worker(); partial_control_pack(); failures_and_multi_action_output(); interrupted_initialization(); checkpoint_crash_and_progress(); preparation_preserves_protocol_timers(); checkpoint_cancellation_and_completion(); checkpoint_faults(); } catch (const std::exception& error) { check(false, error.what()); }
 	std::cout << checks << " worker checks, " << failures << " failures\n"; return failures ? 1 : 0;

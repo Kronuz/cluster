@@ -7,6 +7,7 @@ namespace kronuz::journal {
 
 enum class ArtifactPart { Application, Bundle };
 class Store;
+class StoreAppend;
 class AppendReservation {
 public:
 	AppendReservation(AppendReservation&&) noexcept = default;
@@ -15,6 +16,7 @@ public:
 	AppendReservation& operator=(const AppendReservation&) = delete;
 private:
 	friend class Store;
+	friend class StoreAppend;
 	AppendReservation(std::shared_ptr<char> owner, StoragePermit permit, std::size_t bound)
 		: owner_(std::move(owner)), permit_(std::move(permit)), bound_(bound) {}
 	std::shared_ptr<char> owner_;
@@ -32,6 +34,55 @@ private:
 	std::uint64_t token_;
 };
 
+// An admitted append owns its accounting permit through every suspension.
+// Only the storage owner applies completions and settles the final frontier.
+class StoreAppend final : public IOOperation {
+public:
+	~StoreAppend() override {
+		if (started_ && !finished_) { journal_->fence_storage(); }
+	}
+	const MutationRequest& request() const override { return append_->request(); }
+	void submitted() override {
+		if (finished_ || append_->in_flight()) { throw std::logic_error("store append cannot submit"); }
+		if (!started_) { reservation_.permit_.mark_started(); started_ = true; }
+		append_->submitted();
+	}
+	bool complete(MutationCompletion completion) noexcept override {
+		if (!append_->complete(std::move(completion))) { return false; }
+		if (append_->done()) {
+			try {
+				append_->result();
+				result_ = journal_->finish_append(append_);
+				reservation_.permit_.settle(plan_.added); reservation_.owner_.reset();
+			} catch (...) {
+				error_ = std::current_exception(); journal_->fence_storage(); reservation_.permit_.abandon();
+			}
+			finished_ = true;
+		}
+		return true;
+	}
+	bool done() const noexcept override { return finished_; }
+	bool in_flight() const noexcept override { return append_->in_flight(); }
+	IO& io() const noexcept override { return append_->io(); }
+	const Frontier& result() const {
+		if (!finished_) { throw std::logic_error("store append has not completed"); }
+		if (error_) { std::rethrow_exception(error_); }
+		return *result_;
+	}
+private:
+	friend class Store;
+	StoreAppend(std::shared_ptr<Journal> journal, std::shared_ptr<AppendMutation> append,
+		AppendReservation&& reservation, MutationPlan plan)
+		: journal_(std::move(journal)), append_(std::move(append)), reservation_(std::move(reservation)), plan_(plan) {}
+	std::shared_ptr<Journal> journal_;
+	std::shared_ptr<AppendMutation> append_;
+	AppendReservation reservation_;
+	MutationPlan plan_;
+	std::optional<Frontier> result_;
+	std::exception_ptr error_;
+	bool started_ = false, finished_ = false;
+};
+
 // Single ordered storage executor. IO outlives Store and escaped readers and
 // is used EXCLUSIVELY through Store while its session is open. No mutable
 // Journal, artifact builder, or prepared handle escapes this boundary.
@@ -39,9 +90,15 @@ class Store {
 public:
 	Store(IO& io, AdmissionLimits limits, std::size_t maximum_batch = 64u * 1024 * 1024,
 		std::uint64_t maximum_artifact = 512ull * 1024 * 1024)
-		: io_(io), limits_(limits), journal_(io, maximum_batch, maximum_artifact) {
+		: io_(io), limits_(limits), journal_(std::make_shared<Journal>(io, maximum_batch, maximum_artifact)) {
 		InventoryStats empty; empty.complete = true;
 		Admission validate(empty, limits); // Reject configuration before IO.
+	}
+	Store(std::shared_ptr<IO> io, AdmissionLimits limits, std::size_t maximum_batch = 64u * 1024 * 1024,
+		std::uint64_t maximum_artifact = 512ull * 1024 * 1024)
+		: io_(owned_io(io)), limits_(limits), journal_(std::make_shared<Journal>(std::move(io), maximum_batch, maximum_artifact)) {
+		InventoryStats empty; empty.complete = true;
+		Admission validate(empty, limits);
 	}
 	Store(const Store&) = delete;
 	Store& operator=(const Store&) = delete;
@@ -51,7 +108,7 @@ public:
 			catch (...) { fence(); replacement_.reset(); }
 		}
 	}
-	bool fenced() const noexcept { return failed_ || journal_.fenced(); }
+	bool fenced() const noexcept { return failed_ || journal_->fenced(); }
 	void fence_storage() noexcept { fence(); }
 	std::optional<AdmissionStats> accounting() const noexcept {
 		if (!admission_) { return std::nullopt; }
@@ -61,7 +118,7 @@ public:
 		if (!inventory_) { throw std::logic_error("inventory not started"); }
 		return inventory_->stats();
 	}
-	Frontier frontier() const { healthy(); return journal_.frontier(); }
+	Frontier frontier() const { healthy(); return journal_->frontier(); }
 	Frontier create(Identity identity) {
 		unopened();
 		if (!detail::resources_fit(Journal::bootstrap_plan().peak, limits_.hard)) {
@@ -72,14 +129,14 @@ public:
 			// every existing name before the first owned namespace change.
 			auto cursor = io_.scan_directory();
 			if (cursor->next()) { throw std::invalid_argument("bootstrap requires an empty directory"); }
-			cursor.reset(); auto result = journal_.create(identity);
+			cursor.reset(); auto result = journal_->create(identity);
 			opened_ = true; inventory_.emplace(io_); return result;
 		} catch (...) { fence(); throw; }
 	}
 	template <class Replay, class Restore> Frontier recover(Replay replay, Restore restore) {
 		unopened();
 		try {
-			auto result = journal_.recover(std::move(replay), std::move(restore));
+			auto result = journal_->recover(std::move(replay), std::move(restore));
 			opened_ = true; inventory_.emplace(io_); return result;
 		} catch (...) { fence(); throw; }
 	}
@@ -102,25 +159,26 @@ public:
 	std::optional<AppendReservation> reserve_append(AdmissionClass kind, std::size_t maximum_encoded_bytes) {
 		ready();
 		if (kind == AdmissionClass::Replacement) { throw std::invalid_argument("append requires normal or control admission"); }
-		auto permit = admission_->reserve(kind, journal_.append_plan(maximum_encoded_bytes).peak);
+		auto permit = admission_->reserve(kind, journal_->append_plan(maximum_encoded_bytes).peak);
 		if (!permit) { return std::nullopt; }
 		return AppendReservation(owner_, std::move(*permit), maximum_encoded_bytes);
 	}
 	Frontier append(AppendReservation& reservation, std::string_view bytes) {
 		ready();
 		if (reservation.owner_ != owner_ || bytes.size() > reservation.bound_) { throw std::invalid_argument("foreign or oversized append reservation"); }
-		auto plan = journal_.append_plan(bytes.size());
-		reservation.permit_.mark_started();
+		auto operation = start_append(std::move(reservation), bytes, false);
 		try {
-			auto result = journal_.append_batch(bytes); reservation.permit_.settle(plan.added);
-			reservation.owner_.reset(); return result;
+			drive_synchronously(*operation); return operation->result();
 		} catch (...) { fence(); throw; }
+	}
+	std::shared_ptr<StoreAppend> begin_append(AppendReservation&& reservation, std::string_view bytes) {
+		return start_append(std::move(reservation), bytes, true);
 	}
 	std::optional<ReplacementId> reserve_replacement(std::uint64_t application_cap, std::uint64_t bundle_cap) {
 		ready(); if (replacement_) { return std::nullopt; }
 		if (next_replacement_ == std::numeric_limits<std::uint64_t>::max()) { throw std::overflow_error("replacement token exhausted"); }
 		std::array<std::uint64_t, 2> caps{bundle_cap, application_cap};
-		auto permit = admission_->reserve(AdmissionClass::Replacement, journal_.checkpoint_plan(caps).peak);
+		auto permit = admission_->reserve(AdmissionClass::Replacement, journal_->checkpoint_plan(caps).peak);
 		if (!permit) { return std::nullopt; }
 		replacement_ = std::make_unique<Replacement>(std::move(*permit), ++next_replacement_, application_cap, bundle_cap);
 		return ReplacementId(owner_, replacement_->token);
@@ -132,7 +190,7 @@ public:
 		}
 		operation.permit.mark_started();
 		try {
-			operation.builder.emplace(journal_.prepare_artifact()); operation.active = index; operation.created[index] = true;
+			operation.builder.emplace(journal_->prepare_artifact()); operation.active = index; operation.created[index] = true;
 		} catch (...) { fence(); throw; }
 	}
 	void write_chunk(const ReplacementId& id, std::string_view bytes) {
@@ -156,37 +214,37 @@ public:
 	std::optional<ArtifactVerifier> begin_artifact_verification(const ReplacementId& id, ArtifactPart part) {
 		auto& operation = replacement(id); auto index = part_index(part);
 		if (!operation.prepared[index]) { throw std::logic_error("artifact not sealed"); }
-		try { return journal_.begin_artifact_verification(*operation.prepared[index]); }
-		catch (...) { if (journal_.fenced()) { fence(); } throw; }
+		try { return journal_->begin_artifact_verification(*operation.prepared[index]); }
+		catch (...) { if (journal_->fenced()) { fence(); } throw; }
 	}
 	std::optional<PublishedArtifactSelection> select_published_dependency(std::size_t index) const {
-		ready(); return journal_.select_published_dependency(index);
+		ready(); return journal_->select_published_dependency(index);
 	}
 	std::optional<ArtifactVerifier> begin_published_verification(const PublishedArtifactSelection& selection) {
 		ready();
-		try { return journal_.begin_published_verification(selection); }
-		catch (...) { if (journal_.fenced()) { fence(); } throw; }
+		try { return journal_->begin_published_verification(selection); }
+		catch (...) { if (journal_->fenced()) { fence(); } throw; }
 	}
 	void verify_artifact(const ReplacementId& id, ArtifactPart part) {
 		auto& operation = replacement(id); auto index = part_index(part);
 		if (!operation.prepared[index]) { throw std::logic_error("artifact not sealed"); }
-		try { journal_.verify_artifact(*operation.prepared[index]); } catch (...) { fence(); throw; }
+		try { journal_->verify_artifact(*operation.prepared[index]); } catch (...) { fence(); throw; }
 	}
 	Frontier publish(const ReplacementId& id, std::uint64_t expected_sequence) {
-		auto& operation = replacement(id); auto current = journal_.frontier();
+		auto& operation = replacement(id); auto current = journal_->frontier();
 		if (operation.builder || !operation.prepared[0] || !operation.prepared[1] || expected_sequence != current.sequence ||
 			current.generation == std::numeric_limits<std::uint64_t>::max()) { throw std::invalid_argument("unfinished or stale replacement"); }
 		std::array<std::uint64_t, 2> lengths{operation.lengths[1], operation.lengths[0]};
-		auto plan = journal_.checkpoint_plan(lengths);
+		auto plan = journal_->checkpoint_plan(lengths);
 		try {
-			auto result = journal_.publish_checkpoint(*operation.prepared[1], std::span<const PreparedArtifact>(&*operation.prepared[0], 1), expected_sequence);
+			auto result = journal_->publish_checkpoint(*operation.prepared[1], std::span<const PreparedArtifact>(&*operation.prepared[0], 1), expected_sequence);
 			operation.permit.settle(plan.added, plan.removed); replacement_.reset(); return result;
 		} catch (...) { fence(); throw; }
 	}
 	void cancel_replacement(const ReplacementId& id) {
 		auto& operation = replacement(id); StorageResources staged;
 		for (unsigned index = 0; index < 2; ++index) {
-			if (operation.created[index]) { staged = detail::resources_add(staged, journal_.artifact_footprint(operation.lengths[index])); }
+			if (operation.created[index]) { staged = detail::resources_add(staged, journal_->artifact_footprint(operation.lengths[index])); }
 		}
 		operation.builder.reset(); operation.prepared[0].reset(); operation.prepared[1].reset();
 		if (operation.created[0] || operation.created[1]) { operation.permit.settle(staged); }
@@ -197,7 +255,7 @@ public:
 		if (budget == 0 || budget > 4096) { throw std::invalid_argument("invalid reclamation scan budget"); }
 		if (!admission_) { inventory_.reset(); } // Mutation invalidates partial census.
 		try {
-			auto result = journal_.reclaim_step(budget);
+			auto result = journal_->reclaim_step(budget);
 			if (result.logical_bytes_saturated) { throw std::overflow_error("reclamation credit overflow"); }
 			if (admission_) { admission_->credit_durable_reclaim({result.logical_bytes, result.removed}); }
 			else { inventory_.emplace(io_); }
@@ -205,6 +263,16 @@ public:
 		} catch (...) { fence(); throw; }
 	}
 private:
+	static IO& owned_io(const std::shared_ptr<IO>& io) {
+		if (!io) { throw std::invalid_argument("null owned store IO"); } return *io;
+	}
+	std::shared_ptr<StoreAppend> start_append(AppendReservation&& reservation, std::string_view bytes, bool asynchronous) {
+		ready();
+		if (reservation.owner_ != owner_ || bytes.size() > reservation.bound_) { throw std::invalid_argument("foreign or oversized append reservation"); }
+		auto plan = journal_->append_plan(bytes.size());
+		auto append = journal_->start_append(bytes, asynchronous);
+		return std::shared_ptr<StoreAppend>(new StoreAppend(journal_, std::move(append), std::move(reservation), plan));
+	}
 	struct Replacement {
 		Replacement(StoragePermit value, std::uint64_t identity, std::uint64_t app, std::uint64_t bundle)
 			: permit(std::move(value)), token(identity), caps{app, bundle} {}
@@ -228,11 +296,11 @@ private:
 	void unopened() const { healthy(); if (opened_) { throw std::logic_error("store already opened"); } }
 	void healthy() const { if (fenced()) { throw std::logic_error("store fenced; close and recover"); } }
 	void ready() const { healthy(); if (!admission_) { throw std::logic_error("storage inventory not ready"); } }
-	void fence() noexcept { failed_ = true; journal_.fence_storage(); if (admission_) { admission_->taint(); } }
+	void fence() noexcept { failed_ = true; journal_->fence_storage(); if (admission_) { admission_->taint(); } }
 	IO& io_;
 	AdmissionLimits limits_;
 	std::shared_ptr<char> owner_ = std::make_shared<char>();
-	Journal journal_;
+	std::shared_ptr<Journal> journal_;
 	std::optional<Inventory> inventory_;
 	std::unique_ptr<Admission> admission_;
 	std::unique_ptr<Replacement> replacement_;

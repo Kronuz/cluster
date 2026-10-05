@@ -52,6 +52,14 @@ If occupied output or pending persistence prevents that Tick, GC retains timer d
 
 The isolated worker tests cover actual POSIX persistence/recovery, interrupted initialization, all-or-nothing partial pack failure, busy application completion, multiple actions in one output batch, failure while output is occupied, leader ticks under Control pressure and continuous foreground reads. Transport authentication and production capacity qualification remain pending. The worker is not yet used by the legacy Raft API or Detent daemons.
 
+### Completion-driven append ownership
+
+Construct Worker with `std::shared_ptr<journal::IO>` and set the trailing `WorkerLimits::async_appends` flag to opt into completion-driven initialization and ordinary Raft journal appends. Borrowed backend construction rejects that flag before IO. `run_one()` returns `IOPending` while an operation is outstanding; `take_io_operation()` hands out that operation once. Submit it to an owned completion driver, retain it through every original primitive, and apply completions on the same protocol executor. After the final barrier, a subsequent Worker turn delivers the matching persistence completion. While pending, Worker turns advance Core's safety clock without inventing a persistence acknowledgement.
+
+`storage_operation_failed(operation, reason)` accepts only the current operation capability. It fences Core and storage but does not reap or cancel an accepted primitive; the driver must retain and reap it. Failed or retired operation capabilities cannot release another append. Initialization gates `ready()` until durable settlement. The focused `cluster_worker_test --completion-regressions` suite exercises held completions, exactly-once dispatch, stale failure reports, failure after submission, Worker/backend facade retirement, and a complete election/proposal append chain.
+
+This flag currently covers appends only. Bootstrap creation, recovery, artifact preparation, checkpoint publication, readback and reclamation still perform synchronous IO. Existing callers retain their default synchronous behavior, and production services must not treat this intermediate profile as fully asynchronous storage.
+
 ### Worker-owned checkpoint lifecycle
 
 Call `reserve_checkpoint(application_cap)` before capturing immutable application state. It reserves the complete application artifact, maximum consensus bundle and publication footprint as one replacement. The returned `CheckpointId` belongs to this worker session; stale or foreign IDs cannot attach state or cancel another replacement. Attach `CaptureMetadata{request, through, term}` exactly once, with the image pinned at committed, applied index `through`.

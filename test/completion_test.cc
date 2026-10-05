@@ -1,5 +1,6 @@
 #include "journal/bsd_completion.h"
 #include "journal/journal.h"
+#include "journal/store.h"
 #include <chrono>
 #include <filesystem>
 #include <iostream>
@@ -117,6 +118,33 @@ void owner_retirement(const std::filesystem::path &directory) {
 			  batches[1] == "second",
 		  "retired owner still finishes original durable transaction");
 }
+
+void admitted_store(const std::filesystem::path& parent) {
+	auto directory = parent / "store"; std::filesystem::create_directory(directory); ::chmod(directory.c_str(), 0700);
+	auto io = std::make_shared<PosixIO>(directory);
+	AdmissionLimits limits{{16u << 20, 256}, {1u << 20, 4}, {4u << 20, 4}, 64, 3};
+	auto store = std::make_unique<Store>(io, limits, 1024); Identity id{}; id[0] = 's'; store->create(id);
+	while (!store->inventory_step(1).complete) {}
+	auto before = store->accounting()->used;
+	auto reservation = store->reserve_append(AdmissionClass::Normal, 6);
+	auto operation = store->begin_append(std::move(*reservation), "stored");
+	BsdCompletionQueue queue;
+	while (!operation->done()) {
+		queue.submit(operation); auto completed = await_step(queue);
+		check(store->frontier().sequence == 0 && store->accounting()->used == before && store->accounting()->tickets == 1, "real backend cannot settle Store before owner applies completion");
+		operation->complete(std::move(completed.completion));
+	}
+	check(operation->result().sequence == 1 && store->accounting()->outstanding == StorageResources{} && !store->accounting()->tainted, "real completion atomically publishes Store and settles admitted resources");
+	reservation = store->reserve_append(AdmissionClass::Normal, 7);
+	operation = store->begin_append(std::move(*reservation), "retired");
+	queue.submit(operation); auto draining = operation; operation.reset(); store.reset(); io.reset();
+	auto completed = await_step(queue); draining->complete(std::move(completed.completion));
+	drive(queue, draining); check(draining->result().sequence == 2, "owned Store operation survives facade and accounting facade retirement");
+	draining.reset(); completed.operation.reset();
+	PosixIO recovered(directory); Journal journal(recovered, 1024); std::vector<std::string> batches;
+	journal.recover([&](auto, auto bytes) { batches.emplace_back(bytes); });
+	check(batches == std::vector<std::string>({"stored", "retired"}), "Store retirement preserves both terminal durable appends");
+}
 } // namespace
 int main() {
 	auto directory =
@@ -129,6 +157,7 @@ int main() {
 		::chmod(directory.c_str(), 0700);
 		actual_backend(directory);
 		owner_retirement(directory);
+		admitted_store(directory);
 	} catch (const std::exception &error) {
 		check(false, error.what());
 	}

@@ -9,8 +9,8 @@
 namespace cluster::consensus {
 
 enum class SubmitResult { Accepted, Busy, Pressure, Fenced };
-enum class TurnResult { Idle, Blocked, Pressure, Inventory, Stored, Completed, Maintenance, Fenced };
-struct WorkerLimits { std::size_t foreground_burst = 16, scan_entries = 128; };
+enum class TurnResult { Idle, Blocked, Pressure, Inventory, Stored, Completed, Maintenance, Fenced, IOPending };
+struct WorkerLimits { std::size_t foreground_burst = 16, scan_entries = 128; bool async_appends = false; };
 struct CaptureMetadata { RequestId request; Index through; Term term; };
 struct SnapshotLimits { std::uint32_t application_format; std::uint64_t application_bytes; };
 struct SnapshotContext { NodeId authenticated_peer; Term leader_term; RequestId request; Token transfer; SnapshotDescriptor descriptor; };
@@ -56,7 +56,8 @@ struct ValidationView { SnapshotId snapshot; Token chunk; std::uint64_t offset; 
 struct SnapshotResult { SnapshotId snapshot; SnapshotContext context; SnapshotReason reason; std::optional<InstallRejectReason> rejection{}; std::optional<Term> receiver_term{}; };
 struct SnapshotActivation { SnapshotId snapshot; Token token; SnapshotDescriptor descriptor; };
 
-// One owning executor. IO is exclusive to this worker and outlives it.
+// One owning executor. Borrowed IO outlives this worker; owned IO remains
+// retained by accepted operations. Backend use is exclusive to this worker.
 // There is no input queue; retryable work remains with the caller.
 class Worker {
 public:
@@ -64,20 +65,14 @@ public:
 		Limits limits = {}, Timing timing = {}, WorkerLimits scheduling = {}, std::optional<SnapshotLimits> snapshots = {})
 		: configuration_(std::move(configuration)), limits_(limits), timing_(timing), scheduling_(scheduling),
 		snapshot_limits_(snapshots), store_(io, admission, batch_limit(configuration_, limits), artifact_limit(snapshots)) {
-		Core validate(configuration_, RecoveredState{configuration_, {}, 0, 0, {}, 0}, limits_, timing_);
-		if (!scheduling_.foreground_burst || scheduling_.foreground_burst > 1048576 || !scheduling_.scan_entries || scheduling_.scan_entries > 4096 ||
-			admission.control_slots < 3 || admission.maximum_tickets < 5) { throw std::invalid_argument("invalid worker scheduling or control slots"); }
-		auto tick = plan_event(Tick{}, false, limits_);
-		kronuz::journal::StorageResources pack{};
-		for (std::size_t i = 0; i < tick.count; ++i) { pack = kronuz::journal::detail::resources_add(pack, kronuz::journal::Journal::append_footprint(tick.appends[i].encoded_bytes).peak); }
-		auto rpc = kronuz::journal::Journal::append_footprint(storage_batch_size(true, true, limits_.rpc_entries)).peak;
-		pack.logical_bytes = std::max(pack.logical_bytes, rpc.logical_bytes);
-		if (!kronuz::journal::detail::resources_fit(pack, admission.control_pool)) { throw std::invalid_argument("worker control pool cannot fund continuation pack"); }
-		// Checked bounds for one complete Core action batch, including internal
-		// persistence and checkpoint actions. No unbounded output queue exists.
-		output_count_ = checked_add(checked_multiply(limits_.reads, 2), checked_add(checked_multiply(limits_.voters, 4), 16));
-		output_payload_ = checked_add(limits_.log_bytes, checked_multiply(checked_add(limits_.voters, 2), limits_.rpc_bytes));
-		output_entries_ = checked_add(limits_.log_entries, checked_multiply(checked_add(limits_.voters, 2), limits_.rpc_entries));
+		if (scheduling_.async_appends) { throw std::invalid_argument("completion appends require owned worker IO"); }
+		validate_configuration(admission);
+	}
+	Worker(std::shared_ptr<kronuz::journal::IO> io, FixedConfiguration configuration, kronuz::journal::AdmissionLimits admission,
+		Limits limits = {}, Timing timing = {}, WorkerLimits scheduling = {}, std::optional<SnapshotLimits> snapshots = {})
+		: configuration_(std::move(configuration)), limits_(limits), timing_(timing), scheduling_(scheduling),
+		snapshot_limits_(snapshots), store_(std::move(io), admission, batch_limit(configuration_, limits), artifact_limit(snapshots)) {
+		validate_configuration(admission);
 	}
 	Worker(const Worker&) = delete;
 	Worker& operator=(const Worker&) = delete;
@@ -132,6 +127,13 @@ public:
 	auto storage_frontier() const { return store_.frontier(); }
 	auto accounting() const noexcept { return store_.accounting(); }
 	SubmitResult try_submit(Event event) { return submit(std::move(event), false); }
+	std::shared_ptr<kronuz::journal::IOOperation> take_io_operation() {
+		if (!io_job_ || io_dispatched_) { return {}; }
+		io_dispatched_ = true; return io_job_;
+	}
+	void storage_operation_failed(const std::shared_ptr<kronuz::journal::IOOperation>& operation, std::string reason) {
+		if (operation && operation == io_job_ && !fenced()) { fail(std::move(reason)); }
+	}
 	Actions take_actions() {
 		Actions result = std::move(output_); output_.clear();
 		for (const auto& action : result) {
@@ -325,10 +327,24 @@ public:
 		if (!core_) { throw std::logic_error("worker not opened"); }
 		refresh_source();
 		try {
+			if (io_job_) {
+				if (!io_job_->done()) {
+					if (io_persist_token_ && core_->busy()) { ingest(core_->step(current_time)); }
+					return TurnResult::IOPending;
+				}
+				io_job_->result();
+				if (io_persist_token_) { completion_ = Persisted{*io_persist_token_}; ++foreground_; }
+				else { initialization_.clear(); }
+				io_job_.reset(); io_persist_token_.reset(); io_dispatched_ = false; return TurnResult::Stored;
+			}
 			if (!store_.accounting()) { store_.inventory_step(scheduling_.scan_entries); return TurnResult::Inventory; }
 			if (!initialization_.empty()) {
 				auto permit = store_.reserve_append(kronuz::journal::AdmissionClass::Control, initialization_.size());
 				if (!permit) { return TurnResult::Pressure; }
+				if (scheduling_.async_appends) {
+					io_job_ = store_.begin_append(std::move(*permit), initialization_); io_dispatched_ = false;
+					return TurnResult::IOPending;
+				}
 				store_.append(*permit, initialization_); initialization_.clear(); return TurnResult::Stored;
 			}
 			if (maintenance_due()) {
@@ -341,6 +357,11 @@ public:
 			}
 			if (persist_) {
 				auto encoded = encode_storage_batch(persist_->batch);
+				if (scheduling_.async_appends) {
+					io_job_ = store_.begin_append(std::move(*pack_[pack_next_]), encoded); pack_[pack_next_++].reset();
+					io_persist_token_ = persist_->token; persist_.reset(); io_dispatched_ = false;
+					return TurnResult::IOPending;
+				}
 				store_.append(*pack_[pack_next_], encoded); pack_[pack_next_++].reset();
 				completion_ = Persisted{persist_->token}; persist_.reset(); ++foreground_; return TurnResult::Stored;
 			}
@@ -391,6 +412,22 @@ public:
 		} catch (const std::exception& error) { fail(error.what()); return TurnResult::Fenced; }
 	}
 private:
+	void validate_configuration(const kronuz::journal::AdmissionLimits& admission) {
+		Core validate(configuration_, RecoveredState{configuration_, {}, 0, 0, {}, 0}, limits_, timing_);
+		if (!scheduling_.foreground_burst || scheduling_.foreground_burst > 1048576 || !scheduling_.scan_entries || scheduling_.scan_entries > 4096 ||
+			admission.control_slots < 3 || admission.maximum_tickets < 5) { throw std::invalid_argument("invalid worker scheduling or control slots"); }
+		auto tick = plan_event(Tick{}, false, limits_);
+		kronuz::journal::StorageResources pack{};
+		for (std::size_t i = 0; i < tick.count; ++i) { pack = kronuz::journal::detail::resources_add(pack, kronuz::journal::Journal::append_footprint(tick.appends[i].encoded_bytes).peak); }
+		auto rpc = kronuz::journal::Journal::append_footprint(storage_batch_size(true, true, limits_.rpc_entries)).peak;
+		pack.logical_bytes = std::max(pack.logical_bytes, rpc.logical_bytes);
+		if (!kronuz::journal::detail::resources_fit(pack, admission.control_pool)) { throw std::invalid_argument("worker control pool cannot fund continuation pack"); }
+		// Checked bounds for one complete Core action batch, including internal
+		// persistence and checkpoint actions. No unbounded output queue exists.
+		output_count_ = checked_add(checked_multiply(limits_.reads, 2), checked_add(checked_multiply(limits_.voters, 4), 16));
+		output_payload_ = checked_add(limits_.log_bytes, checked_multiply(checked_add(limits_.voters, 2), limits_.rpc_bytes));
+		output_entries_ = checked_add(limits_.log_entries, checked_multiply(checked_add(limits_.voters, 2), limits_.rpc_entries));
+	}
 	SubmitResult submit(Event event, bool maintenance_tick) {
 		if (maintenance_tick && !std::holds_alternative<Tick>(event)) { throw std::logic_error("maintenance admission requires Tick"); }
 		// Validate even under backpressure; internal events never enter here.
@@ -712,6 +749,7 @@ private:
 	void fail(std::string reason) {
 		if (failed_) { return; } failed_ = true;
 		store_.fence_storage(); if (core_) { core_->step(StorageFault{reason}); }
+		io_job_.reset(); io_persist_token_.reset(); io_dispatched_ = false;
 		persist_.reset(); completion_.reset(); application_.reset(); activation_completion_.reset(); checkpoint_.reset(); source_.reset(); published_.reset(); pending_publication_.reset(); release_pack(); terminal_ = Fenced{std::move(reason)};
 	}
 	FixedConfiguration configuration_;
@@ -724,6 +762,9 @@ private:
 	std::string initialization_;
 	std::array<std::optional<kronuz::journal::AppendReservation>, 3> pack_;
 	std::size_t pack_count_ = 0, pack_next_ = 0, foreground_ = 0, output_count_ = 0, output_payload_ = 0, output_entries_ = 0;
+	std::shared_ptr<kronuz::journal::StoreAppend> io_job_;
+	std::optional<Token> io_persist_token_;
+	bool io_dispatched_ = false;
 	std::optional<Persist> persist_;
 	std::optional<Persisted> completion_;
 	std::optional<Applied> application_;
