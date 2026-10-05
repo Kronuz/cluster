@@ -47,6 +47,27 @@ void drive(BsdCompletionQueue &queue, const std::shared_ptr<IOOperation> &operat
 			  "original token advances shared sequencing on owner");
 	}
 }
+void actual_reclamation(const std::filesystem::path& parent) {
+	for (bool retired : {false, true}) {
+		auto directory = parent / (retired ? "gc-retired" : "gc"); std::filesystem::create_directory(directory); ::chmod(directory.c_str(), 0700);
+		auto io = std::make_shared<PosixIO>(directory); std::weak_ptr<PosixIO> backend = io;
+		AdmissionLimits limits{{16u << 20, 256}, {1u << 20, 4}, {4u << 20, 4}, 64, 3};
+		auto store = std::make_unique<Store>(io, limits, 1024); Identity id{}; id[0] = 'g'; store->create(id); while (!store->inventory_step(1).complete) {}
+		auto replacement = store->reserve_replacement(128, 128); store->begin_artifact(*replacement, ArtifactPart::Application); store->write_chunk(*replacement, "orphan"); auto artifact = store->finish_artifact(*replacement); store->cancel_replacement(*replacement);
+		auto before = store->accounting()->used; auto job = store->begin_reclaim(4096); BsdCompletionQueue queue;
+		while (!job->done()) {
+			queue.submit(job); auto completed = await_step(queue);
+			if (store) { check(store->accounting()->used == before && throws([&] { job->result(); }), "physical native reclamation never credits quota before terminal owner settlement"); }
+			if (retired && store) { store.reset(); io.reset(); check(!backend.expired(), "outstanding GC retains backend and accounting after facade retirement"); }
+			check(job->complete(std::move(completed.completion)), "original GC completion advances on owner");
+		}
+		check(job->result().removed == 1 && job->result().logical_bytes == 74 && !std::filesystem::exists(directory / artifact_name(artifact)), "native GC removes exact sealed orphan after directory barrier");
+		if (store) { check(store->accounting()->used.logical_bytes + 74 == before.logical_bytes && store->accounting()->used.entries + 1 == before.entries && !store->accounting()->tainted, "terminal GC credits exact bytes and entry once"); }
+		check(queue.stats().native_completed >= 1 && queue.stats().file_read_bytes == 56, "native GC reads only bounded ownership metadata");
+		job.reset(); store.reset(); io.reset(); check(backend.expired(), "completed GC capability releases retired owner lock and backend");
+	}
+}
+
 void actual_reads(const std::filesystem::path& parent) {
 	auto directory = parent / "reads"; std::filesystem::create_directory(directory); ::chmod(directory.c_str(), 0700);
 	auto io = std::make_shared<PosixIO>(directory); std::weak_ptr<PosixIO> backend = io;
@@ -257,6 +278,7 @@ int main() {
 			throw std::runtime_error("completion test directory already exists");
 		}
 		::chmod(directory.c_str(), 0700);
+		actual_reclamation(directory);
 		actual_reads(directory);
 		actual_backend(directory);
 		owner_retirement(directory);

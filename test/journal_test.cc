@@ -1170,21 +1170,33 @@ void store_posix() {
 	}
 }
 
-void reclamation_failures() {
-	auto baseline = reclaim_fixture(); std::size_t operations;
+void reclamation_failures(std::size_t chunk = std::numeric_limits<std::size_t>::max(), bool suspended = false) {
+	auto baseline = reclaim_fixture(); baseline.chunk = chunk; std::size_t operations;
+	auto reclaim = [&](Journal& journal) {
+		if (!suspended) { return journal.reclaim_step(4096); }
+		auto job = journal.begin_reclaim(4096);
+		while (!job->done()) {
+			job->submitted(); auto original = detail::execute_primitive(job->io(), job->request());
+			check(throws([&] { job->result(); }), "executed reclamation cannot settle before original reap");
+			MutationCompletion stale; stale.token = job->request().token; ++stale.token.operation;
+			check(!job->complete(std::move(stale)) && job->in_flight(), "stale reclamation callback cannot release original primitive");
+			check(job->complete(std::move(original)), "matching reclamation callback advances owned sequencing");
+		}
+		return journal.finish_reclaim(job);
+	};
 	auto proof = baseline.clone(); auto expected = replay_checkpoint(proof).first;
 	{
-		auto model = baseline.clone(); MemoryIO io(model); Journal journal(io, 1024); journal.recover([](auto, auto) {}, [](auto&, auto&, auto) {});
-		model.operations = 0; auto stats = journal.reclaim_step(4096); operations = model.operations;
+		auto model = baseline.clone(); auto io = std::make_shared<MemoryIO>(model); Journal journal(io, 1024); journal.recover([](auto, auto) {}, [](auto&, auto&, auto) {});
+		model.operations = 0; auto stats = reclaim(journal); operations = model.operations;
 		check(stats.complete && stats.removed == 4 && stats.logical_bytes > 0, "obsolete generations and sealed artifacts are durably reclaimed");
 	}
 	for (std::size_t operation = 1; operation <= operations; ++operation) {
 		for (bool after : {false, true}) {
 			auto failed = baseline.clone();
 			{
-				MemoryIO io(failed); Journal journal(io, 1024); journal.recover([](auto, auto) {}, [](auto&, auto&, auto) {});
+				auto io = std::make_shared<MemoryIO>(failed); Journal journal(io, 1024); journal.recover([](auto, auto) {}, [](auto&, auto&, auto) {});
 				failed.operations = 0; failed.fail_operation = operation; failed.fail_after = after;
-				check(throws([&] { journal.reclaim_step(4096); }) && journal.fenced(), "uncertain reclamation I/O fences the owner");
+				check(throws([&] { reclaim(journal); }) && journal.fenced(), "uncertain reclamation I/O fences the owner");
 				check(throws([&] { journal.append_batch("unavailable"); }), "failed reclamation cannot resume writes");
 			}
 			failed.fail_operation = 0;
@@ -1661,7 +1673,7 @@ void posix() {
 } // namespace
 
 int main() {
-	try { basics(); append_failures(); append_failures(3); append_failures(std::numeric_limits<std::size_t>::max(), true); append_failures(3, true); append_failures(std::numeric_limits<std::size_t>::max(), false, true); append_failures(3, false, true); append_failures(std::numeric_limits<std::size_t>::max(), true, true); append_failures(3, true, true); suspended_artifact_operations(); suspended_artifact_ownership(); suspended_append_ownership(); fenced_append_submission(); suspended_append_retirement(); recovery_failures(); recovery_failures(true); recovery_failures(false, true); recovery_failures(true, true); corruption(); initialization_failures(); checkpoint_basics(); checkpoint_successive_generations(); suspended_artifact_open(); suspended_artifact_reads(); incremental_artifact_verification(); store_incremental_verification(); published_artifact_selection(); store_published_selection(); artifact_verification(); preparation_ownership_and_failures(); checkpoint_publication_failures(); checkpoint_publication_failures(3); checkpoint_publication_failures(std::numeric_limits<std::size_t>::max(), true); checkpoint_publication_failures(3, true); checkpoint_corruption(); reclamation_roots_and_unknowns(); reclamation_failures(); durable_staging_ownership(); mixed_artifact_formats(); footprint_plans(); checkpoint_publication_retirement(); store_publication_completions(); store_artifact_completions(); detached_old_artifact_lease(); store_append_completions(); store_reclaim_before_inventory(); store_basics(); store_failures(); store_append_and_cleanup_failures(); store_limits_and_pins(); store_posix(); posix(); }
+	try { basics(); append_failures(); append_failures(3); append_failures(std::numeric_limits<std::size_t>::max(), true); append_failures(3, true); append_failures(std::numeric_limits<std::size_t>::max(), false, true); append_failures(3, false, true); append_failures(std::numeric_limits<std::size_t>::max(), true, true); append_failures(3, true, true); suspended_artifact_operations(); suspended_artifact_ownership(); suspended_append_ownership(); fenced_append_submission(); suspended_append_retirement(); recovery_failures(); recovery_failures(true); recovery_failures(false, true); recovery_failures(true, true); corruption(); initialization_failures(); checkpoint_basics(); checkpoint_successive_generations(); suspended_artifact_open(); suspended_artifact_reads(); incremental_artifact_verification(); store_incremental_verification(); published_artifact_selection(); store_published_selection(); artifact_verification(); preparation_ownership_and_failures(); checkpoint_publication_failures(); checkpoint_publication_failures(3); checkpoint_publication_failures(std::numeric_limits<std::size_t>::max(), true); checkpoint_publication_failures(3, true); checkpoint_corruption(); reclamation_roots_and_unknowns(); reclamation_failures(); reclamation_failures(3); reclamation_failures(std::numeric_limits<std::size_t>::max(), true); reclamation_failures(3, true); durable_staging_ownership(); mixed_artifact_formats(); footprint_plans(); checkpoint_publication_retirement(); store_publication_completions(); store_artifact_completions(); detached_old_artifact_lease(); store_append_completions(); store_reclaim_before_inventory(); store_basics(); store_failures(); store_append_and_cleanup_failures(); store_limits_and_pins(); store_posix(); posix(); }
 	catch (const std::exception& error) { check(false, error.what()); }
 	std::cout << checks << " journal checks, " << failures << " failures\n";
 	return failures ? 1 : 0;

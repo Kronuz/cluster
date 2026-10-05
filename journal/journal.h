@@ -3,6 +3,7 @@
 #include "artifact.h"
 #include "mutation.h"
 #include "resources.h"
+#include "reclamation.h"
 #include <array>
 #include <limits>
 #include <random>
@@ -47,12 +48,6 @@ private:
 	ArtifactDescriptor checkpoint_;
 	std::size_t index_;
 	ArtifactDescriptor dependency_;
-};
-
-struct ReclaimStats {
-	std::size_t scanned = 0, removed = 0, protected_files = 0, unknown_files = 0;
-	std::uint64_t logical_bytes = 0;
-	bool logical_bytes_saturated = false, complete = false;
 };
 
 struct MutationPlan {
@@ -175,31 +170,12 @@ public:
 
 
 	ReclaimStats reclaim_step(std::size_t scan_budget = 128) {
-		writable();
-		if (scan_budget == 0 || scan_budget > 4096) { throw std::invalid_argument("invalid reclamation scan budget"); }
-		ReclaimStats stats;
-		try {
-			if (!reclaim_cursor_) { reclaim_cursor_ = io_.scan_directory(); }
-			while (stats.scanned < scan_budget) {
-				auto name = reclaim_cursor_->next();
-				if (!name) { stats.complete = true; reclaim_cursor_.reset(); break; }
-				++stats.scanned;
-				if (protected_name(*name)) { ++stats.protected_files; continue; }
-				if (!reclaim_name(*name)) { continue; }
-				auto file = io_.open_reclaim_candidate(*name);
-				if (!file) { ++stats.unknown_files; continue; }
-				auto length = file->size();
-				if (!owned_candidate(*name, *file, length)) { ++stats.unknown_files; continue; }
-				file.reset();
-				if (protected_name(*name)) { ++stats.protected_files; continue; }
-				io_.remove(*name); ++stats.removed;
-				if (length > std::numeric_limits<std::uint64_t>::max() - stats.logical_bytes) {
-					stats.logical_bytes = std::numeric_limits<std::uint64_t>::max(); stats.logical_bytes_saturated = true;
-				} else { stats.logical_bytes += length; }
-			}
-			if (stats.removed) { io_.sync_directory(); }
-			return stats;
-		} catch (...) { owner_->failed = true; throw; }
+		auto operation = start_reclaim(scan_budget, false); drive_synchronously(*operation); return finish_reclaim(operation);
+	}
+	std::shared_ptr<ReclaimMutation> begin_reclaim(std::size_t scan_budget = 128) { return start_reclaim(scan_budget, true); }
+	ReclaimStats finish_reclaim(const std::shared_ptr<ReclaimMutation>& operation) {
+		if (!operation || reclaim_job_.lock() != operation) { throw std::invalid_argument("stale or foreign reclamation"); }
+		auto result = operation->result(); reclaim_cursor_ = operation->cursor_; operation->settled(); reclaim_job_.reset(); return result;
 	}
 
 	Frontier create(Identity identity) {
@@ -447,49 +423,50 @@ private:
 		return name == "journal-0000000000000001" || hexadecimal_name(name, "generation-", 32) ||
 			hexadecimal_name(name, "artifact-", 32) || hexadecimal_name(name, "manifest.pending-", 32);
 	}
-	bool protected_name(std::string_view name) const {
-		if (name == manifest_name || name == "owner.lock" || name == data_name(frontier_)) { return true; }
-		if (frontier_.checkpoint && name == artifact_name(*frontier_.checkpoint)) { return true; }
-		for (const auto& artifact : frontier_.dependencies) { if (name == artifact_name(artifact)) { return true; } }
-		if (owner_->preparing_identity && name == "artifact-" + detail::hexadecimal(*owner_->preparing_identity)) { return true; }
-		for (const auto& [identity, references] : owner_->pins) { if (name == "artifact-" + detail::hexadecimal(identity)) { return true; } }
-		return false;
+	std::shared_ptr<ReclaimMutation> start_reclaim(std::size_t budget, bool asynchronous) {
+		writable();
+		if (!budget || budget > 4096) { throw std::invalid_argument("invalid reclamation scan budget"); }
+		if (asynchronous && !owner_->io_lifetime) { throw std::logic_error("completion reclamation requires owned IO"); }
+		std::vector<std::string> roots{std::string(manifest_name), "owner.lock", data_name(frontier_)};
+		if (frontier_.checkpoint) { roots.push_back(artifact_name(*frontier_.checkpoint)); }
+		for (const auto& artifact : frontier_.dependencies) { roots.push_back(artifact_name(artifact)); }
+		auto io = owner_->io_lifetime ? owner_->io_lifetime : std::shared_ptr<IO>(&io_, [](IO*) {});
+		auto operation = std::shared_ptr<ReclaimMutation>(new ReclaimMutation(std::move(io), owner_, frontier_.identity,
+			reclaim_cursor_, std::move(roots), budget, maximum_manifest_size, reclaim_name, reclaim_header_extent, owned_candidate_bytes));
+		reclaim_job_ = operation; return operation;
 	}
-	bool owned_candidate(std::string_view name, File& file, std::uint64_t length) const {
+	static std::size_t reclaim_header_extent(std::string_view name, std::uint64_t length) {
+		if (name.starts_with("manifest.pending-")) {
+			return length == manifest_size || (length >= manifest_v2_size && length <= maximum_manifest_size) ? static_cast<std::size_t>(length) : 0;
+		}
+		if (name.starts_with("artifact-")) { return length >= 8 ? static_cast<std::size_t>(std::min<std::uint64_t>(length, detail::artifact_v1_header_size)) : 0; }
+		auto size = name.starts_with("generation-") ? file_header_v2_size : file_header_size;
+		return length >= size ? size : 0;
+	}
+	static bool owned_candidate_bytes(Identity identity, std::string_view name, std::uint64_t length, std::string_view raw) {
 		try {
-			std::array<char, maximum_manifest_size> raw{};
-			if (name.starts_with("manifest.pending-")) {
-				if (length != manifest_size && (length < manifest_v2_size || length > maximum_manifest_size)) { return false; }
-				read_all(file, 0, std::span<char>(raw.data(), static_cast<std::size_t>(length)));
-				return decode_manifest(std::string_view(raw.data(), static_cast<std::size_t>(length))).identity == frontier_.identity;
-			}
+			if (name.starts_with("manifest.pending-")) { return decode_manifest(raw).identity == identity; }
 			if (name.starts_with("artifact-")) {
-				if (length < 8) { return false; }
-				read_all(file, 0, std::span<char>(raw.data(), 8)); std::string_view version(raw.data(), 8);
+				if (raw.size() < 8) { return false; } auto version = raw;
 				if (get64(version) == detail::artifact_v2_magic) {
-					if (length < detail::artifact_ownership_size) { return false; }
-					read_all(file, 0, std::span<char>(raw.data(), detail::artifact_ownership_size));
-					std::string_view prefix(raw.data(), detail::artifact_ownership_size);
+					if (raw.size() < detail::artifact_ownership_size) { return false; }
+					auto prefix = raw.substr(0, detail::artifact_ownership_size);
 					if (crc32c(prefix.substr(0, 40)) != checksum_at_end(prefix)) { return false; }
 					prefix.remove_prefix(8);
-					if (prefix.substr(0, 16) != std::string_view(frontier_.identity.data(), 16)) { return false; }
+					if (prefix.substr(0, 16) != std::string_view(identity.data(), 16)) { return false; }
 					prefix.remove_prefix(16); Identity id{}; std::copy_n(prefix.begin(), id.size(), id.begin());
 					return name == "artifact-" + detail::hexadecimal(id);
 				}
 			}
 			auto size = name.starts_with("artifact-") ? detail::artifact_v1_header_size : (name.starts_with("generation-") ? file_header_v2_size : file_header_size);
-			if (length < size) { return false; }
-			read_all(file, 0, std::span<char>(raw.data(), size));
-			std::string_view bytes(raw.data(), size);
+			if (raw.size() < size) { return false; } auto bytes = raw.substr(0, size);
 			if (crc32c(bytes.substr(0, size - 4)) != checksum_at_end(bytes)) { return false; }
 			auto magic = get64(bytes);
-			if (bytes.substr(0, frontier_.identity.size()) != std::string_view(frontier_.identity.data(), frontier_.identity.size())) { return false; }
-			bytes.remove_prefix(frontier_.identity.size());
+			if (bytes.substr(0, identity.size()) != std::string_view(identity.data(), identity.size())) { return false; }
+			bytes.remove_prefix(identity.size());
 			if (name.starts_with("artifact-")) {
-				Identity id{}; std::copy_n(bytes.begin(), id.size(), id.begin()); bytes.remove_prefix(id.size());
-				auto payload = get64(bytes);
-				return magic == detail::artifact_magic && name == "artifact-" + detail::hexadecimal(id) &&
-					payload <= maximum_offset - detail::artifact_v1_header_size && length == detail::artifact_v1_header_size + payload;
+				Identity id{}; std::copy_n(bytes.begin(), id.size(), id.begin()); bytes.remove_prefix(id.size()); auto payload = get64(bytes);
+				return magic == detail::artifact_magic && name == "artifact-" + detail::hexadecimal(id) && payload <= maximum_offset - detail::artifact_v1_header_size && length == detail::artifact_v1_header_size + payload;
 			}
 			if (name.starts_with("generation-")) {
 				Identity id{}; std::copy_n(bytes.begin(), id.size(), id.begin()); bytes.remove_prefix(id.size());
@@ -607,7 +584,8 @@ private:
 	std::weak_ptr<AppendMutation> append_operation_;
 	std::optional<Frontier> append_target_;
 	Frontier frontier_;
-	std::unique_ptr<DirectoryCursor> reclaim_cursor_;
+	std::shared_ptr<DirectoryCursor> reclaim_cursor_;
+	std::weak_ptr<ReclaimMutation> reclaim_job_;
 	bool ready_ = false;
 };
 

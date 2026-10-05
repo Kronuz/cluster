@@ -244,6 +244,48 @@ private:
 	bool started_ = false, finished_ = false;
 };
 
+// Retain quota accounting through the final directory barrier, including
+// facade retirement. Physical removal alone never refunds admission.
+class StoreReclaim final : public IOOperation {
+public:
+	StoreReclaim(const StoreReclaim&) = delete;
+	StoreReclaim& operator=(const StoreReclaim&) = delete;
+	~StoreReclaim() override {
+		if (started_ && !finished_) { journal_->fence_storage(); admission_->taint(); }
+	}
+	const MutationRequest& request() const override { return operation_->request(); }
+	void submitted() override { started_ = true; operation_->submitted(); }
+	bool complete(MutationCompletion completion) noexcept override {
+		if (!operation_->complete(std::move(completion))) { return false; }
+		if (operation_->done()) {
+			try {
+				auto result = journal_->finish_reclaim(operation_);
+				if (result.logical_bytes_saturated) { throw std::overflow_error("reclamation credit overflow"); }
+				admission_->credit_durable_reclaim({result.logical_bytes, result.removed}); result_ = result;
+			} catch (...) { error_ = std::current_exception(); journal_->fence_storage(); admission_->taint(); }
+			finished_ = true;
+		}
+		return true;
+	}
+	bool done() const noexcept override { return finished_; }
+	bool in_flight() const noexcept override { return operation_->in_flight(); }
+	IO& io() const noexcept override { return operation_->io(); }
+	ReclaimStats result() const {
+		if (!finished_) { throw std::logic_error("Store reclamation has not completed"); }
+		if (error_) { std::rethrow_exception(error_); } return *result_;
+	}
+private:
+	friend class Store;
+	StoreReclaim(std::shared_ptr<Journal> journal, std::shared_ptr<Admission> admission, std::shared_ptr<ReclaimMutation> operation)
+		: journal_(std::move(journal)), admission_(std::move(admission)), operation_(std::move(operation)) {}
+	std::shared_ptr<Journal> journal_;
+	std::shared_ptr<Admission> admission_;
+	std::shared_ptr<ReclaimMutation> operation_;
+	std::optional<ReclaimStats> result_;
+	std::exception_ptr error_;
+	bool started_ = false, finished_ = false;
+};
+
 // Single ordered storage executor. IO outlives Store and escaped readers and
 // is used EXCLUSIVELY through Store while its session is open. No mutable
 // Journal, artifact builder, or prepared handle escapes this boundary.
@@ -315,7 +357,7 @@ public:
 		if (admission_) { return inventory_->stats(); }
 		try {
 			auto result = inventory_->step(budget);
-			if (result.ready()) { admission_ = std::make_unique<Admission>(result, limits_); }
+			if (result.ready()) { admission_ = std::make_shared<Admission>(result, limits_); }
 			return result;
 		} catch (...) { fence(); throw; }
 	}
@@ -436,18 +478,22 @@ public:
 		auto& operation = replacement(id); operation.dispose_known(*journal_); replacement_.reset();
 	}
 	ReclaimStats reclaim_step(std::size_t budget = 128) {
-		if (journal_->mutation_pending()) { throw std::logic_error("storage mutation is pending"); }
 		healthy(); if (!opened_) { throw std::logic_error("store not recovered"); }
-		if (budget == 0 || budget > 4096) { throw std::invalid_argument("invalid reclamation scan budget"); }
-		if (!admission_) { inventory_.reset(); } // Mutation invalidates partial census.
+		if (journal_->mutation_pending()) { throw std::logic_error("storage mutation is pending"); }
+		if (!budget || budget > 4096) { throw std::invalid_argument("invalid reclamation scan budget"); }
+		if (admission_) {
+			auto operation = start_reclaim(budget, false);
+			try { drive_synchronously(*operation); return operation->result(); } catch (...) { fence(); throw; }
+		}
+		inventory_.reset();
 		try {
 			auto result = journal_->reclaim_step(budget);
 			if (result.logical_bytes_saturated) { throw std::overflow_error("reclamation credit overflow"); }
-			if (admission_) { admission_->credit_durable_reclaim({result.logical_bytes, result.removed}); }
-			else { inventory_.emplace(io_); }
-			return result;
+			inventory_.emplace(io_); return result;
 		} catch (...) { fence(); throw; }
 	}
+	std::shared_ptr<StoreReclaim> begin_reclaim(std::size_t budget = 1) { return start_reclaim(budget, true); }
+
 private:
 	static IO& owned_io(const std::shared_ptr<IO>& io) {
 		if (!io) { throw std::invalid_argument("null owned store IO"); } return *io;
@@ -465,6 +511,11 @@ private:
 		std::array<std::uint64_t, 2> lengths{cycle.lengths[1], cycle.lengths[0]}; auto plan = journal_->checkpoint_plan(lengths);
 		auto publication = journal_->start_checkpoint(*cycle.prepared[1], std::span<const PreparedArtifact>(&*cycle.prepared[0], 1), expected_sequence, asynchronous);
 		return std::shared_ptr<StorePublication>(new StorePublication(journal_, replacement_, std::move(publication), plan));
+	}
+	std::shared_ptr<StoreReclaim> start_reclaim(std::size_t budget, bool asynchronous) {
+		mutation_ready();
+		auto operation = journal_->start_reclaim(budget, asynchronous);
+		return std::shared_ptr<StoreReclaim>(new StoreReclaim(journal_, admission_, std::move(operation)));
 	}
 	using Replacement = detail::StoreReplacement;
 	static unsigned part_index(ArtifactPart part) {
@@ -487,7 +538,7 @@ private:
 	std::shared_ptr<char> owner_ = std::make_shared<char>();
 	std::shared_ptr<Journal> journal_;
 	std::optional<Inventory> inventory_;
-	std::unique_ptr<Admission> admission_;
+	std::shared_ptr<Admission> admission_;
 	std::shared_ptr<Replacement> replacement_;
 	std::uint64_t next_replacement_ = 0;
 	bool opened_ = false, failed_ = false;
