@@ -82,6 +82,7 @@ public:
 		io_lifetime_ = std::move(io); owner_->io_lifetime = io_lifetime_;
 	}
 	bool fenced() const noexcept { return owner_->failed; }
+	bool mutation_pending() const noexcept { return owner_->mutation_active; }
 	// Trusted owning host: uncertainty outside a Journal method must fence
 	// escaped readers and capabilities from the same storage session too.
 	void fence_storage() noexcept { owner_->failed = true; ready_ = false; }
@@ -129,6 +130,12 @@ public:
 	}
 	ArtifactBuilder prepare_artifact() {
 		writable(); return ArtifactBuilder(io_, owner_, frontier_.identity, maximum_artifact_);
+	}
+	std::shared_ptr<ArtifactMutation> begin_artifact_preparation() {
+		writable();
+		if (!owner_->io_lifetime) { throw std::logic_error("completion artifacts require owned IO"); }
+		auto state = std::make_shared<detail::ArtifactBuildState>(io_, owner_, frontier_.identity, maximum_artifact_);
+		return std::shared_ptr<ArtifactMutation>(new ArtifactMutation(std::move(state), ArtifactMutation::Kind::Create));
 	}
 	PreparedArtifact pin_artifact(const ArtifactDescriptor& artifact) {
 		available();

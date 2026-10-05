@@ -83,6 +83,117 @@ private:
 	bool started_ = false, finished_ = false;
 };
 
+namespace detail {
+struct StoreReplacement {
+	StoreReplacement(StoragePermit value, std::uint64_t identity, std::uint64_t app, std::uint64_t bundle)
+		: permit(std::move(value)), token(identity), caps{app, bundle} {}
+	void dispose_known(Journal& journal) {
+		if (disposed) { return; }
+		StorageResources staged;
+		for (unsigned index = 0; index < 2; ++index) {
+			if (created[index]) { staged = resources_add(staged, journal.artifact_footprint(lengths[index])); }
+		}
+		builder.reset(); prepared[0].reset(); prepared[1].reset();
+		if (created[0] || created[1]) { permit->settle(staged); }
+		permit.reset(); disposed = true;
+	}
+	std::optional<StoragePermit> permit;
+	std::uint64_t token, active_job = 0, next_job = 0;
+	std::array<std::uint64_t, 2> caps, lengths{};
+	std::array<bool, 2> created{};
+	unsigned active = 0;
+	std::optional<ArtifactBuilder> builder;
+	std::array<std::optional<PreparedArtifact>, 2> prepared;
+	bool detached = false, disposed = false;
+};
+class ReplacementJobLease {
+public:
+	explicit ReplacementJobLease(std::shared_ptr<StoreReplacement> cycle) : cycle_(std::move(cycle)) {
+		if (cycle_->active_job || cycle_->detached || cycle_->disposed) { throw std::logic_error("replacement job unavailable"); }
+		if (cycle_->next_job == std::numeric_limits<std::uint64_t>::max()) { throw std::overflow_error("replacement job sequence exhausted"); }
+		token_ = ++cycle_->next_job; cycle_->active_job = token_;
+	}
+	ReplacementJobLease(const ReplacementJobLease&) = delete;
+	ReplacementJobLease& operator=(const ReplacementJobLease&) = delete;
+	ReplacementJobLease(ReplacementJobLease&& other) noexcept : cycle_(std::move(other.cycle_)), token_(other.token_) {}
+	~ReplacementJobLease() { release(); }
+	StoreReplacement& cycle() const noexcept { return *cycle_; }
+	void release() noexcept { if (cycle_ && cycle_->active_job == token_) { cycle_->active_job = 0; } }
+private:
+	std::shared_ptr<StoreReplacement> cycle_;
+	std::uint64_t token_;
+};
+} // namespace detail
+
+// One bounded artifact quantum retains its whole replacement reservation.
+// Phase visibility and accounting change only on terminal owner completion.
+class StoreArtifactOperation final : public IOOperation {
+public:
+	StoreArtifactOperation(const StoreArtifactOperation&) = delete;
+	StoreArtifactOperation& operator=(const StoreArtifactOperation&) = delete;
+	~StoreArtifactOperation() override {
+		if (started_ && !finished_) { journal_->fence_storage(); lease_.cycle().permit->abandon(); }
+		if (!finished_ && !started_ && lease_.cycle().detached) {
+			try { lease_.cycle().dispose_known(*journal_); }
+			catch (...) { journal_->fence_storage(); lease_.cycle().permit->abandon(); }
+		}
+	}
+	const MutationRequest& request() const override { return operation_->request(); }
+	void submitted() override {
+		if (done() || in_flight()) { throw std::logic_error("replacement primitive unavailable"); }
+		if (!started_) { lease_.cycle().permit->mark_started(); started_ = true; }
+		operation_->submitted();
+	}
+	bool complete(MutationCompletion completion) noexcept override {
+		if (!operation_->complete(std::move(completion))) { return false; }
+		if (operation_->done()) { settle(); }
+		return true;
+	}
+	bool done() const noexcept override { return finished_; }
+	bool in_flight() const noexcept override { return operation_->in_flight(); }
+	IO& io() const noexcept override { return operation_->io(); }
+	void result() const {
+		if (!finished_) { throw std::logic_error("replacement quantum has not completed"); }
+		if (error_) { std::rethrow_exception(error_); }
+	}
+	ArtifactDescriptor descriptor() const {
+		result();
+		if (kind_ != Kind::Seal) { throw std::logic_error("replacement quantum is not sealing"); }
+		return descriptor_;
+	}
+private:
+	friend class Store;
+	enum class Kind { Create, Chunk, Seal };
+	StoreArtifactOperation(std::shared_ptr<Journal> journal, std::shared_ptr<detail::StoreReplacement> cycle,
+		std::shared_ptr<ArtifactMutation> operation, Kind kind, unsigned index, std::size_t bytes = 0)
+		: journal_(std::move(journal)), operation_(std::move(operation)), lease_(std::move(cycle)), kind_(kind), index_(index), bytes_(bytes) {
+		if (operation_->done()) { settle(); } // Empty payload quantum performs no IO.
+	}
+	void settle() noexcept {
+		auto& cycle = lease_.cycle();
+		try {
+			operation_->result();
+			switch (kind_) {
+			case Kind::Create: cycle.builder.emplace(operation_->take_builder()); cycle.active = index_; cycle.created[index_] = true; break;
+			case Kind::Chunk: cycle.lengths[index_] += bytes_; break;
+			case Kind::Seal:
+				cycle.prepared[index_].emplace(operation_->prepared_result()); descriptor_ = cycle.prepared[index_]->descriptor(); cycle.builder.reset(); break;
+			}
+			if (cycle.detached) { cycle.dispose_known(*journal_); }
+		} catch (...) { error_ = std::current_exception(); journal_->fence_storage(); cycle.permit->abandon(); }
+		finished_ = true; lease_.release();
+	}
+	std::shared_ptr<Journal> journal_;
+	std::shared_ptr<ArtifactMutation> operation_;
+	detail::ReplacementJobLease lease_;
+	Kind kind_;
+	unsigned index_;
+	std::size_t bytes_;
+	ArtifactDescriptor descriptor_{};
+	std::exception_ptr error_;
+	bool started_ = false, finished_ = false;
+};
+
 // Single ordered storage executor. IO outlives Store and escaped readers and
 // is used EXCLUSIVELY through Store while its session is open. No mutable
 // Journal, artifact builder, or prepared handle escapes this boundary.
@@ -103,6 +214,7 @@ public:
 	Store(const Store&) = delete;
 	Store& operator=(const Store&) = delete;
 	~Store() {
+		if (replacement_ && replacement_->active_job) { replacement_->detached = true; replacement_.reset(); }
 		if (replacement_) {
 			try { cancel_replacement(ReplacementId(owner_, replacement_->token)); }
 			catch (...) { fence(); replacement_.reset(); }
@@ -180,20 +292,42 @@ public:
 		std::array<std::uint64_t, 2> caps{bundle_cap, application_cap};
 		auto permit = admission_->reserve(AdmissionClass::Replacement, journal_->checkpoint_plan(caps).peak);
 		if (!permit) { return std::nullopt; }
-		replacement_ = std::make_unique<Replacement>(std::move(*permit), ++next_replacement_, application_cap, bundle_cap);
+		replacement_ = std::make_shared<Replacement>(std::move(*permit), ++next_replacement_, application_cap, bundle_cap);
 		return ReplacementId(owner_, replacement_->token);
 	}
+	std::shared_ptr<StoreArtifactOperation> begin_artifact_operation(const ReplacementId& id, ArtifactPart part) {
+		auto& cycle = replacement(id); auto index = part_index(part);
+		if (cycle.builder || cycle.created[index] || (index == 1 && !cycle.prepared[0])) { throw std::logic_error("invalid artifact preparation order"); }
+		auto operation = journal_->begin_artifact_preparation();
+		return std::shared_ptr<StoreArtifactOperation>(new StoreArtifactOperation(journal_, replacement_, std::move(operation), StoreArtifactOperation::Kind::Create, index));
+	}
+	std::shared_ptr<StoreArtifactOperation> begin_write_chunk(const ReplacementId& id, std::string_view bytes) {
+		auto& cycle = replacement(id);
+		if (!cycle.builder) { throw std::logic_error("artifact not active"); }
+		auto index = cycle.active;
+		if (bytes.size() > detail::artifact_chunk_size || bytes.size() > cycle.caps[index] - cycle.lengths[index]) { throw std::length_error("replacement chunk or payload exceeds reservation"); }
+		auto operation = cycle.builder->begin_append_chunk(bytes);
+		return std::shared_ptr<StoreArtifactOperation>(new StoreArtifactOperation(journal_, replacement_, std::move(operation), StoreArtifactOperation::Kind::Chunk, index, bytes.size()));
+	}
+	std::shared_ptr<StoreArtifactOperation> begin_finish_artifact(const ReplacementId& id) {
+		auto& cycle = replacement(id);
+		if (!cycle.builder) { throw std::logic_error("artifact not active"); }
+		auto operation = cycle.builder->begin_finish();
+		return std::shared_ptr<StoreArtifactOperation>(new StoreArtifactOperation(journal_, replacement_, std::move(operation), StoreArtifactOperation::Kind::Seal, cycle.active));
+	}
 	void begin_artifact(const ReplacementId& id, ArtifactPart part) {
+		mutation_ready();
 		auto& operation = replacement(id); auto index = part_index(part);
 		if (operation.builder || operation.created[index] || (index == 1 && !operation.prepared[0])) {
 			throw std::logic_error("invalid artifact preparation order");
 		}
-		operation.permit.mark_started();
+		operation.permit->mark_started();
 		try {
 			operation.builder.emplace(journal_->prepare_artifact()); operation.active = index; operation.created[index] = true;
 		} catch (...) { fence(); throw; }
 	}
 	void write_chunk(const ReplacementId& id, std::string_view bytes) {
+		mutation_ready();
 		auto& operation = replacement(id);
 		if (!operation.builder) { throw std::logic_error("artifact not active"); }
 		auto index = operation.active;
@@ -204,6 +338,7 @@ public:
 		catch (...) { fence(); throw; }
 	}
 	ArtifactDescriptor finish_artifact(const ReplacementId& id) {
+		mutation_ready();
 		auto& operation = replacement(id);
 		if (!operation.builder) { throw std::logic_error("artifact not active"); }
 		try {
@@ -231,6 +366,7 @@ public:
 		try { journal_->verify_artifact(*operation.prepared[index]); } catch (...) { fence(); throw; }
 	}
 	Frontier publish(const ReplacementId& id, std::uint64_t expected_sequence) {
+		mutation_ready();
 		auto& operation = replacement(id); auto current = journal_->frontier();
 		if (operation.builder || !operation.prepared[0] || !operation.prepared[1] || expected_sequence != current.sequence ||
 			current.generation == std::numeric_limits<std::uint64_t>::max()) { throw std::invalid_argument("unfinished or stale replacement"); }
@@ -238,19 +374,14 @@ public:
 		auto plan = journal_->checkpoint_plan(lengths);
 		try {
 			auto result = journal_->publish_checkpoint(*operation.prepared[1], std::span<const PreparedArtifact>(&*operation.prepared[0], 1), expected_sequence);
-			operation.permit.settle(plan.added, plan.removed); replacement_.reset(); return result;
+			operation.permit->settle(plan.added, plan.removed); replacement_.reset(); return result;
 		} catch (...) { fence(); throw; }
 	}
 	void cancel_replacement(const ReplacementId& id) {
-		auto& operation = replacement(id); StorageResources staged;
-		for (unsigned index = 0; index < 2; ++index) {
-			if (operation.created[index]) { staged = detail::resources_add(staged, journal_->artifact_footprint(operation.lengths[index])); }
-		}
-		operation.builder.reset(); operation.prepared[0].reset(); operation.prepared[1].reset();
-		if (operation.created[0] || operation.created[1]) { operation.permit.settle(staged); }
-		replacement_.reset(); // No IO started: ordinary pre-IO cancellation.
+		auto& operation = replacement(id); operation.dispose_known(*journal_); replacement_.reset();
 	}
 	ReclaimStats reclaim_step(std::size_t budget = 128) {
+		mutation_ready();
 		healthy(); if (!opened_) { throw std::logic_error("store not recovered"); }
 		if (budget == 0 || budget > 4096) { throw std::invalid_argument("invalid reclamation scan budget"); }
 		if (!admission_) { inventory_.reset(); } // Mutation invalidates partial census.
@@ -273,17 +404,7 @@ private:
 		auto append = journal_->start_append(bytes, asynchronous);
 		return std::shared_ptr<StoreAppend>(new StoreAppend(journal_, std::move(append), std::move(reservation), plan));
 	}
-	struct Replacement {
-		Replacement(StoragePermit value, std::uint64_t identity, std::uint64_t app, std::uint64_t bundle)
-			: permit(std::move(value)), token(identity), caps{app, bundle} {}
-		StoragePermit permit;
-		std::uint64_t token;
-		std::array<std::uint64_t, 2> caps, lengths{};
-		std::array<bool, 2> created{};
-		unsigned active = 0;
-		std::optional<ArtifactBuilder> builder;
-		std::array<std::optional<PreparedArtifact>, 2> prepared;
-	};
+	using Replacement = detail::StoreReplacement;
 	static unsigned part_index(ArtifactPart part) {
 		if (part != ArtifactPart::Application && part != ArtifactPart::Bundle) { throw std::invalid_argument("invalid artifact part"); }
 		return part == ArtifactPart::Application ? 0 : 1;
@@ -291,10 +412,12 @@ private:
 	Replacement& replacement(const ReplacementId& id) {
 		ready();
 		if (id.owner_ != owner_ || !replacement_ || id.token_ != replacement_->token) { throw std::invalid_argument("stale or foreign replacement"); }
+		if (replacement_->active_job) { throw std::logic_error("replacement quantum is pending"); }
 		return *replacement_;
 	}
 	void unopened() const { healthy(); if (opened_) { throw std::logic_error("store already opened"); } }
 	void healthy() const { if (fenced()) { throw std::logic_error("store fenced; close and recover"); } }
+	void mutation_ready() const { ready(); if (journal_->mutation_pending()) { throw std::logic_error("storage mutation is pending"); } }
 	void ready() const { healthy(); if (!admission_) { throw std::logic_error("storage inventory not ready"); } }
 	void fence() noexcept { failed_ = true; journal_->fence_storage(); if (admission_) { admission_->taint(); } }
 	IO& io_;
@@ -303,7 +426,7 @@ private:
 	std::shared_ptr<Journal> journal_;
 	std::optional<Inventory> inventory_;
 	std::unique_ptr<Admission> admission_;
-	std::unique_ptr<Replacement> replacement_;
+	std::shared_ptr<Replacement> replacement_;
 	std::uint64_t next_replacement_ = 0;
 	bool opened_ = false, failed_ = false;
 };

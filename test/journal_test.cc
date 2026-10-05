@@ -541,6 +541,76 @@ void store_replacement(Store& store, const ReplacementId& replacement) {
 	store.begin_artifact(replacement, ArtifactPart::Bundle); store.write_chunk(replacement, "bundle"); store.finish_artifact(replacement);
 	store.publish(replacement, store.frontier().sequence);
 }
+void store_artifact_completions() {
+	for (unsigned phase = 0; phase < 3; ++phase) {
+		for (bool detached : {false, true}) {
+			for (bool uncertain : {false, true}) {
+				auto model = initialized(); auto io = std::make_shared<MemoryIO>(model);
+				AdmissionLimits limits{{10000, 128}, {2048, 4}, {4096, 4}, 16, 3};
+				auto store = std::make_unique<Store>(io, limits, 1024); store->recover([](auto, auto) {}); store->inventory_step(128);
+				auto id = store->reserve_replacement(128, 128); auto used = store->accounting()->used;
+				check(bool(id), "completion preparation reserves complete replacement cycle");
+				if (!id) { return; }
+				auto job = store->begin_artifact_operation(*id, ArtifactPart::Application);
+				if (phase > 0) { drive_synchronously(*job); job->result(); job = store->begin_write_chunk(*id, "payload"); }
+				if (phase > 1) { drive_synchronously(*job); job->result(); job = store->begin_finish_artifact(*id); }
+				auto outstanding = store->accounting()->outstanding;
+				job->submitted(); auto completion = detail::execute_primitive(job->io(), job->request());
+				auto before = model.operations;
+				check(throws([&] { store->cancel_replacement(*id); }) && throws([&] { store->write_chunk(*id, "overlap"); }) && throws([&] { store->reclaim_step(1); }) && !store->fenced() && before == model.operations, "pending quantum rejects cancellation and competing mutation without IO or fencing");
+				check(store->accounting()->used == used && store->accounting()->outstanding == outstanding, "executed but undelivered artifact quantum retains entire reservation");
+				MutationCompletion stale; stale.token = completion.token; ++stale.token.operation;
+				check(!job->complete(std::move(stale)) && job->in_flight(), "stale artifact completion cannot settle replacement lease");
+				if (uncertain) { completion.error = std::make_exception_ptr(std::runtime_error("injected artifact completion uncertainty")); }
+				if (detached) { store.reset(); io.reset(); check(model.locked, "detached replacement retains backend and stable owner lock"); }
+				check(job->complete(std::move(completion)), "original artifact completion reaped through admitted job");
+				drive_synchronously(*job);
+				if (uncertain) {
+					check(throws([&] { job->result(); }), "uncertain artifact job preserves original failure");
+					if (store) { check(store->fenced() && store->accounting()->tainted && store->accounting()->used == used && store->accounting()->outstanding == outstanding, "uncertain preparation fences and retains conservative capacity"); }
+				} else {
+					job->result();
+					if (store) {
+						if (phase == 0) { store->write_chunk(*id, "payload"); }
+						auto descriptor = phase == 2 ? job->descriptor() : store->finish_artifact(*id);
+						check(descriptor.length == 7 && descriptor.checksum == crc32c("payload"), "terminal artifact quantum transfers exact visible length and seal into cycle");
+						store->cancel_replacement(*id);
+						check(store->accounting()->outstanding == StorageResources{} && store->accounting()->used.logical_bytes == used.logical_bytes + detail::artifact_header_size + 7 && !store->accounting()->tainted, "known canceled preparation keeps staged bytes charged and releases unused reservation");
+					}
+				}
+				job.reset(); store.reset(); io.reset(); check(!model.locked, "terminal artifact retirement closes handles and releases stable ownership");
+				model.fail_operation = 0; check(replay(model) == std::vector<std::string>{"first"}, "detached or uncertain preparation never changes acknowledged journal history");
+			}
+		}
+	}
+	{
+		auto model = initialized(); auto io = std::make_shared<MemoryIO>(model);
+		AdmissionLimits limits{{10000, 128}, {2048, 4}, {4096, 4}, 16, 3}; Store store(io, limits, 1024); store.recover([](auto, auto) {}); store.inventory_step(128);
+		auto id = store.reserve_replacement(128, 128); auto before = model.operations;
+		{ auto canceled = store.begin_artifact_operation(*id, ArtifactPart::Application); }
+		check(before == model.operations && !store.fenced(), "unsubmitted replacement job cancellation performs no IO");
+		store.cancel_replacement(*id); check(store.accounting()->outstanding == StorageResources{}, "unsubmitted cycle cancellation refunds whole reservation");
+		id = store.reserve_replacement(128, 128); auto creation = store.begin_artifact_operation(*id, ArtifactPart::Application); drive_synchronously(*creation); creation->result(); creation.reset();
+		auto empty = store.begin_write_chunk(*id, ""); check(empty->done(), "empty preparation quantum performs no IO");
+		auto payload = store.begin_write_chunk(*id, "new"); empty.reset();
+		check(throws([&] { store.cancel_replacement(*id); }), "retiring old completed lease cannot release a newer preparation job");
+		payload.reset(); store.cancel_replacement(*id);
+	}
+}
+
+void detached_old_artifact_lease() {
+	auto model = initialized(); auto io = std::make_shared<MemoryIO>(model);
+	AdmissionLimits limits{{10000, 128}, {2048, 4}, {4096, 4}, 16, 3}; auto store = std::make_unique<Store>(io, limits, 1024);
+	store->recover([](auto, auto) {}); store->inventory_step(128); auto id = store->reserve_replacement(128, 128);
+	{ auto creation = store->begin_artifact_operation(*id, ArtifactPart::Application); drive_synchronously(*creation); creation->result(); }
+	auto old = store->begin_write_chunk(*id, ""); auto payload = store->begin_write_chunk(*id, "new");
+	payload->submitted(); auto original = detail::execute_primitive(payload->io(), payload->request());
+	store.reset(); io.reset(); old.reset();
+	check(payload->in_flight() && model.locked && payload->complete(std::move(original)), "retiring old empty job after detachment cannot dispose the active replacement lease");
+	drive_synchronously(*payload); payload->result(); payload.reset();
+	check(!model.locked && replay(model) == std::vector<std::string>{"first"}, "detached payload settles independently of retired old jobs");
+}
+
 void store_append_completions() {
 	auto model = initialized(3); auto io = std::make_shared<MemoryIO>(model); Store store(io, store_limits, 1024);
 	store.recover([](auto, auto) {}); ready_store(store); auto initial = store.accounting()->used;
@@ -1067,6 +1137,99 @@ void append_failures(std::size_t chunk = std::numeric_limits<std::size_t>::max()
 	std::cout << "append publication operations tested: " << operation_count << '\n';
 }
 
+void suspended_artifact_operations() {
+	auto baseline = initialized();
+	for (auto chunk : {std::size_t{3}, std::numeric_limits<std::size_t>::max()}) {
+		baseline.chunk = chunk;
+		auto prepare_owned = [](Journal& journal, bool suspended) {
+			if (!suspended) { return prepare(journal, "artifact-payload"); }
+			auto drive = [&](const std::shared_ptr<ArtifactMutation>& operation) {
+				while (!operation->done()) {
+					auto before = operation->request().token;
+					operation->submitted(); auto completion = detail::execute_primitive(operation->io(), operation->request());
+					check(throws([&] { operation->result(); }), "executed artifact primitive cannot report completion before delivery");
+					MutationCompletion stale; stale.token = before; ++stale.token.step;
+					check(!operation->complete(std::move(stale)) && operation->in_flight(), "stale artifact completion retains original primitive");
+					check(operation->complete(std::move(completion)), "matching artifact primitive reaped");
+					MutationCompletion duplicate; duplicate.token = before;
+					check(!operation->complete(std::move(duplicate)), "duplicate artifact completion cannot advance another phase");
+				}
+				operation->result();
+			};
+			auto creation = journal.begin_artifact_preparation(); drive(creation);
+			auto builder = creation->take_builder(); creation.reset();
+			auto payload = builder.begin_append_chunk("artifact-payload"); drive(payload); payload.reset();
+			auto seal = builder.begin_finish(); drive(seal); return seal->prepared_result();
+		};
+		std::size_t count = 0;
+		{
+			auto model = baseline.clone(); auto io = std::make_shared<MemoryIO>(model); Journal journal(io, 1024);
+			journal.recover([](auto, auto) {}); model.operations = 0;
+			auto prepared = prepare_owned(journal, true); count = model.operations;
+			check(prepared.descriptor().length == 16 && prepared.descriptor().checksum == crc32c("artifact-payload"), "completion artifact settles exact descriptor after seal barriers");
+			journal.verify_artifact(prepared);
+		}
+		for (std::size_t fault = 1; fault <= count; ++fault) {
+			for (bool after : {false, true}) {
+				std::array<Model, 2> outcomes{baseline.clone(), baseline.clone()};
+				for (unsigned driver = 0; driver < 2; ++driver) {
+					auto& model = outcomes[driver];
+					auto io = std::make_shared<MemoryIO>(model); Journal journal(io, 1024); journal.recover([](auto, auto) {});
+					model.operations = 0; model.fail_operation = fault; model.fail_after = after;
+					check(throws([&] { prepare_owned(journal, driver == 1); }) && journal.fenced(), "both artifact drivers fence each uncertain primitive outcome");
+					check(model.operations == fault, "artifact failure never executes a later primitive");
+				}
+				auto footprints = [](const Model& model) {
+					std::vector<std::pair<std::size_t, std::size_t>> sizes;
+					for (const auto& [name, inode] : model.visible) { sizes.emplace_back(inode->visible.size(), inode->durable.size()); }
+					std::sort(sizes.begin(), sizes.end()); return sizes;
+				};
+				check(footprints(outcomes[0]) == footprints(outcomes[1]), "both artifact drivers leave identical visible/durable file footprints under the same fault");
+				for (bool visible : {false, true}) {
+					for (auto& outcome : outcomes) {
+						auto crash = outcome.clone(); crash.power_loss(visible);
+						check(replay(crash) == std::vector<std::string>{"first"}, "artifact faults preserve acknowledged history under both namespace outcomes");
+					}
+				}
+			}
+		}
+	}
+}
+void suspended_artifact_ownership() {
+	auto model = initialized(); auto io = std::make_shared<MemoryIO>(model);
+	auto journal = std::make_unique<Journal>(io, 1024); journal->recover([](auto, auto) {});
+	{
+		auto canceled = journal->begin_artifact_preparation();
+		check(throws([&] { journal->prepare_artifact(); }), "unsubmitted creation owns the bounded preparation slot");
+	}
+	check(!journal->fenced(), "unsubmitted artifact cancellation performs no IO and leaves owner healthy");
+	auto creation = journal->begin_artifact_preparation(); creation->submitted();
+	auto first = detail::execute_primitive(creation->io(), creation->request());
+	auto before = model.operations;
+	check(throws([&] { journal->append_batch("overlap"); }) && before == model.operations, "pending artifact primitive rejects overlapping mutations before IO");
+	journal.reset(); io.reset();
+	check(model.locked && creation->complete(std::move(first)), "creation keeps backend and stable lock after facade retirement");
+	drive_synchronously(*creation); auto builder = creation->take_builder();
+	check(throws([&] { creation->take_builder(); }), "creation exposes exactly one builder facade"); creation.reset();
+	{
+		auto canceled = builder.begin_append_chunk("discarded");
+	}
+	auto payload = builder.begin_append_chunk("retained");
+	{
+		auto old = payload;
+		drive_synchronously(*payload); payload->result();
+		auto seal = builder.begin_finish(); payload.reset(); old.reset();
+		check(throws([&] { builder.begin_append_chunk("overlap"); }), "retiring completed payload cannot release the sealing gate");
+		while (!seal->done()) {
+			seal->submitted(); auto completion = detail::execute_primitive(seal->io(), seal->request());
+			check(throws([&] { seal->prepared_result(); }), "seal capability remains hidden until original directory barrier is delivered");
+			check(seal->complete(std::move(completion)), "sealing retains matching completion ownership");
+		}
+		auto prepared = seal->prepared_result();
+		check(prepared.descriptor().length == 8 && prepared.descriptor().checksum == crc32c("retained"), "unsubmitted payload cancellation leaves checksum and length unchanged");
+	}
+}
+
 void suspended_append_ownership() {
 	auto model = initialized(3);
 	std::weak_ptr<MemoryIO> backend;
@@ -1294,7 +1457,7 @@ void posix() {
 } // namespace
 
 int main() {
-	try { basics(); append_failures(); append_failures(3); append_failures(std::numeric_limits<std::size_t>::max(), true); append_failures(3, true); append_failures(std::numeric_limits<std::size_t>::max(), false, true); append_failures(3, false, true); append_failures(std::numeric_limits<std::size_t>::max(), true, true); append_failures(3, true, true); suspended_append_ownership(); suspended_append_retirement(); recovery_failures(); recovery_failures(true); recovery_failures(false, true); recovery_failures(true, true); corruption(); initialization_failures(); checkpoint_basics(); checkpoint_successive_generations(); incremental_artifact_verification(); store_incremental_verification(); published_artifact_selection(); store_published_selection(); artifact_verification(); preparation_ownership_and_failures(); checkpoint_publication_failures(); checkpoint_corruption(); reclamation_roots_and_unknowns(); reclamation_failures(); durable_staging_ownership(); mixed_artifact_formats(); footprint_plans(); store_append_completions(); store_basics(); store_failures(); store_append_and_cleanup_failures(); store_limits_and_pins(); store_posix(); posix(); }
+	try { basics(); append_failures(); append_failures(3); append_failures(std::numeric_limits<std::size_t>::max(), true); append_failures(3, true); append_failures(std::numeric_limits<std::size_t>::max(), false, true); append_failures(3, false, true); append_failures(std::numeric_limits<std::size_t>::max(), true, true); append_failures(3, true, true); suspended_artifact_operations(); suspended_artifact_ownership(); suspended_append_ownership(); suspended_append_retirement(); recovery_failures(); recovery_failures(true); recovery_failures(false, true); recovery_failures(true, true); corruption(); initialization_failures(); checkpoint_basics(); checkpoint_successive_generations(); incremental_artifact_verification(); store_incremental_verification(); published_artifact_selection(); store_published_selection(); artifact_verification(); preparation_ownership_and_failures(); checkpoint_publication_failures(); checkpoint_corruption(); reclamation_roots_and_unknowns(); reclamation_failures(); durable_staging_ownership(); mixed_artifact_formats(); footprint_plans(); store_artifact_completions(); detached_old_artifact_lease(); store_append_completions(); store_basics(); store_failures(); store_append_and_cleanup_failures(); store_limits_and_pins(); store_posix(); posix(); }
 	catch (const std::exception& error) { check(false, error.what()); }
 	std::cout << checks << " journal checks, " << failures << " failures\n";
 	return failures ? 1 : 0;

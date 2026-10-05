@@ -119,6 +119,61 @@ void owner_retirement(const std::filesystem::path &directory) {
 		  "retired owner still finishes original durable transaction");
 }
 
+void actual_artifacts(const std::filesystem::path& parent) {
+	auto directory = parent / "artifacts"; std::filesystem::create_directory(directory); ::chmod(directory.c_str(), 0700);
+	ArtifactDescriptor descriptor;
+	{
+		auto io = std::make_shared<PosixIO>(directory); Journal journal(io, 1024);
+		Identity id{}; id[0] = 'a'; journal.create(id); BsdCompletionQueue queue;
+		auto creation = journal.begin_artifact_preparation(); drive(queue, creation);
+		auto builder = creation->take_builder(); creation.reset();
+		auto payload = builder.begin_append_chunk(std::string(60000, 'z')); drive(queue, payload); payload->result(); payload.reset();
+		auto seal = builder.begin_finish();
+		while (!seal->done()) {
+			check(queue.submit(seal), "artifact seal reserves one primitive"); auto completed = await_step(queue);
+			check(throws([&] { seal->prepared_result(); }), "native seal cannot expose capability before original barrier completion");
+			check(seal->complete(std::move(completed.completion)), "native seal applies matching completion");
+		}
+		auto prepared = seal->prepared_result(); descriptor = prepared.descriptor();
+		check(descriptor.length == 60000 && descriptor.checksum == crc32c(std::string(60000, 'z')), "native artifact preserves exact payload checksum and descriptor");
+		journal.publish_checkpoint(prepared, {}, 0);
+		auto stats = queue.stats(); check(stats.native_completed >= 3 && stats.fallback_completed >= 4, "artifact creation/payload/seal use native writes and explicit flush/namespace fallback");
+	}
+	{
+		PosixIO io(directory); Journal journal(io, 1024); bool restored = false;
+		journal.recover([](auto, auto) {}, [&](const Frontier& frontier, ArtifactReader& reader, auto) {
+			std::string bytes(60000, '\0'); std::size_t consumed = 0;
+			while (consumed < bytes.size()) { consumed += reader.read_at(consumed, std::span<char>(bytes).subspan(consumed)); }
+			restored = frontier.checkpoint == descriptor && bytes == std::string(60000, 'z');
+		});
+		check(restored, "completion-created artifact survives real checkpoint publication and recovery");
+	}
+}
+void admitted_artifacts(const std::filesystem::path& parent) {
+	auto directory = parent / "admitted-artifacts"; std::filesystem::create_directory(directory); ::chmod(directory.c_str(), 0700);
+	{
+		auto io = std::make_shared<PosixIO>(directory); AdmissionLimits limits{{16u << 20, 256}, {1u << 20, 4}, {4u << 20, 4}, 64, 3};
+		Store store(io, limits, 1024); Identity id{}; id[0] = 'A'; store.create(id); store.inventory_step(128);
+		auto replacement = store.reserve_replacement(60000, 16); BsdCompletionQueue queue;
+		for (auto part : {ArtifactPart::Application, ArtifactPart::Bundle}) {
+			auto creation = store.begin_artifact_operation(*replacement, part); drive(queue, creation); creation->result(); creation.reset();
+			std::string bytes = part == ArtifactPart::Application ? std::string(60000, 'q') : std::string("bundle");
+			auto payload = store.begin_write_chunk(*replacement, bytes); drive(queue, payload); payload->result(); payload.reset();
+			auto seal = store.begin_finish_artifact(*replacement); drive(queue, seal);
+			check(seal->descriptor().length == bytes.size(), "native admitted artifact quantum publishes exact sealed phase");
+		}
+		check(store.accounting()->tickets == 1 && !store.accounting()->tainted, "native preparation keeps one whole-cycle reservation through both artifacts");
+		store.publish(*replacement, 0);
+		check(store.accounting()->tickets == 0 && store.accounting()->outstanding == StorageResources{}, "publication settles the admitted completion-prepared replacement");
+	}
+	PosixIO io(directory); Journal journal(io, 1024); bool restored = false;
+	journal.recover([](auto, auto) {}, [&](const Frontier&, ArtifactReader&, std::span<ArtifactReader> dependencies) {
+		std::string bytes(60000, '\0'); std::size_t count = 0;
+		while (count < bytes.size()) { count += dependencies[0].read_at(count, std::span<char>(bytes).subspan(count)); }
+		restored = bytes == std::string(60000, 'q');
+	});
+	check(restored, "native admitted preparation recovers exact application after publication");
+}
 void admitted_store(const std::filesystem::path& parent) {
 	auto directory = parent / "store"; std::filesystem::create_directory(directory); ::chmod(directory.c_str(), 0700);
 	auto io = std::make_shared<PosixIO>(directory);
@@ -158,6 +213,8 @@ int main() {
 		actual_backend(directory);
 		owner_retirement(directory);
 		admitted_store(directory);
+		actual_artifacts(directory);
+		admitted_artifacts(directory);
 	} catch (const std::exception &error) {
 		check(false, error.what());
 	}

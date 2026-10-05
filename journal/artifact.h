@@ -1,6 +1,6 @@
 #pragma once
 
-#include "primitives.h"
+#include "operation.h"
 #include <algorithm>
 #include <limits>
 #include <memory>
@@ -83,6 +83,7 @@ inline std::string artifact_header(Identity storage, ArtifactDescriptor artifact
 
 class Journal;
 class ArtifactBuilder;
+class ArtifactMutation;
 class PreparedArtifact {
 public:
 	PreparedArtifact(const PreparedArtifact&) = default;
@@ -97,67 +98,192 @@ public:
 private:
 	friend class Journal;
 	friend class ArtifactBuilder;
+	friend class ArtifactMutation;
 	PreparedArtifact(ArtifactDescriptor descriptor, std::shared_ptr<detail::OwnerSession> owner)
 		: lease_(std::make_shared<detail::ArtifactLease>(descriptor, std::move(owner))) {}
 	std::shared_ptr<detail::ArtifactLease> lease_;
 };
 
-// All builder operations run on the journal's owning storage executor, and
-// may interleave with complete journal appends between bounded chunks. The
-// shared session keeps the stable lock until every preparation handle closes.
+namespace detail {
+struct ArtifactBuildState {
+	ArtifactBuildState(IO& backend, std::shared_ptr<OwnerSession> session, Identity store, std::uint64_t cap)
+		: io(backend), owner(std::move(session)), storage(store), maximum(cap) {
+		if (owner->preparing || owner->prepared >= maximum_prepared_artifacts) { throw std::logic_error("artifact preparation slots exhausted"); }
+		descriptor.identity = random_identity();
+		owner->preparing_identity = descriptor.identity; ++owner->preparing;
+	}
+	ArtifactBuildState(const ArtifactBuildState&) = delete;
+	ArtifactBuildState& operator=(const ArtifactBuildState&) = delete;
+	~ArtifactBuildState() {
+		file.reset();
+		if (active) { --owner->preparing; owner->preparing_identity.reset(); }
+	}
+	IO& io;
+	std::shared_ptr<OwnerSession> owner;
+	std::shared_ptr<File> file;
+	Identity storage;
+	ArtifactDescriptor descriptor;
+	std::uint64_t maximum;
+	Checksum checksum;
+	bool active = true, initialized = false;
+};
+} // namespace detail
+
+// Creation, bounded payload writes and immutable sealing share one operation
+// implementation between synchronous callers and completion-based drivers.
+class ArtifactMutation final : public IOOperation {
+public:
+	ArtifactMutation(const ArtifactMutation&) = delete;
+	ArtifactMutation& operator=(const ArtifactMutation&) = delete;
+	~ArtifactMutation() override {
+		if (in_flight_) { std::terminate(); }
+		if (started_ && gated_) { state_->owner->failed = true; }
+		release_gate();
+	}
+	const MutationRequest& request() const override {
+		if (done()) { throw std::logic_error("artifact operation has completed"); }
+		return request_;
+	}
+	void submitted() override {
+		if (done() || in_flight_ || state_->owner->failed) { throw std::logic_error("artifact operation unavailable"); }
+		started_ = in_flight_ = true;
+	}
+	bool complete(MutationCompletion completion) noexcept override {
+		if (!in_flight_ || completion.token != request_.token) { return false; }
+		in_flight_ = false;
+		try {
+			if (state_->owner->failed) { throw std::runtime_error("storage owner fenced during artifact operation"); }
+			if (completion.error) { std::rethrow_exception(completion.error); }
+			switch (phase_) {
+			case Phase::Create:
+				if (!completion.file) { throw std::runtime_error("artifact create completed without file"); }
+				state_->file = std::move(completion.file); phase_ = Phase::Write; break;
+			case Phase::Write:
+				if (!completion.count || completion.count > bytes_.size() - written_) { throw std::runtime_error("artifact write made invalid progress"); }
+				written_ += completion.count;
+				if (written_ == bytes_.size()) {
+					if (kind_ == Kind::Chunk) {
+						state_->checksum.update(bytes_); state_->descriptor.length += bytes_.size(); phase_ = Phase::Done;
+					} else { phase_ = Phase::Sync; }
+				}
+				break;
+			case Phase::Sync:
+				if (kind_ == Kind::Create) { state_->initialized = true; phase_ = Phase::Done; }
+				else { phase_ = Phase::DirectorySync; }
+				break;
+			case Phase::DirectorySync:
+				state_->descriptor.checksum = prepared_->descriptor().checksum;
+				state_->file.reset(); state_->active = false;
+				--state_->owner->preparing; state_->owner->preparing_identity.reset(); phase_ = Phase::Done; break;
+			case Phase::Done: throw std::logic_error("artifact completion after finish");
+			}
+			if (!done()) { ++request_.token.step; refresh_request(); }
+		} catch (...) { error_ = std::current_exception(); state_->owner->failed = true; }
+		if (done()) { release_gate(); }
+		return true;
+	}
+	bool done() const noexcept override { return error_ || phase_ == Phase::Done; }
+	bool in_flight() const noexcept override { return in_flight_; }
+	IO& io() const noexcept override { return state_->io; }
+	void result() const {
+		if (!done() || in_flight_) { throw std::logic_error("artifact operation has not completed"); }
+		if (error_) { std::rethrow_exception(error_); }
+	}
+	ArtifactBuilder take_builder();
+	PreparedArtifact prepared_result() const {
+		result(); if (kind_ != Kind::Seal) { throw std::logic_error("artifact operation is not sealing"); }
+		return *prepared_;
+	}
+private:
+	friend class ArtifactBuilder;
+	friend class Journal;
+	enum class Kind { Create, Chunk, Seal };
+	enum class Phase { Create, Write, Sync, DirectorySync, Done };
+	ArtifactMutation(std::shared_ptr<detail::ArtifactBuildState> state, Kind kind, std::string_view chunk = {})
+		: state_(std::move(state)), kind_(kind), phase_(kind == Kind::Create ? Phase::Create : Phase::Write) {
+		auto& owner = *state_->owner;
+		if (owner.failed || owner.mutation_active || !state_->active || (kind != Kind::Create && !state_->initialized)) { throw std::logic_error("artifact preparation unavailable"); }
+		if (owner.mutation_sequence == std::numeric_limits<std::uint64_t>::max()) { throw std::overflow_error("storage operation sequence exhausted"); }
+		if (kind == Kind::Create) {
+			name_ = artifact_name(state_->descriptor);
+			bytes_ = detail::artifact_ownership(state_->storage, state_->descriptor.identity) + std::string(detail::artifact_seal_size, '\0');
+		} else if (kind == Kind::Chunk) {
+			if (chunk.size() > detail::artifact_chunk_size || chunk.size() > state_->maximum - state_->descriptor.length) { throw std::length_error("artifact chunk or cumulative size exceeds bound"); }
+			bytes_.assign(chunk); offset_ = detail::artifact_header_size + state_->descriptor.length;
+			if (bytes_.empty()) { phase_ = Phase::Done; }
+		} else {
+			auto descriptor = state_->descriptor; descriptor.checksum = state_->checksum.value();
+			bytes_ = detail::artifact_seal(state_->storage, descriptor); offset_ = detail::artifact_ownership_size;
+			// Allocate the final lease before any IO. Completion settlement cannot
+			// fail allocation after removing the active preparation protection.
+			prepared_.emplace(PreparedArtifact(descriptor, state_->owner));
+		}
+		request_.token = {owner.mutation_identity, ++owner.mutation_sequence, 1};
+		if (!done()) { refresh_request(); owner.mutation_active = gated_ = true; }
+	}
+	void release_gate() noexcept { if (gated_) { state_->owner->mutation_active = false; gated_ = false; } }
+	void refresh_request() {
+		auto token = request_.token; request_ = {}; request_.token = token;
+		switch (phase_) {
+		case Phase::Create: request_.kind = PrimitiveKind::Create; request_.source = name_; break;
+		case Phase::Write:
+			request_.kind = PrimitiveKind::Write; request_.file = state_->file;
+			request_.offset = offset_ + written_; request_.bytes = std::string_view(bytes_).substr(written_); break;
+		case Phase::Sync: request_.kind = PrimitiveKind::Sync; request_.file = state_->file; break;
+		case Phase::DirectorySync: request_.kind = PrimitiveKind::DirectorySync; break;
+		case Phase::Done: break;
+		}
+	}
+	std::shared_ptr<detail::ArtifactBuildState> state_;
+	Kind kind_;
+	Phase phase_;
+	std::string name_, bytes_;
+	std::uint64_t offset_ = 0;
+	std::size_t written_ = 0;
+	MutationRequest request_;
+	std::optional<PreparedArtifact> prepared_;
+	std::exception_ptr error_;
+	bool started_ = false, in_flight_ = false, gated_ = false, builder_taken_ = false;
+};
+
+// One builder facade; an accepted operation retains its preparation state,
+// backend and owner lock even if this facade disappears during IO.
 class ArtifactBuilder {
 public:
 	ArtifactBuilder(const ArtifactBuilder&) = delete;
 	ArtifactBuilder& operator=(const ArtifactBuilder&) = delete;
-	ArtifactBuilder(ArtifactBuilder&& other) noexcept
-		: io_(other.io_), owner_(std::move(other.owner_)), file_(std::move(other.file_)), storage_(other.storage_),
-			descriptor_(other.descriptor_), maximum_(other.maximum_), checksum_(other.checksum_), active_(std::exchange(other.active_, false)) {}
-	~ArtifactBuilder() { file_.reset(); if (active_) { --owner_->preparing; owner_->preparing_identity.reset(); } }
+	ArtifactBuilder(ArtifactBuilder&&) noexcept = default;
 	void append_chunk(std::string_view bytes) {
-		if (!active_ || owner_->failed) { throw std::logic_error("artifact preparation unavailable"); }
-		if (owner_->mutation_active) { throw std::logic_error("journal mutation is pending"); }
-		if (bytes.size() > detail::artifact_chunk_size || bytes.size() > maximum_ - descriptor_.length) {
-			throw std::length_error("artifact chunk or cumulative size exceeds bound");
-		}
-		try {
-			detail::write_all(*file_, detail::artifact_header_size + descriptor_.length, bytes);
-			checksum_.update(bytes); descriptor_.length += bytes.size();
-		} catch (...) { owner_->failed = true; throw; }
+		auto operation = start(ArtifactMutation::Kind::Chunk, bytes, false);
+		drive_synchronously(*operation); operation->result();
 	}
 	PreparedArtifact finish() {
-		if (!active_ || owner_->failed) { throw std::logic_error("artifact preparation unavailable"); }
-		if (owner_->mutation_active) { throw std::logic_error("journal mutation is pending"); }
-		try {
-			descriptor_.checksum = checksum_.value();
-			detail::write_all(*file_, detail::artifact_ownership_size, detail::artifact_seal(storage_, descriptor_));
-			file_->sync(); io_.sync_directory();
-			file_.reset(); active_ = false; --owner_->preparing; owner_->preparing_identity.reset();
-			return PreparedArtifact(descriptor_, owner_);
-		} catch (...) { owner_->failed = true; throw; }
+		auto operation = start(ArtifactMutation::Kind::Seal, {}, false);
+		drive_synchronously(*operation); return operation->prepared_result();
 	}
+	std::shared_ptr<ArtifactMutation> begin_append_chunk(std::string_view bytes) { return start(ArtifactMutation::Kind::Chunk, bytes, true); }
+	std::shared_ptr<ArtifactMutation> begin_finish() { return start(ArtifactMutation::Kind::Seal, {}, true); }
 private:
 	friend class Journal;
+	friend class ArtifactMutation;
+	explicit ArtifactBuilder(std::shared_ptr<detail::ArtifactBuildState> state) : state_(std::move(state)) {}
 	ArtifactBuilder(IO& io, std::shared_ptr<detail::OwnerSession> owner, Identity storage, std::uint64_t maximum)
-		: io_(io), owner_(std::move(owner)), storage_(storage), maximum_(maximum) {
-		if (owner_->preparing || owner_->prepared >= detail::maximum_prepared_artifacts) { throw std::logic_error("artifact preparation slots exhausted"); }
-		try {
-			descriptor_.identity = detail::random_identity(); owner_->preparing_identity = descriptor_.identity; file_ = io_.create_exclusive(artifact_name(descriptor_));
-			// Establish immutable ownership before accepting any payload. Only
-			// the separate seal is replaced by finish; it starts unpublished.
-			detail::write_all(*file_, 0, detail::artifact_ownership(storage_, descriptor_.identity) + std::string(detail::artifact_seal_size, '\0'));
-			file_->sync();
-			++owner_->preparing; active_ = true;
-		} catch (...) { owner_->failed = true; throw; }
+		: state_(std::make_shared<detail::ArtifactBuildState>(io, std::move(owner), storage, maximum)) {
+		auto operation = std::shared_ptr<ArtifactMutation>(new ArtifactMutation(state_, ArtifactMutation::Kind::Create));
+		drive_synchronously(*operation); operation->result();
 	}
-	IO& io_;
-	std::shared_ptr<detail::OwnerSession> owner_;
-	std::unique_ptr<File> file_;
-	Identity storage_;
-	ArtifactDescriptor descriptor_;
-	std::uint64_t maximum_;
-	Checksum checksum_;
-	bool active_ = false;
+	std::shared_ptr<ArtifactMutation> start(ArtifactMutation::Kind kind, std::string_view bytes, bool asynchronous) {
+		if (!state_) { throw std::logic_error("artifact builder moved"); }
+		if (asynchronous && !state_->owner->io_lifetime) { throw std::logic_error("completion artifacts require owned IO"); }
+		return std::shared_ptr<ArtifactMutation>(new ArtifactMutation(state_, kind, bytes));
+	}
+	std::shared_ptr<detail::ArtifactBuildState> state_;
 };
+inline ArtifactBuilder ArtifactMutation::take_builder() {
+	result();
+	if (kind_ != Kind::Create || builder_taken_) { throw std::logic_error("artifact builder already taken or wrong operation"); }
+	builder_taken_ = true; return ArtifactBuilder(state_);
+}
 
 class ArtifactVerifier;
 class ArtifactReader {
