@@ -29,6 +29,17 @@ struct MutationCompletion {
 	std::exception_ptr error;
 };
 
+class IOOperation {
+public:
+	virtual ~IOOperation() = default;
+	virtual const MutationRequest& request() const = 0;
+	virtual void submitted() = 0;
+	virtual bool complete(MutationCompletion completion) noexcept = 0;
+	virtual bool done() const noexcept = 0;
+	virtual bool in_flight() const noexcept = 0;
+	virtual IO& io() const noexcept = 0;
+};
+
 namespace detail {
 
 // Shared manifest sequencing for bootstrap, append and checkpoint publication.
@@ -142,11 +153,11 @@ inline MutationCompletion execute_primitive(IO &io, const MutationRequest &reque
 // One append transaction, including the final manifest namespace barrier.
 // Drivers retain this object through every accepted primitive. Completion and
 // destruction run on the storage owner; backends only schedule completions.
-class AppendMutation {
+class AppendMutation : public IOOperation {
   public:
 	AppendMutation(const AppendMutation &) = delete;
 	AppendMutation &operator=(const AppendMutation &) = delete;
-	~AppendMutation() {
+	~AppendMutation() override {
 		// This is a driver ownership bug, not a request for blocking cleanup.
 		if (in_flight_) {
 			std::terminate();
@@ -158,19 +169,19 @@ class AppendMutation {
 			owner_->mutation_active = false;
 		}
 	}
-	const MutationRequest &request() const {
+	const MutationRequest &request() const override {
 		if (done()) {
 			throw std::logic_error("append mutation is complete");
 		}
 		return request_;
 	}
-	void submitted() {
+	void submitted() override {
 		if (in_flight_ || done()) {
 			throw std::logic_error("append submission is not available");
 		}
 		started_ = in_flight_ = true;
 	}
-	bool complete(MutationCompletion completion) noexcept {
+	bool complete(MutationCompletion completion) noexcept override {
 		if (!in_flight_ || completion.token != request_.token) {
 			return false;
 		}
@@ -208,8 +219,8 @@ class AppendMutation {
 		}
 		return true;
 	}
-	bool done() const noexcept { return error_ || (phase_ == Phase::Publication && publication_.done()); }
-	bool in_flight() const noexcept { return in_flight_; }
+	bool done() const noexcept override { return error_ || (phase_ == Phase::Publication && publication_.done()); }
+	bool in_flight() const noexcept override { return in_flight_; }
 	void result() const {
 		if (!done() || in_flight_) {
 			throw std::logic_error("append has not completed");
@@ -218,7 +229,7 @@ class AppendMutation {
 			std::rethrow_exception(error_);
 		}
 	}
-	IO &io() const noexcept { return *io_; }
+	IO &io() const noexcept override { return *io_; }
 
   private:
 	friend class Journal;

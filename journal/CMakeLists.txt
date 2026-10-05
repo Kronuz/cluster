@@ -8,6 +8,11 @@ target_include_directories(cluster_journal INTERFACE "${CMAKE_CURRENT_SOURCE_DIR
 target_compile_features(cluster_journal INTERFACE cxx_std_20)
 add_library(cluster::journal ALIAS cluster_journal)
 
+find_package(Threads REQUIRED)
+add_library(cluster_journal_completion INTERFACE)
+target_link_libraries(cluster_journal_completion INTERFACE cluster::journal Threads::Threads)
+add_library(cluster::journal_completion ALIAS cluster_journal_completion)
+
 # This module can be built without fetching Asio or reactor.
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	enable_testing()
@@ -32,4 +37,10 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	target_link_libraries(cluster_admission_test PRIVATE cluster::journal)
 	add_test(NAME cluster_admission COMMAND cluster_admission_test)
 	set_tests_properties(cluster_admission PROPERTIES TIMEOUT 30)
+	if(APPLE OR CMAKE_SYSTEM_NAME STREQUAL "FreeBSD")
+		add_executable(cluster_completion_test ../test/completion_test.cc)
+		target_link_libraries(cluster_completion_test PRIVATE cluster::journal_completion)
+		add_test(NAME cluster_completion COMMAND cluster_completion_test)
+		set_tests_properties(cluster_completion PROPERTIES TIMEOUT 30)
+	endif()
 endif()

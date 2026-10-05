@@ -67,6 +67,8 @@ class PosixFile final : public File {
 public:
 	explicit PosixFile(int fd) : fd_(fd) {}
 	~PosixFile() override { ::close(fd_); }
+	// Trusted completion backend only. The owning File lease retains this FD.
+	int native_handle() const noexcept { return fd_; }
 	std::uint64_t size() override {
 		struct stat status{};
 		if (::fstat(fd_, &status)) { system_failure("stat journal size"); }
