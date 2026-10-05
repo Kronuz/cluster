@@ -218,3 +218,7 @@ Single local Release samples on the Intel Mac, with duplicate-Begin injection di
 | 64 MiB | 2.41281 | 1.017820 | 67,421,064 | 131,224 | 459,519 | 412,426,240 | 2,048 / 1,024 |
 
 Source reads include full pre-transmit verification and streaming reread. Timed work includes election, checkpoint capture, transfer and suffix application. Process RSS includes application/fixture copies; it is not adapter memory. The generated CSV and benchmark entry point make these samples reproducible. Authenticated sockets, authority integration and fleet qualification remain pending.
+
+### Application runtime observations
+
+`Worker::retained_log_bytes()` reports Core's retained encoded log bytes for proactive application checkpoint thresholds. `Worker::base_boundary()` reports the recovered or installed index and term so application recovery can verify its exact image boundary. `Worker::snapshot_context(id)` returns the immutable incoming descriptor only for a matching live capability; foreign, canceled and fenced capabilities expose no metadata. These read-only observations perform no IO and change neither legacy Raft APIs nor wire formats.

@@ -49,6 +49,7 @@ public:
 	Term term() const noexcept { return hard_.term; }
 	Index committed() const noexcept { return durable_.commit_index; }
 	Index applied() const noexcept { return applied_; }
+	std::size_t retained_log_bytes() const noexcept { return log_bytes_; }
 	Index last_index() const noexcept { return base_index_ + static_cast<Index>(entries_.size()); }
 	Index base_index() const noexcept { return base_index_; }
 	LogBoundary base_boundary() const noexcept { return {base_index_, base_term_}; }

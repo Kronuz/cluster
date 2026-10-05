@@ -529,6 +529,7 @@ void snapshot_policy_and_rejection() {
 		check(throws([&] { worker.reserve_snapshot(invalid); }) && !worker.fenced() && worker.accounting()->used == used && !worker.take_snapshot_result(), "malformed snapshot policy/context reserves nothing and queues no result");
 	}
 	auto id = worker.reserve_snapshot(context); if (!id) { check(false, "policy fixture reservation"); return; }
+	check(worker.snapshot_context(*id) && worker.snapshot_context(*id)->descriptor == context.descriptor, "matching incoming capability exposes its immutable validation boundary");
 	check(throws([&] { worker.offer_snapshot_chunk(*id, 1, "a"); }) && throws([&] { worker.offer_snapshot_chunk(*id, 0, ""); }) && throws([&] { worker.offer_snapshot_chunk(*id, 0, "a", true); }) && throws([&] { worker.offer_snapshot_chunk(*id, 0, "abcd", true); }) && throws([&] { worker.offer_snapshot_chunk(*id, 0, std::string(65537, 'x')); }) && !worker.fenced(), "invalid offsets, zero chunks, early final and excess sizes leave reception unchanged");
 	auto first = worker.offer_snapshot_chunk(*id, 0, "a"); auto busy = worker.offer_snapshot_chunk(*id, 1, "b");
 	check(first.result == SubmitResult::Accepted && first.next_offset == 1 && busy.result == SubmitResult::Busy && busy.next_offset == 1 && throws([&] { worker.offer_snapshot_chunk(*id, 0, "a"); }), "busy input accepts no bytes and duplicate offsets reject");
@@ -538,7 +539,9 @@ void snapshot_policy_and_rejection() {
 	check(final.result == SubmitResult::Accepted, "empty final marker closes a fully offered nonempty image");
 	SnapshotFixture other("foreign"); auto other_id = other.worker.reserve_snapshot(other.context("abc"));
 	check(other_id && worker.consume_validation(*other_id, 1) == ValidationAck::Stale && worker.validation_succeeded(*other_id, 1) == ValidationAck::Stale && worker.cancel_snapshot(*other_id) == CancelResult::Stale && throws([&] { worker.offer_snapshot_chunk(*other_id, 0, "a"); }), "foreign session callbacks cannot change an incoming candidate");
+	check(other_id && !worker.snapshot_context(*other_id), "foreign snapshot context capability exposes no metadata");
 	check(worker.reject_snapshot_validation(*id) == CancelResult::Canceled, "semantic rejection cancels healthy staged storage");
+	check(!worker.snapshot_context(*id), "canceled snapshot context capability exposes no metadata");
 	auto rejected = worker.take_snapshot_result(); check(rejected && rejected->reason == SnapshotReason::InvalidApplication && !worker.fenced(), "semantic rejection is a correlated healthy result");
 	context.descriptor.application_crc32c ^= 1; id = worker.reserve_snapshot(context); fixture.send(*id, "abc");
 	for (unsigned turn = 0; turn < 100 && worker.accounting()->tickets; ++turn) { fixture.pump(); }

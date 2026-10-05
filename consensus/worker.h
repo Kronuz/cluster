@@ -126,7 +126,9 @@ public:
 	Term term() const noexcept { return core_ ? core_->term() : 0; }
 	Index committed() const noexcept { return core_ ? core_->committed() : 0; }
 	Index applied_index() const noexcept { return core_ ? core_->applied() : 0; }
+	std::size_t retained_log_bytes() const noexcept { return core_ ? core_->retained_log_bytes() : 0; }
 	Index base_index() const noexcept { return core_ ? core_->base_index() : 0; }
+	LogBoundary base_boundary() const noexcept { return core_ ? core_->base_boundary() : LogBoundary{}; }
 	auto storage_frontier() const { return store_.frontier(); }
 	auto accounting() const noexcept { return store_.accounting(); }
 	SubmitResult try_submit(Event event) { return submit(std::move(event), false); }
@@ -240,6 +242,10 @@ public:
 	bool snapshot_validated(const SnapshotId& id) const noexcept {
 		return !fenced() && checkpoint_ && id.owner_ == checkpoint_owner_ && id.token_ == checkpoint_->token &&
 			std::holds_alternative<Incoming>(checkpoint_->mode) && checkpoint_->phase == Phase::Validated;
+	}
+	std::optional<SnapshotContext> snapshot_context(const SnapshotId& id) const noexcept {
+		if (fenced() || !checkpoint_ || id.owner_ != checkpoint_owner_ || id.token_ != checkpoint_->token) { return std::nullopt; }
+		auto incoming = std::get_if<Incoming>(&checkpoint_->mode); return incoming ? std::optional<SnapshotContext>{incoming->context} : std::nullopt;
 	}
 	CancelResult reject_snapshot_validation(const SnapshotId& id) { return cancel_snapshot(id, SnapshotReason::InvalidApplication); }
 	CancelResult cancel_snapshot(const SnapshotId& id) { return cancel_snapshot(id, SnapshotReason::Canceled); }
