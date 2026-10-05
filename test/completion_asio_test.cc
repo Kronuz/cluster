@@ -1,3 +1,4 @@
+#include "consensus/worker.h"
 #include "journal/asio_completion.h"
 #include "journal/bsd_completion.h"
 #include "journal/journal.h"
@@ -31,6 +32,7 @@ class DelayedQueue {
 		}
 		return result;
 	}
+	void delay_next() { delay_ = true; }
 	CompletionStats stats() const { return queue_.stats(); }
 
   private:
@@ -74,6 +76,132 @@ asio::awaitable<void> observe(Journal &journal, bool &done, std::size_t &ticks) 
 		}
 	}
 }
+asio::awaitable<void> worker_exercise(cluster::consensus::Worker &worker,
+									  const std::shared_ptr<AsioCompletionDriver<DelayedQueue>> &driver,
+									  const std::shared_ptr<DelayedQueue> &queue) {
+	using namespace cluster::consensus;
+	auto executor = co_await asio::this_coro::executor;
+	asio::steady_timer timer(executor);
+	asio::ip::udp::socket socket(executor, asio::ip::udp::endpoint(asio::ip::address_v4::loopback(), 0));
+	std::optional<CheckpointId> capture;
+	bool started = false, delayed = false, final_accepted = false;
+	unsigned pending_ticks = 0, published = 0;
+	std::exception_ptr io_error, failure;
+	bool active = false;
+	try {
+		for (unsigned turn = 0; turn < 3000 && !published; ++turn) {
+			worker.run_one({100, 100});
+			if (auto job = worker.take_io_operation()) {
+				if (active) {
+					throw std::logic_error("Worker dispatched overlapping native jobs");
+				}
+				if (capture && !delayed && std::dynamic_pointer_cast<StoreArtifactOperation>(job)) {
+					queue->delay_next();
+					delayed = true;
+				}
+				active = true;
+				asio::co_spawn(executor, driver->run(job), [&, job](std::exception_ptr error) {
+					if (error) {
+						io_error = error;
+						worker.storage_operation_failed(job, "native Worker driver failed");
+					}
+					active = false;
+				});
+			}
+			for (const auto &action : worker.take_actions()) {
+				if (auto batch = std::get_if<Committed>(&action)) {
+					worker.applied({batch->entries.back().index});
+				}
+				published += std::holds_alternative<CheckpointPublished>(action);
+			}
+			if (io_error) {
+				std::rethrow_exception(io_error);
+			}
+			if (worker.fenced()) {
+				throw std::runtime_error("native completion Worker fenced");
+			}
+			if (worker.ready() && !started) {
+				worker.try_submit(Start{});
+				started = true;
+			}
+			if (!capture && worker.applied_index() == 1) {
+				capture = worker.reserve_checkpoint(65553);
+				if (capture) {
+					worker.attach_capture(*capture, {90, 1, worker.term()});
+					worker.offer_application_chunk(*capture, std::string(65536, 'a'));
+				}
+			}
+			if (capture && !final_accepted && worker.checkpoint_active(*capture)) {
+				final_accepted = worker.offer_application_chunk(*capture, std::string(17, 'b'), true) ==
+								 SubmitResult::Accepted;
+			}
+			if (delayed && active && pending_ticks < 20) {
+				const char sent = 'w';
+				char received = 0;
+				co_await socket.async_send_to(asio::buffer(&sent, 1), socket.local_endpoint(),
+											  asio::use_awaitable);
+				co_await socket.async_receive(asio::buffer(&received, 1), asio::use_awaitable);
+				if (received != sent || worker.base_index() != 0) {
+					throw std::runtime_error("held Worker IO stalled sockets or published early");
+				}
+				++pending_ticks;
+			}
+			timer.expires_after(std::chrono::milliseconds(1));
+			co_await timer.async_wait(asio::use_awaitable);
+		}
+	} catch (...) {
+		failure = std::current_exception();
+	}
+	while (active) {
+		timer.expires_after(std::chrono::milliseconds(1));
+		co_await timer.async_wait(asio::use_awaitable);
+	}
+	if (failure) {
+		std::rethrow_exception(failure);
+	}
+	if (io_error) {
+		std::rethrow_exception(io_error);
+	}
+	if (pending_ticks < 20 || published != 1 || worker.base_index() != 1 ||
+		!queue->stats().native_submitted) {
+		std::cerr << "Worker native state: ready=" << worker.ready() << " role=" << int(worker.role())
+				  << " applied=" << worker.applied_index() << " base=" << worker.base_index()
+				  << " capture=" << bool(capture) << " delayed=" << delayed << " ticks=" << pending_ticks
+				  << " published=" << published << " native=" << queue->stats().native_submitted << "\n";
+		throw std::runtime_error("native Worker checkpoint did not reach exact durable publication");
+	}
+}
+void native_worker(const std::filesystem::path &directory) {
+	std::filesystem::create_directory(directory);
+	::chmod(directory.c_str(), 0700);
+	auto io = std::make_shared<PosixIO>(directory);
+	cluster::consensus::FixedConfiguration fixed;
+	fixed.local = 1;
+	fixed.voters = {1};
+	fixed.cluster[0] = 'W';
+	fixed.configuration[0] = 'V';
+	cluster::consensus::Limits limits;
+	limits.command_bytes = 1024;
+	limits.rpc_bytes = 2048;
+	limits.log_bytes = 4096;
+	limits.log_entries = 32;
+	limits.control_entries = 4;
+	limits.rpc_entries = 4;
+	cluster::consensus::Worker worker(io, fixed, {{1024 * 1024, 1024}, {65536, 3}, {512 * 1024, 4}, 8, 3},
+									  limits, {}, {16, 128, false, true});
+	Identity identity{};
+	identity[0] = 'W';
+	worker.create(identity);
+	asio::io_context context;
+	auto queue = std::make_shared<DelayedQueue>();
+	auto driver = std::make_shared<AsioCompletionDriver<DelayedQueue>>(context.get_executor(), queue);
+	std::exception_ptr error;
+	asio::co_spawn(context, worker_exercise(worker, driver, queue), [&](std::exception_ptr e) { error = e; });
+	context.run();
+	if (error) {
+		std::rethrow_exception(error);
+	}
+}
 } // namespace
 int main() {
 	auto directory =
@@ -85,6 +213,7 @@ int main() {
 			throw std::runtime_error("completion test directory already exists");
 		}
 		::chmod(directory.c_str(), 0700);
+		native_worker(directory / "worker");
 		auto io = std::make_shared<PosixIO>(directory);
 		Journal journal(io, 1024);
 		Identity id{};

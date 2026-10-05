@@ -33,7 +33,7 @@ public:
 		worker_.source_peer_failed(session.peer);
 		auto selected = selected_frame(); auto closes_selected = selected && selected->peer == session.peer;
 		if (sending_ && sending_->info.peer == session.peer) { worker_.source_failed(sending_->info.source); sending_.reset(); }
-		if (receiving_ && receiving_->session == session) { receiving_->connected = false; worker_.cancel_snapshot(receiving_->id); }
+		if (receiving_ && receiving_->session == session) { receiving_->connected = false; cancel_receiving(); }
 		if (data_ && data_->peer == session.peer) { data_.reset(); }
 		channel->control.reset(); channel->completed.reset(); channel->used = 0; channel->session.reset(); if (closes_selected) { selected_ = 0; }
 	}
@@ -142,7 +142,11 @@ private:
 		NodeId peer; std::optional<TrustedSession> session; std::array<char, maximum_transfer_bytes> input{}; std::size_t used = 0; std::optional<Output> control; std::optional<Completed> completed;
 	};
 	struct Sending { explicit Sending(SourceInfo source) : info(std::move(source)) {} SourceInfo info; bool accepted = false, final = false; Token waiting = 0; std::uint64_t next = 0; };
-	struct Receiving { TrustedSession session; SnapshotId id; SnapshotKey key; SnapshotDescriptor descriptor; std::uint64_t offset, started; bool connected = true, final = false; };
+	struct Receiving { TrustedSession session; SnapshotId id; SnapshotKey key; SnapshotDescriptor descriptor; std::uint64_t offset, started; bool connected = true, final = false, canceling = false; };
+	void cancel_receiving() {
+		auto result = worker_.cancel_snapshot(receiving_->id);
+		if (result == CancelResult::Pending || result == CancelResult::Canceled) { receiving_->canceling = true; }
+	}
 	void close_fenced() {
 		// Worker fencing already invalidated storage and application ownership.
 		for (auto& channel : channels_) { channel.session.reset(); channel.control.reset(); channel.completed.reset(); channel.used = 0; }
@@ -170,6 +174,9 @@ private:
 		case TransferKind::Begin: {
 			auto policy = worker_.snapshot_policy(); if (!policy) { throw Corruption("snapshot reception disabled"); }
 			auto descriptor = decode_snapshot(frame.body, *policy); if (LogBoundary{descriptor.through, descriptor.term} != key.boundary) { throw Corruption("snapshot boundary mismatch"); }
+			if (receiving_ && receiving_->session == session && receiving_->key == key && receiving_->canceling) {
+				if (receiving_->descriptor != descriptor) { throw Corruption("conflicting canceling Begin"); } return true;
+			}
 			if (channel.control) { return false; }
 			if (channel.completed && channel.completed->key == key) {
 				if (channel.completed->descriptor != descriptor) { throw Corruption("conflicting completed Begin"); }
@@ -189,6 +196,7 @@ private:
 			if (!receiving_ || receiving_->session != session || receiving_->key != key || receiving_->final) { throw Corruption("unowned Chunk"); }
 			auto body = frame.body; auto token = get64(body); auto offset = get64(body); auto count = get32(body); auto final = body[0] != 0; body.remove_prefix(4);
 			if (offset != receiving_->offset || count > receiving_->descriptor.application_bytes - offset || (!final && !count) || (final && offset + count != receiving_->descriptor.application_bytes)) { throw Corruption("invalid sequential Chunk"); }
+			if (receiving_->canceling) { receiving_->offset += count; receiving_->final = final; return true; }
 			if (channel.control) { return false; }
 			auto offered = worker_.offer_snapshot_chunk(receiving_->id, offset, body, final); if (offered.result == SubmitResult::Busy) { return false; }
 			if (offered.result != SubmitResult::Accepted) { throw Corruption("receiver cannot accept Chunk"); }
@@ -209,7 +217,7 @@ private:
 			auto result = worker_.try_submit(Receive{session.peer, response}); return result == SubmitResult::Accepted || result == SubmitResult::Fenced;
 		}
 		case TransferKind::Cancel:
-			if (receiving_ && receiving_->session == session && receiving_->key == key) { worker_.cancel_snapshot(receiving_->id); } return true;
+			if (receiving_ && receiving_->session == session && receiving_->key == key) { cancel_receiving(); } return true;
 		} throw Corruption("unsupported frame");
 	}
 	Worker& worker_; std::uint64_t timeout_, now_ = 0; Token next_output_ = 0, selected_ = 0;
