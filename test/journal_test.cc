@@ -724,6 +724,24 @@ void store_append_completions() {
 	check(store.accounting()->tainted && store.accounting()->outstanding == held && store.accounting()->used == used, "uncertain Store mutation retains conservative charges without refund");
 }
 
+void store_reclaim_before_inventory() {
+	for (bool partial : {false, true}) {
+		auto model = initialized(); MemoryIO io(model); std::string orphan;
+		{ Journal journal(io, 1024); journal.recover([](auto, auto) {}); auto artifact = prepare(journal, "orphan"); orphan = artifact_name(artifact.descriptor()); }
+		Store store(io, store_limits, 1024); store.recover([](auto, auto) {});
+		if (partial) { auto census = store.inventory_step(1); check(census.entries == 1 && !census.complete, "fixture holds a partial census before cleanup"); }
+		check(!store.accounting(), "pre-census cleanup has no admission facade");
+		bool reclaimed = false;
+		try { auto stats = store.reclaim_step(4096); reclaimed = stats.complete && stats.removed == 1 && !model.visible.contains(orphan); }
+		catch (const std::exception&) {}
+		check(reclaimed && !store.fenced(), "reclamation removes owned orphans before completed census without fencing");
+		if (!reclaimed) { continue; }
+		check(!store.accounting() && store.inventory_stats().entries == 0, "pre-census mutation invalidates the old partial inventory");
+		ready_store(store); store_exact(model, store);
+		check(store.accounting()->used.entries == model.visible.size(), "fresh post-cleanup census charges exactly the surviving namespace");
+	}
+}
+
 void store_basics() {
 	Model model; model.chunk = 3; MemoryIO io(model);
 	{
@@ -1643,7 +1661,7 @@ void posix() {
 } // namespace
 
 int main() {
-	try { basics(); append_failures(); append_failures(3); append_failures(std::numeric_limits<std::size_t>::max(), true); append_failures(3, true); append_failures(std::numeric_limits<std::size_t>::max(), false, true); append_failures(3, false, true); append_failures(std::numeric_limits<std::size_t>::max(), true, true); append_failures(3, true, true); suspended_artifact_operations(); suspended_artifact_ownership(); suspended_append_ownership(); fenced_append_submission(); suspended_append_retirement(); recovery_failures(); recovery_failures(true); recovery_failures(false, true); recovery_failures(true, true); corruption(); initialization_failures(); checkpoint_basics(); checkpoint_successive_generations(); suspended_artifact_open(); suspended_artifact_reads(); incremental_artifact_verification(); store_incremental_verification(); published_artifact_selection(); store_published_selection(); artifact_verification(); preparation_ownership_and_failures(); checkpoint_publication_failures(); checkpoint_publication_failures(3); checkpoint_publication_failures(std::numeric_limits<std::size_t>::max(), true); checkpoint_publication_failures(3, true); checkpoint_corruption(); reclamation_roots_and_unknowns(); reclamation_failures(); durable_staging_ownership(); mixed_artifact_formats(); footprint_plans(); checkpoint_publication_retirement(); store_publication_completions(); store_artifact_completions(); detached_old_artifact_lease(); store_append_completions(); store_basics(); store_failures(); store_append_and_cleanup_failures(); store_limits_and_pins(); store_posix(); posix(); }
+	try { basics(); append_failures(); append_failures(3); append_failures(std::numeric_limits<std::size_t>::max(), true); append_failures(3, true); append_failures(std::numeric_limits<std::size_t>::max(), false, true); append_failures(3, false, true); append_failures(std::numeric_limits<std::size_t>::max(), true, true); append_failures(3, true, true); suspended_artifact_operations(); suspended_artifact_ownership(); suspended_append_ownership(); fenced_append_submission(); suspended_append_retirement(); recovery_failures(); recovery_failures(true); recovery_failures(false, true); recovery_failures(true, true); corruption(); initialization_failures(); checkpoint_basics(); checkpoint_successive_generations(); suspended_artifact_open(); suspended_artifact_reads(); incremental_artifact_verification(); store_incremental_verification(); published_artifact_selection(); store_published_selection(); artifact_verification(); preparation_ownership_and_failures(); checkpoint_publication_failures(); checkpoint_publication_failures(3); checkpoint_publication_failures(std::numeric_limits<std::size_t>::max(), true); checkpoint_publication_failures(3, true); checkpoint_corruption(); reclamation_roots_and_unknowns(); reclamation_failures(); durable_staging_ownership(); mixed_artifact_formats(); footprint_plans(); checkpoint_publication_retirement(); store_publication_completions(); store_artifact_completions(); detached_old_artifact_lease(); store_append_completions(); store_reclaim_before_inventory(); store_basics(); store_failures(); store_append_and_cleanup_failures(); store_limits_and_pins(); store_posix(); posix(); }
 	catch (const std::exception& error) { check(false, error.what()); }
 	std::cout << checks << " journal checks, " << failures << " failures\n";
 	return failures ? 1 : 0;

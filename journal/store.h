@@ -436,7 +436,7 @@ public:
 		auto& operation = replacement(id); operation.dispose_known(*journal_); replacement_.reset();
 	}
 	ReclaimStats reclaim_step(std::size_t budget = 128) {
-		mutation_ready();
+		if (journal_->mutation_pending()) { throw std::logic_error("storage mutation is pending"); }
 		healthy(); if (!opened_) { throw std::logic_error("store not recovered"); }
 		if (budget == 0 || budget > 4096) { throw std::invalid_argument("invalid reclamation scan budget"); }
 		if (!admission_) { inventory_.reset(); } // Mutation invalidates partial census.
