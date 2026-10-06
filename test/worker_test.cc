@@ -7,10 +7,12 @@
 #include "journal/posix.h"
 #include <iostream>
 #include <map>
+#include <ctime>
 
 using namespace cluster::consensus;
 namespace {
 int checks = 0, failures = 0;
+bool admission_benchmark = false;
 void check(bool value, std::string_view message) { ++checks; if (!value) { ++failures; std::cerr << "FAIL: " << message << '\n'; } }
 template <class F> bool throws(F&& function) { try { function(); return false; } catch (const std::exception&) { return true; } }
 FixedConfiguration configuration() { FixedConfiguration result; result.local = 1; result.voters = {1}; result.cluster[0] = 'C'; result.configuration[0] = 'V'; return result; }
@@ -191,6 +193,28 @@ void real_worker() {
 		for (unsigned turn = 0; turn < 10 && !blocked; ++turn) { blocked = worker.run_one({100, 100}) == TurnResult::Blocked; }
 		check(blocked && worker.committed() == 0 && !worker.fenced(), "output pressure retains the next durable election completion");
 		check(worker.try_submit(Read{99}) == SubmitResult::Busy, "undrained output blocks external protocol admission");
+		Event retained_busy = Propose{99, std::string(512, 'b')};
+		auto busy_data = std::get<Propose>(retained_busy).command.data();
+		check(worker.try_submit_retained(retained_busy) == SubmitResult::Busy &&
+			std::get<Propose>(retained_busy).command.data() == busy_data &&
+			std::get<Propose>(retained_busy).command == std::string(512, 'b'),
+			"Busy retained admission leaves the caller event and allocation intact");
+		if (admission_benchmark) {
+			constexpr unsigned iterations = 100000;
+			std::cout << "profile,payload_bytes,attempts,cpu_seconds\n";
+			for (unsigned sample = 0; sample != 6; ++sample) {
+				const bool retained = (sample % 2) != 0;
+				bool busy = true;
+				const auto start = std::clock();
+				for (unsigned attempt = 0; attempt != iterations; ++attempt) {
+					const auto result = retained ? worker.try_submit_retained(retained_busy) : worker.try_submit(retained_busy);
+					busy = busy && result == SubmitResult::Busy;
+				}
+				const auto elapsed = double(std::clock() - start) / CLOCKS_PER_SEC;
+				check(busy, "paired admission benchmark preserves Busy state");
+				std::cout << (retained ? "retained" : "by_value") << ",512," << iterations << ',' << elapsed << '\n';
+			}
+		}
 		unsigned maintenance = 0;
 		bool hold_noop = true;
 		auto drain = [&] {
@@ -214,7 +238,14 @@ void real_worker() {
 		auto proposal = worker.try_submit(Propose{2, std::string(1024, 'x')});
 		if (proposal == SubmitResult::Busy) { worker.run_one({100, 100}); proposal = worker.try_submit(Propose{2, std::string(1024, 'x')}); }
 		check(proposal == SubmitResult::Pressure && worker.term() == 1 && worker.committed() == 1 && worker.accounting()->used == before, "denied pre-event reservation leaves durable and Core state unchanged");
-		check(worker.try_submit(Propose{3, "state"}) == SubmitResult::Accepted, "small admitted command retains its commit continuation");
+		Event retained_pressure = Propose{2, std::string(1024, 'p')};
+		auto pressure_data = std::get<Propose>(retained_pressure).command.data();
+		check(worker.try_submit_retained(retained_pressure) == SubmitResult::Pressure &&
+			std::get<Propose>(retained_pressure).command.data() == pressure_data &&
+			std::get<Propose>(retained_pressure).command == std::string(1024, 'p') && worker.accounting()->used == before,
+			"Pressure retained admission preserves event bytes and refunds partial reservations");
+		Event retained_accepted = Propose{3, "state"};
+		check(worker.try_submit_retained(retained_accepted) == SubmitResult::Accepted, "small retained event transfers its commit continuation");
 		worker.applied({1});
 		check(worker.applied_index() == 1, "application completion survives busy command persistence");
 		for (unsigned turn = 0; turn < 100 && worker.applied_index() < 2; ++turn) { worker.run_one({100, 100}); drain(); }
@@ -1379,6 +1410,7 @@ void binary_transfer_codec() {
 
 int main(int argc, char** argv) {
 	try {
+		if (argc == 2 && std::string_view(argv[1]) == "--retained-admission-benchmark") { admission_benchmark = true; real_worker(); return failures ? 1 : 0; }
 		if (argc == 2 && std::string_view(argv[1]) == "--completion-regressions") { completion_appends(); completion_storage(); completion_channel_cancellation(); completion_snapshot_readback(); retired_completion_worker(); for (unsigned mode : {0u, 1u, 3u}) { binary_transfer_integration(65553, mode, false, true); } std::cout << checks << " completion checks, " << failures << " failures\n"; return failures ? 1 : 0; }
 		if (argc == 2 && std::string_view(argv[1]) == "--review-regressions") { channel_dispatch_and_unstarted_result(); binary_transfer_integration(65553); binary_transfer_integration(65553, 5); owned_snapshot_sources(); std::cout << checks << " review checks, " << failures << " failures\n"; return failures ? 1 : 0; }
 		if (argc == 2 && std::string_view(argv[1]) == "--transfer-benchmark") { std::ofstream(std::filesystem::current_path() / ".scratch" / "snapshot-transfer-benchmark.csv") << "image_bytes,wall_s,cpu_s,wire_bytes,retained_frame_bytes,payload_buffer_capacity,process_maxrss_native,sender_payload_reads,receiver_payload_reads\n"; binary_transfer_integration(1048576, 0, true); binary_transfer_integration(67108864, 0, true); std::cout << checks << " benchmark checks, " << failures << " failures\n"; return failures ? 1 : 0; }

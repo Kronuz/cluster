@@ -128,6 +128,10 @@ public:
 	auto storage_frontier() const { return store_.frontier(); }
 	auto accounting() const noexcept { return store_.accounting(); }
 	SubmitResult try_submit(Event event) { return submit(std::move(event), false); }
+	// Busy and Pressure retain the caller's event. Admitted execution may move
+	// its payload, including a terminal Fenced result during that execution.
+	// Existing by-value callers preserve their original contract.
+	SubmitResult try_submit_retained(Event& event) { return submit_retained(event, false); }
 	std::shared_ptr<kronuz::journal::IOOperation> take_io_operation() {
 		if (io_dispatched_ || (!io_job_ && !maintenance_io_)) { return {}; }
 		io_dispatched_ = true; return io_job_ ? std::static_pointer_cast<kronuz::journal::IOOperation>(io_job_) : maintenance_io_;
@@ -455,6 +459,9 @@ private:
 		output_entries_ = checked_add(limits_.log_entries, checked_multiply(checked_add(limits_.voters, 2), limits_.rpc_entries));
 	}
 	SubmitResult submit(Event event, bool maintenance_tick) {
+		return submit_retained(event, maintenance_tick);
+	}
+	SubmitResult submit_retained(Event& event, bool maintenance_tick) {
 		if (maintenance_tick && !std::holds_alternative<Tick>(event)) { throw std::logic_error("maintenance admission requires Tick"); }
 		// Validate even under backpressure; internal events never enter here.
 		auto plan = plan_event(event, core_ && core_->busy(), limits_);
