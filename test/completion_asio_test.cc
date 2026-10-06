@@ -1,6 +1,6 @@
 #include "consensus/worker.h"
 #include "journal/asio_completion.h"
-#include "journal/bsd_completion.h"
+#include "journal/native_completion.h"
 #include "journal/journal.h"
 #include <filesystem>
 #include <iostream>
@@ -36,7 +36,7 @@ class DelayedQueue {
 	CompletionStats stats() const { return queue_.stats(); }
 
   private:
-	BsdCompletionQueue queue_;
+	NativeCompletionQueue queue_;
 	bool delay_ = true;
 	std::optional<OwnedCompletion> held_;
 	Clock::time_point release_;
@@ -208,6 +208,9 @@ int main() {
 		std::filesystem::current_path() / ".scratch" / ("completion-asio-test-" + std::to_string(::getpid()));
 	int failed = 0;
 	try {
+#ifdef __linux__
+		LinuxCompletionQueue qualification(LinuxCompletionPolicy::RequireNative);
+#endif
 		std::filesystem::create_directories(directory.parent_path());
 		if (!std::filesystem::create_directory(directory)) {
 			throw std::runtime_error("completion test directory already exists");

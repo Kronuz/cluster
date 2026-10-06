@@ -117,6 +117,8 @@ public:
 			device_ = status.st_dev;
 		} catch (...) { ::close(directory_); directory_ = -1; throw; }
 	}
+	// Trusted completion backends retain the IO owner while using this capability.
+	int native_directory_handle() const noexcept { return directory_; }
 	~PosixIO() override { ::close(directory_); }
 	PosixIO(const PosixIO&) = delete;
 	PosixIO& operator=(const PosixIO&) = delete;

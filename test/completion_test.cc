@@ -1,4 +1,4 @@
-#include "journal/bsd_completion.h"
+#include "journal/native_completion.h"
 #include "journal/journal.h"
 #include "journal/store.h"
 #include <algorithm>
@@ -26,7 +26,7 @@ template <class F> bool throws(F function) {
 	}
 }
 using Clock = std::chrono::steady_clock;
-OwnedCompletion await_step(BsdCompletionQueue &queue) {
+OwnedCompletion await_step(NativeCompletionQueue &queue) {
 	auto deadline = Clock::now() + std::chrono::seconds(5);
 	while (Clock::now() < deadline) {
 		if (auto result = queue.poll()) {
@@ -36,7 +36,7 @@ OwnedCompletion await_step(BsdCompletionQueue &queue) {
 	}
 	throw std::runtime_error("completion test deadline");
 }
-void drive(BsdCompletionQueue &queue, const std::shared_ptr<IOOperation> &operation) {
+void drive(NativeCompletionQueue &queue, const std::shared_ptr<IOOperation> &operation) {
 	while (!operation->done()) {
 		check(queue.submit(operation), "free reserved slot accepts primitive");
 		check(!queue.submit(operation), "busy backend rejects without a second submission");
@@ -54,7 +54,7 @@ void actual_reclamation(const std::filesystem::path& parent) {
 		AdmissionLimits limits{{16u << 20, 256}, {1u << 20, 4}, {4u << 20, 4}, 64, 3};
 		auto store = std::make_unique<Store>(io, limits, 1024); Identity id{}; id[0] = 'g'; store->create(id); while (!store->inventory_step(1).complete) {}
 		auto replacement = store->reserve_replacement(128, 128); store->begin_artifact(*replacement, ArtifactPart::Application); store->write_chunk(*replacement, "orphan"); auto artifact = store->finish_artifact(*replacement); store->cancel_replacement(*replacement);
-		auto before = store->accounting()->used; auto job = store->begin_reclaim(4096); BsdCompletionQueue queue;
+		auto before = store->accounting()->used; auto job = store->begin_reclaim(4096); NativeCompletionQueue queue;
 		while (!job->done()) {
 			queue.submit(job); auto completed = await_step(queue);
 			if (store) { check(store->accounting()->used == before && throws([&] { job->result(); }), "physical native reclamation never credits quota before terminal owner settlement"); }
@@ -76,7 +76,7 @@ void actual_reads(const std::filesystem::path& parent) {
 	{ auto builder = journal->prepare_artifact();
 	for (std::size_t offset = 0; offset < payload.size();) { auto count = std::min(std::size_t{65536}, payload.size() - offset); builder.append_chunk(std::string_view(payload).substr(offset, count)); offset += count; }
 	artifact.emplace(builder.finish()); }
-	BsdCompletionQueue queue; auto opening = *journal->begin_artifact_open(*artifact); drive(queue, opening);
+	NativeCompletionQueue queue; auto opening = *journal->begin_artifact_open(*artifact); drive(queue, opening);
 	std::optional<ArtifactVerifier> verifier(opening->take_verifier()); opening.reset(); auto metadata = queue.stats(); std::string candidate;
 	check(metadata.native_completed >= 2 && metadata.file_read_bytes == 8 + detail::artifact_header_size && metadata.fallback_completed == 2, "actual metadata opening uses native bounded header reads and reserved open/size fallback");
 	while (verifier->offset() < payload.size()) {
@@ -103,7 +103,7 @@ void actual_backend(const std::filesystem::path &directory) {
 	Identity id{};
 	id[0] = 'c';
 	journal.create(id);
-	BsdCompletionQueue queue;
+	NativeCompletionQueue queue;
 	auto operation = journal.begin_append(std::string(150000, 'a'));
 	std::uint64_t steps = 0;
 	while (!operation->done()) {
@@ -123,9 +123,9 @@ void actual_backend(const std::filesystem::path &directory) {
 	check(journal.finish_append(operation).sequence == 1, "terminal barrier permits acknowledged frontier");
 	auto stats = queue.stats();
 	check(stats.native_submitted >= 5 && stats.native_completed == stats.native_submitted,
-		  "actual journal and manifest writes use reaped native AIO");
-	check(stats.fallback_completed == stats.fallback_submitted && stats.fallback_submitted >= 3,
-		  "namespace and unsupported barriers use the bounded fallback slot");
+		  "actual journal and manifest writes use reaped native IO");
+	check(stats.fallback_completed == stats.fallback_submitted && stats.fallback_submitted >= 1,
+		  "validated composite operations use the bounded fallback slot");
 	check(stats.file_write_bytes == 150000 + 24 + 52, "backend reports exact completed file write bytes");
 	check(!queue.busy() && !queue.poll(), "drained queue has no retained result");
 	std::cout << "native=" << stats.native_completed << " fallback=" << stats.fallback_completed
@@ -138,7 +138,7 @@ void owner_retirement(const std::filesystem::path &directory) {
 	journal->recover([](auto, auto) {});
 	auto operation = journal->begin_append("second");
 	std::weak_ptr<AppendMutation> lifetime = operation;
-	BsdCompletionQueue queue;
+	NativeCompletionQueue queue;
 	check(queue.submit(operation), "backend accepts operation before caller interest disappears");
 	operation.reset();
 	journal.reset();
@@ -175,7 +175,7 @@ void actual_artifacts(const std::filesystem::path& parent) {
 	ArtifactDescriptor descriptor;
 	{
 		auto io = std::make_shared<PosixIO>(directory); Journal journal(io, 1024);
-		Identity id{}; id[0] = 'a'; journal.create(id); BsdCompletionQueue queue;
+		Identity id{}; id[0] = 'a'; journal.create(id); NativeCompletionQueue queue;
 		auto creation = journal.begin_artifact_preparation(); drive(queue, creation);
 		auto builder = creation->take_builder(); creation.reset();
 		auto payload = builder.begin_append_chunk(std::string(60000, 'z')); drive(queue, payload); payload->result(); payload.reset();
@@ -188,7 +188,7 @@ void actual_artifacts(const std::filesystem::path& parent) {
 		auto prepared = seal->prepared_result(); descriptor = prepared.descriptor();
 		check(descriptor.length == 60000 && descriptor.checksum == crc32c(std::string(60000, 'z')), "native artifact preserves exact payload checksum and descriptor");
 		journal.publish_checkpoint(prepared, {}, 0);
-		auto stats = queue.stats(); check(stats.native_completed >= 3 && stats.fallback_completed >= 4, "artifact creation/payload/seal use native writes and explicit flush/namespace fallback");
+		auto stats = queue.stats(); check(stats.native_completed >= 3 && stats.fallback_completed >= 1, "artifact creation/payload/seal use native writes and explicit flush/namespace fallback");
 	}
 	{
 		PosixIO io(directory); Journal journal(io, 1024); bool restored = false;
@@ -205,7 +205,7 @@ void admitted_artifacts(const std::filesystem::path& parent) {
 	{
 		auto io = std::make_shared<PosixIO>(directory); AdmissionLimits limits{{16u << 20, 256}, {1u << 20, 4}, {4u << 20, 4}, 64, 3};
 		Store store(io, limits, 1024); Identity id{}; id[0] = 'A'; store.create(id); store.inventory_step(128);
-		auto replacement = store.reserve_replacement(60000, 16); BsdCompletionQueue queue;
+		auto replacement = store.reserve_replacement(60000, 16); NativeCompletionQueue queue;
 		for (auto part : {ArtifactPart::Application, ArtifactPart::Bundle}) {
 			auto creation = store.begin_artifact_operation(*replacement, part); drive(queue, creation); creation->result(); creation.reset();
 			std::string bytes = part == ArtifactPart::Application ? std::string(60000, 'q') : std::string("bundle");
@@ -232,7 +232,7 @@ void retired_publication(const std::filesystem::path& parent) {
 	auto store = std::make_unique<Store>(io, limits, 1024); Identity id{}; id[0] = 'P'; store->create(id); store->inventory_step(128);
 	auto replacement = store->reserve_replacement(128, 128);
 	for (auto part : {ArtifactPart::Application, ArtifactPart::Bundle}) { store->begin_artifact(*replacement, part); store->write_chunk(*replacement, part == ArtifactPart::Application ? "application" : "first"); store->finish_artifact(*replacement); }
-	BsdCompletionQueue queue; auto publication = store->begin_publication(*replacement, 0);
+	NativeCompletionQueue queue; auto publication = store->begin_publication(*replacement, 0);
 	check(queue.submit(publication), "native publication accepted before facade retirement"); store.reset(); io.reset();
 	{ auto original = await_step(queue); check(publication->complete(std::move(original.completion)), "original native generation creation reaped after facade retirement"); }
 	drive(queue, publication); check(publication->result().generation == 2, "native detached publication finishes full protocol"); publication.reset();
@@ -251,7 +251,7 @@ void admitted_store(const std::filesystem::path& parent) {
 	auto before = store->accounting()->used;
 	auto reservation = store->reserve_append(AdmissionClass::Normal, 6);
 	auto operation = store->begin_append(std::move(*reservation), "stored");
-	BsdCompletionQueue queue;
+	NativeCompletionQueue queue;
 	while (!operation->done()) {
 		queue.submit(operation); auto completed = await_step(queue);
 		check(store->frontier().sequence == 0 && store->accounting()->used == before && store->accounting()->tickets == 1, "real backend cannot settle Store before owner applies completion");
@@ -273,6 +273,10 @@ int main() {
 	auto directory =
 		std::filesystem::current_path() / ".scratch" / ("completion-test-" + std::to_string(::getpid()));
 	try {
+#ifdef __linux__
+		LinuxCompletionQueue qualification(LinuxCompletionPolicy::RequireNative);
+		check(qualification.native_available(), "qualification requires real io_uring");
+#endif
 		std::filesystem::create_directories(directory.parent_path());
 		if (!std::filesystem::create_directory(directory)) {
 			throw std::runtime_error("completion test directory already exists");

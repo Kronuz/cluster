@@ -5,6 +5,7 @@
 #endif
 
 #include "mutation.h"
+#include "completion.h"
 #include "posix.h"
 #include <aio.h>
 #include <atomic>
@@ -13,17 +14,6 @@
 #include <thread>
 
 namespace kronuz::journal {
-
-struct CompletionStats {
-	std::uint64_t native_submitted = 0, native_completed = 0, native_rejected = 0;
-	std::uint64_t fallback_submitted = 0, fallback_completed = 0;
-	std::uint64_t file_write_bytes = 0, file_read_bytes = 0;
-	std::uint64_t notification_errors = 0;
-};
-struct OwnedCompletion {
-	std::shared_ptr<IOOperation> operation;
-	MutationCompletion completion;
-};
 
 // One funded primitive and one reserved completion slot. The owning executor
 // submits and polls; the fallback worker performs IO only, never state changes.
@@ -110,6 +100,7 @@ class BsdCompletionQueue {
 		operation->submitted();
 		pending_ = operation;
 		request_ = std::move(request);
+		stats_.maximum_outstanding = 1;
 		if (native) {
 			int result;
 			if (request_.kind == PrimitiveKind::Read) { result = ::aio_read(&control_); }
@@ -118,6 +109,7 @@ class BsdCompletionQueue {
 			if (result == 0) {
 				native_pending_ = true;
 				++stats_.native_submitted;
+				++stats_.native_by_primitive.at(static_cast<std::size_t>(request_.kind));
 				return true;
 			}
 			auto error = errno;
@@ -131,6 +123,7 @@ class BsdCompletionQueue {
 			}
 		}
 		++stats_.fallback_submitted;
+		++stats_.fallback_by_primitive.at(static_cast<std::size_t>(request_.kind));
 		fallback_pending_ = true;
 		work_.release();
 		return true;

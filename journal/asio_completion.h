@@ -53,7 +53,13 @@ class AsioCompletionDriver : public std::enable_shared_from_this<AsioCompletionD
 			bool &active;
 			~Reset() { active = false; }
 		} reset{active_};
+		std::size_t immediate_steps = 0;
 		while (!operation->done()) {
+			// A fast backend still yields bounded owner turns to sockets and timers.
+			if (++immediate_steps == 16) {
+				immediate_steps = 0;
+				co_await asio::post(executor_, asio::use_awaitable);
+			}
 			if (!queue_->submit(operation)) {
 				throw std::logic_error("reserved completion queue is busy");
 			}
