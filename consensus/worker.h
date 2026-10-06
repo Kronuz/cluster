@@ -481,7 +481,12 @@ private:
 		} catch (const std::exception& error) { fail(error.what()); return SubmitResult::Fenced; }
 	}
 	enum class Phase { Reserved, BeginApplication, Application, SealApplication, OpenVerification, Readback, FinishVerification, AwaitVerifiedEOF, AwaitSemantic, Validated, AwaitRejection, Cutover, EncodeBundle, BeginBundle, Bundle, SealBundle, Publish, Completion };
-	struct Chunk { std::array<char, 65536> bytes{}; std::size_t length = 0; bool final = false; std::uint64_t offset = 0; Token token = 0; };
+	struct Chunk {
+		// Explicit construction avoids early nested-type trait evaluation in
+		// Clang/libstdc++ optional::emplace while retaining zeroed staging bytes.
+		Chunk() noexcept : bytes{}, length(0), final(false), offset(0), token(0) {}
+		std::array<char, 65536> bytes; std::size_t length; bool final; std::uint64_t offset; Token token;
+	};
 	struct Local { std::optional<CaptureMetadata> capture; };
 	enum class SourcePhase { Opening, Verifying, Ready, Streaming, AwaitResult, Failed };
 	struct Publication { LogBoundary boundary; std::optional<std::uint32_t> format; std::uint64_t generation; };
