@@ -1,6 +1,7 @@
 #include "journal/linux_completion.h"
 #include <filesystem>
 #include <iostream>
+#include <sys/wait.h>
 
 using namespace kronuz::journal;
 namespace {
@@ -72,6 +73,56 @@ void wrong_token(io_uring_cqe &completion) {
 int unavailable(unsigned, io_uring_params *) {
 	errno = ENOSYS;
 	return -1;
+}
+
+int permanent_enter(int) {
+	errno = EIO;
+	return -1;
+}
+void permanent_wrong_token(io_uring_cqe &completion) { ++completion.user_data; }
+int termination_code = 88;
+void permanent_faults(const std::filesystem::path &directory) {
+	for (bool corrupt : {false, true}) {
+		auto child_directory = directory / (corrupt ? "permanent-cq" : "permanent-enter");
+		std::filesystem::create_directory(child_directory);
+		check(::chmod(child_directory.c_str(), 0700) == 0, "private ownership fault directory");
+		const auto child = ::fork();
+		check(child >= 0, "spawn ownership fault witness");
+		if (!child) {
+			std::set_terminate([] { ::_exit(termination_code); });
+			auto io = std::make_shared<PosixIO>(child_directory);
+			auto owner = io->acquire_owner(true);
+			std::shared_ptr<File> file = io->create_exclusive("original");
+			LinuxCompletionQueue queue(
+				LinuxCompletionPolicy::RequireNative,
+				{nullptr, corrupt ? nullptr : permanent_enter, corrupt ? permanent_wrong_token : nullptr});
+			MutationRequest request;
+			request.kind = PrimitiveKind::Sync;
+			request.file = file;
+			auto operation = std::make_shared<Primitive>(io, request);
+			bool rejected = false;
+			try {
+				queue.submit(operation);
+				if (corrupt)
+					reap(queue, operation);
+			} catch (const std::system_error &error) {
+				rejected = !corrupt && error.code().value() == EIO;
+			} catch (const std::logic_error &) {
+				rejected = corrupt;
+			}
+			if (!rejected || !queue.busy() || operation->done() || !operation->in_flight() ||
+				queue.stats().native_submitted != 1 || queue.stats().fallback_submitted != 0)
+				::_exit(87);
+			termination_code = 86;
+			// The pending queue's destructor must fail stop; uncertain accepted IO
+			// cannot silently release resources or execute through fallback.
+		} else {
+			int result = 0;
+			check(::waitpid(child, &result, 0) == child, "reap ownership fault witness");
+			check(WIFEXITED(result) && WEXITSTATUS(result) == 86,
+				  "permanent ownership fault retains original and fails stop");
+		}
+	}
 }
 void schedules(const std::filesystem::path &directory) {
 	auto io = std::make_shared<PosixIO>(directory);
@@ -198,6 +249,7 @@ int main() {
 		std::filesystem::create_directories(directory);
 		::chmod(directory.c_str(), 0700);
 		schedules(directory);
+		permanent_faults(directory);
 		std::filesystem::remove_all(directory);
 		std::cout << checks << " Linux completion checks\n";
 		return 0;
