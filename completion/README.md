@@ -20,6 +20,10 @@ The standalone test exercises create, write, file synchronization, replace, dire
 
 ## Opaque image jobs
 
+`completion/allocation.h` supplies an optional `AllocationContext` and `OwnedAllocator<T>` without application dependencies. Empty contexts use the process-lifetime `new_delete_resource()`; managed contexts retain their resource across container rebinds and weak shared controls. Allocation sizes are checked before calling the resource, and deallocation is nonthrowing. This foundation does not yet account image jobs, POSIX controls or native queue storage.
+
+The standalone resource fixture qualifies overflow, alignment, allocation and constructor failures, container growth, and last-owner release on another thread. All three standalone suites pass on macOS, Linux and FreeBSD and under macOS ASan/UBSan. The resource fixture also passes a separate fully instrumented ThreadSanitizer run.
+
 `completion/image.h` provides `ImagePreparation` and `ImagePublication` over the same operation interface. Preparation retains an immutable input buffer, backend and caller-supplied owner/admission lease; writes use at most 64 KiB per primitive and handle short writes. Only completed file and directory synchronization can produce a `PreparedImage` capability. The caller supplies a unique generation basename and validates application semantics before preparation.
 
 Publication takes a prepared descriptor whose opaque bytes identify the separately prepared image. The application checks its expected base before constructing the job and retains the referenced image through its supplied lease. Descriptor replacement is followed by directory synchronization. Once replacement is submitted, an error leaves an uncertain outcome; the application must preserve both possible roots and fence further publication until recovery determines the selected descriptor. Successful publication consumes the prepared descriptor's selection capability. These jobs do not interpret cursors, choose storage quotas, reclaim files, or provide a transactional rollback.
