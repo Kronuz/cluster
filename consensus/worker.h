@@ -607,7 +607,7 @@ private:
 		else { std::static_pointer_cast<StoreArtifactOperation>(job)->result(); }
 		maintenance_io_.reset(); io_dispatched_ = false;
 		if (kind >= MaintenanceKind::SourceOpen) {
-			if (source_ && source_->token == token) {
+			if (source_ && source_->token == token && source_->phase != SourcePhase::Failed) {
 				auto& source = *source_;
 				if (kind == MaintenanceKind::SourceOpen) { source.verifier.emplace(std::static_pointer_cast<ArtifactOpen>(job)->take_verifier()); source.phase = SourcePhase::Verifying; }
 				else if (kind == MaintenanceKind::SourceVerify) { source.verifier->finish_read_next(std::static_pointer_cast<ArtifactRead>(job)); }
