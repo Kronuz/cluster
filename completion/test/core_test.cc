@@ -2,6 +2,7 @@
 #include "completion/image.h"
 #include "completion/native_completion.h"
 #include "journal/operation.h"
+#include <array>
 #include <chrono>
 #include <filesystem>
 #include <iostream>
@@ -162,6 +163,46 @@ int main(int argc, char **argv) {
 				std::rethrow_exception(native_job->error());
 			if (!native_job->prepared())
 				throw std::runtime_error("native image did not seal");
+			// A non-string buffer can expose a slice. Drop the initiating job
+			// after queue acceptance; its original must retain the allocation.
+			auto allocation = std::make_shared<std::array<char, 65543>>();
+			allocation->fill('y');
+			std::fill_n(allocation->begin(), 3, 'x');
+			std::fill_n(allocation->end() - 3, 3, 'z');
+			std::weak_ptr<const void> retained = allocation;
+			auto slice = std::string_view(allocation->data() + 3, 65537);
+			auto sliced_job = std::make_shared<c::ImagePreparation>(
+				io, owner, token, "sliced-generation", allocation, slice, slice.size());
+			allocation.reset();
+			sliced_job->submitted();
+			auto created = kronuz::journal::detail::execute_primitive(sliced_job->io(), sliced_job->request());
+			if (!sliced_job->complete(std::move(created)) || sliced_job->error())
+				throw std::runtime_error("sliced create failed");
+			if (!queue.submit(sliced_job))
+				throw std::runtime_error("sliced write not accepted");
+			sliced_job.reset();
+			if (retained.expired())
+				throw std::runtime_error("accepted write released its buffer");
+			std::shared_ptr<c::Operation> original_job;
+			while (queue.busy()) {
+				if (auto completion = queue.poll()) {
+					original_job = std::move(completion->operation);
+					if (retained.expired() || !original_job->complete(std::move(completion->completion)))
+						throw std::runtime_error("sliced original lost its buffer");
+				} else
+					std::this_thread::sleep_for(std::chrono::milliseconds(1));
+			}
+			if (!original_job || retained.expired())
+				throw std::runtime_error("slice released before sealing");
+			c::drive_synchronously(*original_job);
+			auto prepared = std::static_pointer_cast<c::ImagePreparation>(original_job);
+			if (prepared->error() || !prepared->prepared() || !retained.expired())
+				throw std::runtime_error("slice ownership did not settle at the barrier");
+			auto sliced_file = io->open_existing("sliced-generation");
+			std::array<char, 65537> contents;
+			if (sliced_file->size() != contents.size() || sliced_file->read_at(0, contents) != contents.size() ||
+				!std::all_of(contents.begin(), contents.end(), [](char value) { return value == 'y'; }))
+				throw std::runtime_error("slice contents differ");
 		}
 		std::filesystem::remove_all(directory);
 		std::cout << "completion core passed\n";

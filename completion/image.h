@@ -5,6 +5,13 @@
 
 namespace kronuz::io::completion {
 
+// The caller supplies a matching immutable view and lifetime owner. Accepted
+// operations retain the owner even when their initiating facade disappears.
+struct ImmutableBytes {
+	std::shared_ptr<const void> owner;
+	std::string_view view;
+};
+
 // The application supplies its owner-lock and admission lease together. Jobs
 // retain that lease, the backend and every buffer through original settlement.
 class PreparedImage {
@@ -33,8 +40,12 @@ class ImagePreparation final : public Operation {
   public:
 	ImagePreparation(std::shared_ptr<IO> io, std::shared_ptr<void> lease, Token token, std::string name,
 					 std::shared_ptr<const std::string> bytes, std::size_t maximum)
-		: state_(std::make_shared<PreparedImage::State>()), bytes_(std::move(bytes)), token_(token) {
-		if (!io || !lease || !bytes_ || bytes_->size() > maximum)
+		: ImagePreparation(std::move(io), std::move(lease), token, std::move(name),
+						   bytes, bytes ? std::string_view(*bytes) : std::string_view{}, maximum) {}
+	ImagePreparation(std::shared_ptr<IO> io, std::shared_ptr<void> lease, Token token, std::string name,
+					 std::shared_ptr<const void> owner, std::string_view bytes, std::size_t maximum)
+		: state_(std::make_shared<PreparedImage::State>()), bytes_{std::move(owner), bytes}, token_(token) {
+		if (!io || !lease || !bytes_.owner || bytes_.view.size() > maximum)
 			throw std::invalid_argument("image preparation admission invalid");
 		state_->io = std::move(io);
 		state_->lease = std::move(lease);
@@ -58,18 +69,18 @@ class ImagePreparation final : public Operation {
 				if (!result.file)
 					throw std::runtime_error("image create returned no file");
 				state_->file = std::move(result.file);
-				phase_ = bytes_->empty() ? 2 : 1;
+				phase_ = bytes_.view.empty() ? 2 : 1;
 			} else if (phase_ == 1) {
 				if (!result.count || result.count > request_.bytes.size())
 					throw std::runtime_error("invalid image write completion");
 				offset_ += result.count;
-				if (offset_ == bytes_->size())
+				if (offset_ == bytes_.view.size())
 					phase_ = 2;
 			} else if (phase_ == 2) {
 				phase_ = 3;
 			} else {
 				done_ = true;
-				bytes_.reset();
+				bytes_ = {};
 				return true;
 			}
 			if (token_.step == std::numeric_limits<std::uint64_t>::max())
@@ -103,13 +114,13 @@ class ImagePreparation final : public Operation {
 		} else if (phase_ == 1) {
 			request_.kind = Kind::Write;
 			request_.offset = offset_;
-			request_.bytes = std::string_view(*bytes_).substr(
-				offset_, std::min<std::size_t>(65536, bytes_->size() - offset_));
+			request_.bytes = bytes_.view.substr(
+				offset_, std::min<std::size_t>(65536, bytes_.view.size() - offset_));
 		} else
 			request_.kind = phase_ == 2 ? Kind::Sync : Kind::DirectorySync;
 	}
 	std::shared_ptr<PreparedImage::State> state_;
-	std::shared_ptr<const std::string> bytes_;
+	ImmutableBytes bytes_;
 	Token token_;
 	Request request_;
 	std::exception_ptr error_;
