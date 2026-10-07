@@ -83,6 +83,7 @@ void managed_images(const std::shared_ptr<UnusedIO> &io, const std::shared_ptr<c
 	unsigned destroyed = 0;
 	auto file = std::make_unique<TrackedFile>(destroyed);
 	const auto admitted = resource->used;
+	resource->fail_at = resource->calls + 1;
 	while (!job->done()) {
 		c::Result result;
 		result.token = job->request().token;
@@ -93,7 +94,7 @@ void managed_images(const std::shared_ptr<UnusedIO> &io, const std::shared_ptr<c
 		job->submitted();
 		check(job->complete(std::move(result)));
 		watching = false;
-		check(allocations == 0 && resource->used == admitted);
+		check(allocations == 0 && resource->used == admitted && resource->calls == 3);
 	}
 	auto prepared = job->prepared();
 	check(prepared.name() == candidate && prepared.allocation_context().resource() == resource.get());
