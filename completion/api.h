@@ -11,6 +11,7 @@ using File = kronuz::journal::File;
 using IO = kronuz::journal::IO;
 using OwnerLock = kronuz::journal::OwnerLock;
 using PosixIO = kronuz::journal::PosixIO;
+using kronuz::journal::make_posix_io;
 using Token = kronuz::journal::MutationToken;
 using Kind = kronuz::journal::PrimitiveKind;
 using Request = kronuz::journal::MutationRequest;

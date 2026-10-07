@@ -1,7 +1,9 @@
 #pragma once
 
 #include "io.h"
+#include "allocation.h"
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <filesystem>
 #include <fcntl.h>
@@ -17,6 +19,29 @@
 namespace kronuz::journal {
 
 namespace detail {
+// Concrete POSIX controls keep default unique_ptr deletion. Their allocation
+// header retains the PMR owner until after the most-derived destructor runs.
+template <class Base> class ManagedPosixControl final : public Base {
+	using Context = kronuz::io::completion::AllocationContext;
+	struct Header { Context context; };
+	static constexpr std::size_t alignment() { return std::max(alignof(Header), alignof(ManagedPosixControl)); }
+	static constexpr std::size_t prefix() { return (sizeof(Header) + alignment() - 1) / alignment() * alignment(); }
+public:
+	using Base::Base;
+	static void* operator new(std::size_t bytes, const Context& context) {
+		if (bytes != sizeof(ManagedPosixControl)) { throw std::bad_alloc(); }
+		auto memory = context.resource()->allocate(prefix() + bytes, alignment());
+		std::construct_at(static_cast<Header*>(memory), Header{context});
+		return static_cast<char*>(memory) + prefix();
+	}
+	static void operator delete(void* pointer) noexcept {
+		auto header = reinterpret_cast<Header*>(static_cast<char*>(pointer) - prefix());
+		auto context = std::move(header->context);
+		std::destroy_at(header);
+		context.resource()->deallocate(header, prefix() + sizeof(ManagedPosixControl), alignment());
+	}
+	static void operator delete(void* pointer, const Context&) noexcept { operator delete(pointer); }
+};
 [[noreturn]] inline void system_failure(const char* operation) {
 	throw std::system_error(errno, std::generic_category(), operation);
 }
@@ -26,6 +51,17 @@ inline void validate_name(std::string_view name, std::size_t maximum = 128) {
 		throw std::invalid_argument("invalid journal filename");
 	}
 }
+class PosixName {
+public:
+	explicit PosixName(std::string_view name, std::size_t maximum = 128) {
+		validate_name(name, std::min<std::size_t>(maximum, 255));
+		std::copy(name.begin(), name.end(), bytes_.begin());
+		bytes_[name.size()] = '\0';
+	}
+	const char* c_str() const noexcept { return bytes_.data(); }
+private:
+	std::array<char, 256> bytes_;
+};
 inline void validate_file(int fd) {
 	struct stat status{};
 	if (::fstat(fd, &status)) { system_failure("stat journal file"); }
@@ -48,10 +84,11 @@ inline off_t checked_offset(std::uint64_t offset) {
 	}
 	return static_cast<off_t>(offset);
 }
-class PosixCursor final : public DirectoryCursor {
+class PosixCursor : public DirectoryCursor {
 public:
 	explicit PosixCursor(DIR* directory) : directory_(directory) {}
-	~PosixCursor() override { ::closedir(directory_); }
+	~PosixCursor() override { if (directory_) { ::closedir(directory_); } }
+	void install(DIR* directory) noexcept { directory_ = directory; }
 	std::optional<std::string> next() override {
 		for (;;) {
 			errno = 0; auto entry = ::readdir(directory_);
@@ -63,10 +100,11 @@ public:
 private:
 	DIR* directory_;
 };
-class PosixFile final : public File {
+class PosixFile : public File {
 public:
 	explicit PosixFile(int fd) : fd_(fd) {}
-	~PosixFile() override { ::close(fd_); }
+	~PosixFile() override { if (fd_ >= 0) { ::close(fd_); } }
+	void install(int fd) noexcept { fd_ = fd; }
 	// Trusted completion backend only. The owning File lease retains this FD.
 	int native_handle() const noexcept { return fd_; }
 	std::uint64_t size() override {
@@ -106,7 +144,10 @@ public:
 	// Trusted ancestors are a caller precondition; final-component symlinks and
 	// directories writable by other users are rejected here.
 	explicit PosixIO(const std::filesystem::path& directory, unsigned artifact_mode = 0600)
-		: artifact_mode_(artifact_mode) {
+		: PosixIO(kronuz::io::completion::AllocationContext{}, directory, artifact_mode) {}
+	PosixIO(kronuz::io::completion::AllocationContext context, const std::filesystem::path& directory,
+		unsigned artifact_mode = 0600)
+		: context_(std::move(context)), artifact_mode_(artifact_mode) {
 		if (artifact_mode != 0600 && artifact_mode != 0640 && artifact_mode != 0644) {
 			throw std::invalid_argument("unsupported artifact permissions");
 		}
@@ -129,11 +170,12 @@ public:
 
 	std::unique_ptr<OwnerLock> acquire_owner(bool create) override {
 		if (owner_fd_ >= 0) { throw std::logic_error("journal directory already owned"); }
+		auto owner = control<Lock>(*this, -1);
 		int fd = open_file("owner.lock", create);
 		try {
 			if (::flock(fd, LOCK_EX | LOCK_NB)) { detail::system_failure("lock journal owner"); }
 			if (create) { detail::file_sync(fd); }
-			auto owner = std::make_unique<Lock>(*this, fd);
+			owner->install(fd);
 			owner_fd_ = fd;
 			return owner;
 		} catch (...) { ::close(fd); throw; }
@@ -141,27 +183,26 @@ public:
 	std::unique_ptr<File> open_existing(std::string_view name) override { return file(name, false); }
 	std::unique_ptr<File> create_exclusive(std::string_view name) override { return file(name, true); }
 	void replace(std::string_view source, std::string_view destination) override {
-		detail::validate_name(source); detail::validate_name(destination);
-		std::string from(source), to(destination);
+		detail::PosixName from(source), to(destination);
 		if (::renameat(directory_, from.c_str(), directory_, to.c_str())) { detail::system_failure("replace journal manifest"); }
 	}
 	void remove(std::string_view name) override {
-		detail::validate_name(name);
-		std::string component(name);
+		detail::PosixName component(name);
 		if (::unlinkat(directory_, component.c_str(), 0) && errno != ENOENT) { detail::system_failure("remove journal file"); }
 	}
 	std::unique_ptr<DirectoryCursor> scan_directory() override {
+		auto cursor = control<detail::PosixCursor>(nullptr);
 		// dup() would share the original directory's file offset. Use an
 		// independent open description for every reclamation pass.
 		int fd = ::openat(directory_, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
 		if (fd < 0) { detail::system_failure("open journal scan cursor"); }
 		auto directory = ::fdopendir(fd);
 		if (!directory) { auto error = errno; ::close(fd); errno = error; detail::system_failure("create journal scan cursor"); }
-		try { return std::make_unique<detail::PosixCursor>(directory); }
-		catch (...) { ::closedir(directory); throw; }
+		cursor->install(directory);
+		return cursor;
 	}
 	std::unique_ptr<File> open_reclaim_candidate(std::string_view name) override {
-		detail::validate_name(name); std::string component(name); struct stat status{};
+		detail::PosixName component(name); struct stat status{};
 		if (::fstatat(directory_, component.c_str(), &status, AT_SYMLINK_NOFOLLOW)) {
 			if (errno == ENOENT) { return nullptr; } detail::system_failure("inspect reclamation candidate");
 		}
@@ -171,7 +212,7 @@ public:
 	}
 	std::optional<EntryFootprint> entry_footprint(std::string_view name) override {
 		// Census foreign names too, beyond the journal's own 128-byte bound.
-		detail::validate_name(name, 255); std::string component(name); struct stat status{};
+		detail::PosixName component(name, 255); struct stat status{};
 		if (::fstatat(directory_, component.c_str(), &status, AT_SYMLINK_NOFOLLOW)) {
 			if (errno == ENOENT) { return std::nullopt; } detail::system_failure("inspect storage footprint");
 		}
@@ -196,17 +237,17 @@ public:
 	}
 
 private:
-	class Lock final : public OwnerLock {
+	class Lock : public OwnerLock {
 	public:
 		Lock(PosixIO& io, int fd) : io_(io), fd_(fd) {}
-		~Lock() override { io_.owner_fd_ = -1; ::close(fd_); }
+		~Lock() override { if (fd_ >= 0) { io_.owner_fd_ = -1; ::close(fd_); } }
+		void install(int fd) noexcept { fd_ = fd; }
 	private:
 		PosixIO& io_;
 		int fd_;
 	};
 	int open_file(std::string_view name, bool create) {
-		detail::validate_name(name);
-		std::string component(name);
+		detail::PosixName component(name);
 		int flags = O_RDWR | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK;
 		if (create) { flags |= O_CREAT | O_EXCL; }
 		int fd;
@@ -231,13 +272,26 @@ private:
 		return fd;
 	}
 	std::unique_ptr<File> file(std::string_view name, bool create) {
-		int fd = open_file(name, create);
-		try { return std::make_unique<detail::PosixFile>(fd); }
-		catch (...) { ::close(fd); throw; }
+		auto result = control<detail::PosixFile>(-1);
+		result->install(open_file(name, create));
+		return result;
 	}
+	template <class T, class... Args> std::unique_ptr<T> control(Args&&... args) {
+		if (context_.managed()) {
+			return std::unique_ptr<T>(new (context_) detail::ManagedPosixControl<T>(std::forward<Args>(args)...));
+		}
+		return std::make_unique<T>(std::forward<Args>(args)...);
+	}
+	kronuz::io::completion::AllocationContext context_;
 	int directory_ = -1, owner_fd_ = -1;
 	dev_t device_{};
 	unsigned artifact_mode_ = 0600;
 };
+
+inline std::shared_ptr<PosixIO> make_posix_io(kronuz::io::completion::AllocationContext context,
+	const std::filesystem::path& directory, unsigned artifact_mode = 0600) {
+	return std::allocate_shared<PosixIO>(kronuz::io::completion::OwnedAllocator<PosixIO>(context),
+		context, directory, artifact_mode);
+}
 
 } // namespace kronuz::journal

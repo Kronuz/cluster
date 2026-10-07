@@ -5,6 +5,7 @@
 #include "completion.h"
 #include "posix.h"
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <climits>
 #include <linux/io_uring.h>
@@ -13,7 +14,6 @@
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <thread>
-#include <vector>
 
 namespace kronuz::journal {
 enum class LinuxCompletionPolicy { Automatic, RequireNative, Fallback };
@@ -154,8 +154,8 @@ class LinuxCompletionQueue {
 			stats_.file_read_bytes += result_.count;
 		OwnedCompletion result{std::move(pending_), std::move(result_)};
 		request_ = {};
-		source_.clear();
-		destination_.clear();
+		source_[0] = '\0';
+		destination_[0] = '\0';
 		ready_.store(false, std::memory_order_relaxed);
 		return result;
 	}
@@ -218,8 +218,8 @@ class LinuxCompletionQueue {
 		cqes_ = field<io_uring_cqe>(cq_mapping_, cq_size_, parameters_.cq_off.cqes, parameters_.cq_entries);
 		if (*sq_mask_ != parameters_.sq_entries - 1 || *cq_mask_ != parameters_.cq_entries - 1)
 			throw std::runtime_error("invalid IO ring indices");
-		std::vector<std::uint64_t> probe_storage(
-			(sizeof(io_uring_probe) + 256 * sizeof(io_uring_probe_op) + 7) / 8);
+		std::array<std::uint64_t, (sizeof(io_uring_probe) + 256 * sizeof(io_uring_probe_op) + 7) / 8>
+			probe_storage{};
 		auto probe = reinterpret_cast<io_uring_probe *>(probe_storage.data());
 		if (::syscall(__NR_io_uring_register, ring_, IORING_REGISTER_PROBE, probe, 256) < 0)
 			detail::system_failure("probe IO operations");
@@ -271,26 +271,31 @@ class LinuxCompletionQueue {
 				return false;
 			detail::validate_name(request.source);
 			detail::validate_name(request.destination);
-			source_ = request.source;
-			destination_ = request.destination;
+			copy_name(source_, request.source);
+			copy_name(destination_, request.destination);
 			entry.opcode = IORING_OP_RENAMEAT;
 			entry.fd = directory->native_directory_handle();
-			entry.addr = reinterpret_cast<std::uintptr_t>(source_.c_str());
+			entry.addr = reinterpret_cast<std::uintptr_t>(source_.data());
 			entry.len = static_cast<unsigned>(directory->native_directory_handle());
-			entry.addr2 = reinterpret_cast<std::uintptr_t>(destination_.c_str());
+			entry.addr2 = reinterpret_cast<std::uintptr_t>(destination_.data());
 			return true;
 		case PrimitiveKind::Remove:
 			if (!directory || !supported_[IORING_OP_UNLINKAT])
 				return false;
 			detail::validate_name(request.source);
-			source_ = request.source;
+			copy_name(source_, request.source);
 			entry.opcode = IORING_OP_UNLINKAT;
 			entry.fd = directory->native_directory_handle();
-			entry.addr = reinterpret_cast<std::uintptr_t>(source_.c_str());
+			entry.addr = reinterpret_cast<std::uintptr_t>(source_.data());
 			return true;
 		default:
 			return false; // Existing composite validation stays intact.
 		}
+	}
+	static void copy_name(std::array<char, 129> &target, std::string_view name) noexcept {
+		// Both namespace primitives validate the 128-byte bound first.
+		std::copy(name.begin(), name.end(), target.begin());
+		target[name.size()] = '\0';
 	}
 	void kick() {
 		if (!native_pending_ || load(sq_head_) == load(sq_tail_))
@@ -358,7 +363,7 @@ class LinuxCompletionQueue {
 	std::shared_ptr<IOOperation> pending_;
 	MutationRequest request_;
 	MutationCompletion result_;
-	std::string source_, destination_;
+	std::array<char, 129> source_, destination_;
 	CompletionStats stats_;
 };
 } // namespace kronuz::journal

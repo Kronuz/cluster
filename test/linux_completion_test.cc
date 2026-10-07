@@ -127,7 +127,8 @@ void permanent_faults(const std::filesystem::path &directory) {
 void schedules(const std::filesystem::path &directory) {
 	auto io = std::make_shared<PosixIO>(directory);
 	auto owner = io->acquire_owner(true);
-	std::shared_ptr<File> file = io->create_exclusive("source");
+	const std::string source(128, 's'), destination(128, 'd');
+	std::shared_ptr<File> file = io->create_exclusive(source);
 	LinuxCompletionQueue queue(LinuxCompletionPolicy::RequireNative, {nullptr, transient_enter});
 	std::string payload = "owned original";
 	MutationRequest request;
@@ -168,16 +169,16 @@ void schedules(const std::filesystem::path &directory) {
 	check(!directory_sync->result_.error, "native directory barrier");
 	request = {};
 	request.kind = PrimitiveKind::Replace;
-	request.source = "source";
-	request.destination = "destination";
+	request.source = source;
+	request.destination = destination;
 	auto rename = std::make_shared<Primitive>(io, request);
 	queue.submit(rename);
 	reap(queue, rename);
-	check(!rename->result_.error && std::filesystem::exists(directory / "destination"),
+	check(!rename->result_.error && std::filesystem::exists(directory / destination),
 		  "native namespace replacement");
 	request = {};
 	request.kind = PrimitiveKind::Remove;
-	request.source = "destination";
+	request.source = destination;
 	for (int i = 0; i < 2; ++i) {
 		auto remove = std::make_shared<Primitive>(io, request);
 		queue.submit(remove);
@@ -203,6 +204,14 @@ void schedules(const std::filesystem::path &directory) {
 	}
 	check(invalid_rejected && !invalid->in_flight() && !queue.busy(),
 		  "basename rejection precedes kernel publication");
+	const std::string oversized(129, 'x');
+	request.source = oversized;
+	auto oversized_job = std::make_shared<Primitive>(io, request);
+	invalid_rejected = false;
+	try { queue.submit(oversized_job); }
+	catch (const std::invalid_argument&) { invalid_rejected = true; }
+	check(invalid_rejected && !oversized_job->in_flight() && !queue.busy(),
+		  "inline namespace buffer rejects oversized names before submission");
 	auto stats = queue.stats();
 	check(stats.native_completed == 8 && stats.fallback_submitted == 0 && stats.maximum_outstanding == 1,
 		  "real kernel must qualify all selected primitive classes");
