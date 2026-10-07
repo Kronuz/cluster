@@ -22,6 +22,7 @@ public:
 	SnapshotChannel(const SnapshotChannel&) = delete;
 	SnapshotChannel& operator=(const SnapshotChannel&) = delete;
 	void register_session(TrustedSession session) {
+		if (worker_.closing()) { return; }
 		auto channel = find(session.peer);
 		if (!channel || session.local == Identity{} || session.remote == Identity{}) { throw std::invalid_argument("invalid trusted snapshot session"); }
 		if (channel->session) { session_closed(*channel->session); }
@@ -39,7 +40,7 @@ public:
 	}
 	TransferInput receive(const TrustedSession& session, std::span<const char> bytes) {
 		auto channel = find(session.peer); if (!channel || channel->session != session) { return {TransferReceive::Closed, 0}; }
-		if (worker_.fenced()) { close_fenced(); return {TransferReceive::Closed, 0}; }
+		if (worker_.closing() || worker_.fenced()) { close_fenced(); return {TransferReceive::Closed, 0}; }
 		std::size_t consumed = 0;
 		try {
 			if (channel->used >= 12 && channel->used == frame_length(*channel)) {
@@ -58,7 +59,7 @@ public:
 		catch (const std::invalid_argument&) { session_closed(session); return {TransferReceive::Closed, consumed}; }
 	}
 	std::optional<TransferOutput> outbound() {
-		if (worker_.fenced()) { close_fenced(); return std::nullopt; }
+		if (worker_.closing() || worker_.fenced()) { close_fenced(); return std::nullopt; }
 		if (!selected_) {
 			for (auto& channel : channels_) { if (channel.control) { selected_ = channel.control->token; break; } }
 			if (!selected_ && data_) { selected_ = data_->token; }
@@ -76,7 +77,7 @@ public:
 		selected_ = 0;
 	}
 	void run_one(Tick tick) {
-		if (worker_.fenced()) { close_fenced(); return; }
+		if (worker_.closing() || worker_.fenced()) { close_fenced(); return; }
 		if (tick.now < now_) { return; } now_ = tick.now;
 		for (auto& channel : channels_) {
 			if (channel.session && channel.used >= 12) {

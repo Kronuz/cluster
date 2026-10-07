@@ -3,6 +3,7 @@
 #include "core.h"
 #include "admission.h"
 #include "checkpoint.h"
+#include "checkpoint_encoder.h"
 #include "snapshot.h"
 #include "../journal/store.h"
 
@@ -115,7 +116,15 @@ public:
 			} else { core_ = std::make_unique<Core>(configuration_, recovery.finish(frontier.sequence), limits_, timing_); }
 		} catch (const std::exception& error) { fail(error.what()); throw; }
 	}
-	bool ready() const noexcept { return core_ && initialization_.empty() && store_.accounting().has_value() && !fenced(); }
+	bool ready() const noexcept { return !closing_ && core_ && initialization_.empty() && store_.accounting().has_value() && !fenced(); }
+	// Close protocol interest, then reap accepted originals before invalidating
+	// their backing capabilities. No new Store operation is started after close.
+	void close() noexcept { closing_ = true; }
+	bool closing() const noexcept { return closing_; }
+	bool drained() const noexcept {
+		return closing_ && !io_job_ && !maintenance_io_ && !persist_ && output_.empty() &&
+			!checkpoint_ && !source_ && (!core_ || core_->retirement_drained());
+	}
 	bool fenced() const noexcept { return failed_ || store_.fenced(); }
 	Role role() const noexcept { return core_ ? core_->role() : Role::Follower; }
 	bool busy() const noexcept { return core_ && core_->busy(); }
@@ -123,6 +132,9 @@ public:
 	Index committed() const noexcept { return core_ ? core_->committed() : 0; }
 	Index applied_index() const noexcept { return core_ ? core_->applied() : 0; }
 	std::size_t retained_log_bytes() const noexcept { return core_ ? core_->retained_log_bytes() : 0; }
+	std::size_t retired_log_bytes() const noexcept { return core_ ? core_->retired_log_bytes() : 0; }
+	std::size_t retired_log_entries() const noexcept { return core_ ? core_->retired_log_entries() : 0; }
+	bool owns_io_operation(const std::shared_ptr<kronuz::journal::IOOperation>& operation) const noexcept { return operation && (operation == io_job_ || operation == maintenance_io_); }
 	Index base_index() const noexcept { return core_ ? core_->base_index() : 0; }
 	LogBoundary base_boundary() const noexcept { return core_ ? core_->base_boundary() : LogBoundary{}; }
 	auto storage_frontier() const { return store_.frontier(); }
@@ -137,9 +149,19 @@ public:
 		io_dispatched_ = true; return io_job_ ? std::static_pointer_cast<kronuz::journal::IOOperation>(io_job_) : maintenance_io_;
 	}
 	void storage_operation_failed(const std::shared_ptr<kronuz::journal::IOOperation>& operation, std::string reason) {
-		if (operation && (operation == io_job_ || operation == maintenance_io_) && !fenced()) { fail(std::move(reason)); }
+		if (!operation || (operation != io_job_ && operation != maintenance_io_) || failed_) { return; }
+		// A failed driver closes admission without bulk-destroying protocol
+		// payloads. In-flight originals remain owned until their actual reaping.
+		close(); failed_ = true; store_.fence_storage(); terminal_ = Fenced{std::move(reason)};
+		if (!operation->in_flight() && !operation->done()) {
+			// No submitted original remains. The host must have stopped its
+			// driver before reporting this local abandonment. Started mutations
+			// retain conservative tainted accounting; this is not a completion.
+			io_job_.reset(); maintenance_io_.reset(); io_persist_token_.reset(); io_dispatched_ = false;
+		}
 	}
 	Actions take_actions() {
+		if (closing_) { return {}; }
 		Actions result = std::move(output_); output_.clear();
 		for (const auto& action : result) {
 			if (auto committed = std::get_if<Committed>(&action)) { delivered_ = committed->entries.back().index; }
@@ -148,7 +170,7 @@ public:
 		return result;
 	}
 	void applied(Applied completion) {
-		if (fenced() || !core_ || completion.through <= core_->applied()) { return; }
+		if (closing_ || fenced() || !core_ || completion.through <= core_->applied()) { return; }
 		if (application_ && application_->through == completion.through) { return; }
 		if (completion.through != delivered_ || application_) { fail("invalid worker application completion"); return; }
 		delivered_ = 0;
@@ -157,7 +179,7 @@ public:
 	}
 	void application_failed(Index through, std::string reason) {
 		// A stale/duplicate report cannot fence unrelated application work.
-		if (!fenced() && core_ && through != 0 && through == delivered_) { fail(std::move(reason)); }
+		if (!closing_ && !fenced() && core_ && through != 0 && through == delivered_) { fail(std::move(reason)); }
 	}
 	std::optional<CheckpointId> reserve_checkpoint(std::uint64_t application_cap) {
 		if (!ready() || checkpoint_ || snapshot_result_) { return std::nullopt; }
@@ -175,6 +197,7 @@ public:
 		std::get<Local>(operation.mode).capture = capture; operation.phase = Phase::BeginApplication;
 	}
 	SubmitResult offer_application_chunk(const CheckpointId& id, std::string_view bytes, bool final = false) {
+		if (closing_) { return SubmitResult::Busy; }
 		auto& operation = checkpoint(id);
 		if (operation.cancel_reason) { return SubmitResult::Busy; }
 		if ((operation.phase != Phase::BeginApplication && operation.phase != Phase::Application) || operation.final_offered) {
@@ -217,6 +240,7 @@ public:
 		return SnapshotId(checkpoint_owner_, token);
 	}
 	SnapshotOffer offer_snapshot_chunk(const SnapshotId& id, std::uint64_t offset, std::string_view bytes, bool final = false) {
+		if (closing_) { return {SubmitResult::Busy, offset}; }
 		auto& operation = snapshot(id);
 		if (operation.cancel_reason) { return {SubmitResult::Busy, operation.offered_bytes}; }
 		if ((operation.phase != Phase::BeginApplication && operation.phase != Phase::Application) || operation.final_offered) { throw std::invalid_argument("snapshot no longer accepts input"); }
@@ -230,13 +254,14 @@ public:
 		return {SubmitResult::Accepted, operation.offered_bytes};
 	}
 	std::optional<ValidationView> validation_chunk() const {
-		if (fenced() || !checkpoint_ || checkpoint_->cancel_reason) { return std::nullopt; }
+		if (closing_ || fenced() || !checkpoint_ || checkpoint_->cancel_reason) { return std::nullopt; }
 		auto incoming = std::get_if<Incoming>(&checkpoint_->mode);
 		if (!incoming || !incoming->view) { return std::nullopt; }
 		const auto& chunk = *checkpoint_->chunk;
 		return ValidationView{SnapshotId(checkpoint_owner_, checkpoint_->token), chunk.token, chunk.offset, std::span<const char>(chunk.bytes.data(), chunk.length), chunk.final};
 	}
 	ValidationAck consume_validation(const SnapshotId& id, Token token) {
+		if (closing_) { return ValidationAck::NotReady; }
 		if (fenced()) { return ValidationAck::Fenced; }
 		auto operation = find_snapshot(id); if (!operation) { return ValidationAck::Stale; }
 		if (operation->cancel_reason) { return ValidationAck::NotReady; }
@@ -248,6 +273,7 @@ public:
 		operation->chunk.reset(); return ValidationAck::Accepted;
 	}
 	ValidationAck validation_succeeded(const SnapshotId& id, Token eof) {
+		if (closing_) { return ValidationAck::NotReady; }
 		if (fenced()) { return ValidationAck::Fenced; }
 		auto operation = find_snapshot(id); if (!operation) { return ValidationAck::Stale; }
 		if (operation->cancel_reason) { return ValidationAck::NotReady; }
@@ -274,6 +300,7 @@ public:
 	const FixedConfiguration& configuration() const noexcept { return configuration_; }
 	std::optional<SnapshotResult> take_snapshot_result() { auto result = std::move(snapshot_result_); snapshot_result_.reset(); return result; }
 	SubmitResult request_install(const SnapshotId& id) {
+		if (closing_) { return SubmitResult::Busy; }
 		if (fenced()) { return SubmitResult::Fenced; }
 		auto& operation = snapshot(id);
 		if (operation.cancel_reason) { return SubmitResult::Busy; } auto& incoming = std::get<Incoming>(operation.mode);
@@ -287,7 +314,7 @@ public:
 		} catch (const std::exception& error) { fail(error.what()); return SubmitResult::Fenced; }
 	}
 	std::optional<SnapshotActivation> snapshot_activation() const {
-		if (fenced() || !checkpoint_ || delivered_ || application_ || activation_completion_) { return std::nullopt; }
+		if (closing_ || fenced() || !checkpoint_ || delivered_ || application_ || activation_completion_) { return std::nullopt; }
 		auto incoming = std::get_if<Incoming>(&checkpoint_->mode);
 		if (!incoming || !incoming->activation) { return std::nullopt; }
 		return SnapshotActivation{SnapshotId(checkpoint_owner_, checkpoint_->token), incoming->activation->token, incoming->context.descriptor};
@@ -304,6 +331,7 @@ public:
 		activation_completion_ = InstallActivated{token}; return ValidationAck::Accepted;
 	}
 	ValidationAck snapshot_activation_failed(const SnapshotId& id, Token token) {
+		if (closing_) { return ValidationAck::NotReady; }
 		if (fenced()) { return ValidationAck::Fenced; }
 		auto operation = find_snapshot(id); if (!operation) { return ValidationAck::Stale; }
 		if (operation->cancel_reason) { return ValidationAck::NotReady; }
@@ -314,7 +342,7 @@ public:
 	}
 
 	std::optional<SourceInfo> snapshot_source() const {
-		if (fenced() || !source_ || (source_->phase != SourcePhase::Streaming && source_->phase != SourcePhase::AwaitResult) || !core_->snapshot_sending(source_->peer, source_->key)) { return std::nullopt; }
+		if (closing_ || fenced() || !source_ || (source_->phase != SourcePhase::Streaming && source_->phase != SourcePhase::AwaitResult) || !core_->snapshot_sending(source_->peer, source_->key)) { return std::nullopt; }
 		return SourceInfo{SourceId(source_owner_, source_->token), source_->peer, source_->key, source_->descriptor};
 	}
 	std::optional<SourceChunk> source_chunk() const {
@@ -343,10 +371,12 @@ public:
 		return ValidationAck::Accepted;
 	}
 	TurnResult run_one(Tick current_time) {
+		if (closing_) { return retirement_turn(); }
 		if (store_.fenced() && !failed_) { fail("storage fenced outside worker"); }
 		if (fenced()) { return TurnResult::Fenced; }
 		if (!core_) { throw std::logic_error("worker not opened"); }
 		refresh_source();
+		core_->retire_log();
 		try {
 			if (maintenance_io_) {
 				if (!maintenance_io_->done()) {
@@ -441,6 +471,46 @@ public:
 		} catch (const std::exception& error) { fail(error.what()); return TurnResult::Fenced; }
 	}
 private:
+	TurnResult retirement_turn() {
+		try {
+			if (maintenance_io_) {
+				if (!maintenance_io_->done()) { return TurnResult::IOPending; }
+				// Observe the actual accepted preparation/publication outcome.
+				// A published image may be activated by recovery after shutdown.
+				finish_maintenance_io(); return TurnResult::Stored;
+			}
+			if (io_job_) {
+				if (!io_job_->done()) { return TurnResult::IOPending; }
+				io_job_->result(); io_job_.reset(); io_persist_token_.reset(); io_dispatched_ = false;
+				return TurnResult::Stored;
+			}
+			if (checkpoint_) {
+				// Completion denotes an actually published manifest. Earlier
+				// phases own known staging artifacts, not durable publication.
+				if (checkpoint_->phase != Phase::Completion) { store_.cancel_replacement(checkpoint_->replacement); }
+				checkpoint_.reset();
+			}
+			source_.reset(); snapshot_result_.reset(); published_.reset(); pending_publication_.reset();
+			completion_.reset(); application_.reset(); activation_completion_.reset(); initialization_.clear();
+			release_pack(); delivered_ = 0;
+			detail::RetirementBudget budget{32, limits_.command_bytes};
+			if (persist_) {
+				if (persist_->batch.log && !detail::retire_entries(persist_->batch.log->entries, budget)) { return TurnResult::Maintenance; }
+				persist_.reset();
+			}
+			if (!detail::retire_actions(output_, budget)) { return TurnResult::Maintenance; }
+			terminal_.reset();
+			if (core_) { core_->begin_retirement(); core_->retirement_step(budget); }
+			return drained() ? TurnResult::Idle : TurnResult::Maintenance;
+		} catch (const std::exception& error) {
+			// Originals reaching this branch are terminal. Preserve the existing
+			// storage fence, but do not bulk-clear retained protocol payloads.
+			failed_ = true; store_.fence_storage();
+			checkpoint_.reset(); source_.reset();
+			io_job_.reset(); maintenance_io_.reset(); io_persist_token_.reset(); io_dispatched_ = false;
+			terminal_ = Fenced{error.what()}; return TurnResult::Fenced;
+		}
+	}
 	enum class MaintenanceKind { Reclaim, BeginApplication, Application, SealApplication, OpenVerification, Readback, BeginBundle, Bundle, SealBundle, Publish, SourceOpen, SourceVerify, SourceRead };
 	void validate_configuration(const kronuz::journal::AdmissionLimits& admission) {
 		Core validate(configuration_, RecoveredState{configuration_, {}, 0, 0, {}, 0}, limits_, timing_);
@@ -520,7 +590,8 @@ private:
 		std::variant<Local, Incoming> mode;
 		std::optional<Chunk> chunk;
 		std::optional<kronuz::journal::ArtifactDescriptor> application;
-		std::optional<RecoveredState> captured;
+		std::optional<Core::FrozenCheckpoint> frozen;
+		std::optional<IncrementalCheckpointEncoder<Core::FrozenCheckpoint>> encoder;
 		std::string bundle;
 		std::size_t offset = 0;
 		bool final_offered = false;
@@ -607,7 +678,7 @@ private:
 		else { std::static_pointer_cast<StoreArtifactOperation>(job)->result(); }
 		maintenance_io_.reset(); io_dispatched_ = false;
 		if (kind >= MaintenanceKind::SourceOpen) {
-			if (source_ && source_->token == token && source_->phase != SourcePhase::Failed) {
+			if (source_ && source_->token == token && !closing_ && source_->phase != SourcePhase::Failed) {
 				auto& source = *source_;
 				if (kind == MaintenanceKind::SourceOpen) { source.verifier.emplace(std::static_pointer_cast<ArtifactOpen>(job)->take_verifier()); source.phase = SourcePhase::Verifying; }
 				else if (kind == MaintenanceKind::SourceVerify) { source.verifier->finish_read_next(std::static_pointer_cast<ArtifactRead>(job)); }
@@ -633,8 +704,8 @@ private:
 					chunk.offset = incoming.verifier->offset(); chunk.length = incoming.verifier->finish_read_next(read); std::copy(bytes.begin(), bytes.end(), chunk.bytes.begin()); chunk.token = validation_token(); incoming.view = true; break;
 				}
 				case MaintenanceKind::BeginBundle: operation.phase = Phase::Bundle; break;
-				case MaintenanceKind::Bundle: operation.offset += maintenance_bytes_; if (operation.offset == operation.bundle.size()) { operation.phase = Phase::SealBundle; } break;
-				case MaintenanceKind::SealBundle: operation.bundle.clear(); operation.phase = Phase::Publish; break;
+				case MaintenanceKind::Bundle: operation.offset += maintenance_bytes_; operation.bundle.clear(); if (operation.encoder->done()) { operation.phase = Phase::SealBundle; } break;
+				case MaintenanceKind::SealBundle: operation.bundle.clear(); operation.encoder.reset(); operation.phase = Phase::Publish; break;
 				case MaintenanceKind::Publish: if (completion_) { throw std::logic_error("checkpoint completion slot occupied"); } completion_ = Persisted{operation.persistence_token}; operation.phase = Phase::Completion; break;
 				default: throw std::logic_error("unknown maintenance continuation");
 				}
@@ -750,32 +821,37 @@ private:
 				if (!incoming->cutover_permit || pack_count_) { throw std::logic_error("installation cutover lacks dedicated control permit"); }
 				pack_[0] = std::move(incoming->cutover_permit); incoming->cutover_permit.reset(); pack_count_ = 1; pack_next_ = 0;
 				auto context = incoming->context;
-				ingest(core_->step(InstallPrepared{context.request, operation.token, context.authenticated_peer, context.leader_term,
+				ingest_capture(core_->step_capture(InstallPrepared{context.request, operation.token, context.authenticated_peer, context.leader_term,
 					configuration_.cluster, configuration_.configuration, {context.descriptor.through, context.descriptor.term}}));
 				break;
 			}
 			auto capture = *std::get<Local>(operation.mode).capture;
-			ingest(core_->step(LocalCheckpoint{capture.request, operation.token, capture.through, capture.term, configuration_.cluster, configuration_.configuration}));
+			ingest_capture(core_->step_capture(LocalCheckpoint{capture.request, operation.token, capture.through, capture.term, configuration_.cluster, configuration_.configuration}));
 			if (fenced()) { break; }
 			if (!core_->busy()) { store_.cancel_replacement(operation.replacement); checkpoint_.reset(); cutover_debt_ = false; }
 			break;
 		}
 		case Phase::EncodeBundle:
-			operation.bundle = encode_checkpoint(*operation.captured, operation.sequence, *operation.application, limits_, std::holds_alternative<Incoming>(operation.mode) ? std::optional<std::uint32_t>{std::get<Incoming>(operation.mode).context.descriptor.application_format} : (snapshot_limits_ ? std::optional<std::uint32_t>{snapshot_limits_->application_format} : std::nullopt));
-			operation.captured.reset(); operation.phase = Phase::BeginBundle; break;
+			if (!operation.frozen) { throw std::logic_error("checkpoint lacks frozen capture"); }
+			operation.encoder.emplace(std::move(*operation.frozen), operation.sequence, *operation.application, limits_, std::holds_alternative<Incoming>(operation.mode) ? std::optional<std::uint32_t>{std::get<Incoming>(operation.mode).context.descriptor.application_format} : (snapshot_limits_ ? std::optional<std::uint32_t>{snapshot_limits_->application_format} : std::nullopt));
+			operation.frozen.reset(); operation.phase = Phase::BeginBundle; break;
 		case Phase::BeginBundle:
 			if (scheduling_.async_storage) { start_maintenance_io(store_.begin_artifact_operation(operation.replacement, ArtifactPart::Bundle), MaintenanceKind::BeginBundle); break; }
 			store_.begin_artifact(operation.replacement, ArtifactPart::Bundle); operation.phase = Phase::Bundle; break;
 		case Phase::Bundle: {
-			auto count = std::min(operation.bundle.size() - operation.offset, std::size_t{65536});
-			if (scheduling_.async_storage) { maintenance_bytes_ = count; start_maintenance_io(store_.begin_write_chunk(operation.replacement, std::string_view(operation.bundle).substr(operation.offset, count)), MaintenanceKind::Bundle); break; }
-			store_.write_chunk(operation.replacement, std::string_view(operation.bundle).substr(operation.offset, count)); operation.offset += count;
-			if (operation.offset == operation.bundle.size()) { operation.phase = Phase::SealBundle; }
+			if (!operation.encoder || !operation.bundle.empty()) { throw std::logic_error("checkpoint encoding slot occupied"); }
+			std::array<char, 65536> bytes{};
+			auto count = operation.encoder->next(bytes, 256);
+			if (!count) { throw std::logic_error("checkpoint encoder made no progress"); }
+			operation.bundle.assign(bytes.data(), count);
+			if (scheduling_.async_storage) { maintenance_bytes_ = count; start_maintenance_io(store_.begin_write_chunk(operation.replacement, std::string_view(operation.bundle)), MaintenanceKind::Bundle); break; }
+			store_.write_chunk(operation.replacement, std::string_view(operation.bundle)); operation.offset += count;
+			operation.bundle.clear(); if (operation.encoder->done()) { operation.phase = Phase::SealBundle; }
 			break;
 		}
 		case Phase::SealBundle:
 			if (scheduling_.async_storage) { start_maintenance_io(store_.begin_finish_artifact(operation.replacement), MaintenanceKind::SealBundle); break; }
-			store_.finish_artifact(operation.replacement); operation.bundle.clear(); operation.phase = Phase::Publish; break;
+			store_.finish_artifact(operation.replacement); operation.bundle.clear(); operation.encoder.reset(); operation.phase = Phase::Publish; break;
 		case Phase::Publish:
 			if (completion_) { throw std::logic_error("checkpoint completion slot occupied"); }
 			if (scheduling_.async_storage) { start_maintenance_io(store_.begin_publication(operation.replacement, operation.sequence), MaintenanceKind::Publish); break; }
@@ -800,6 +876,15 @@ private:
 	bool maintenance_due() const noexcept { return foreground_ >= scheduling_.foreground_burst; }
 	void unopened() const { if (core_ || failed_) { throw std::logic_error("worker already opened or fenced"); } }
 	void release_pack() { for (auto& permit : pack_) { permit.reset(); } pack_count_ = pack_next_ = 0; }
+	void ingest_capture(Core::CapturedActions result) {
+		ingest(std::move(result.actions));
+		if (result.capture) {
+			if (!checkpoint_ || checkpoint_->phase != Phase::EncodeBundle || checkpoint_->persistence_token != result.capture->token()) {
+				throw std::logic_error("frozen capture persistence identity mismatch");
+			}
+			checkpoint_->frozen = std::move(result.capture);
+		}
+	}
 	void ingest(Actions actions) {
 		std::size_t payload = 0, entries = 0;
 		if (actions.size() > output_count_) { throw std::length_error("worker action count bound"); }
@@ -827,7 +912,7 @@ private:
 				if (!checkpoint_ || !std::holds_alternative<Incoming>(checkpoint_->mode) || checkpoint_->phase != Phase::Cutover || value->prepared != checkpoint_->token) { throw std::logic_error("installation lacks owned replacement"); }
 				std::get<Incoming>(checkpoint_->mode).admitted = true;
 				checkpoint_->sequence = store_.frontier().sequence; checkpoint_->persistence_token = value->token;
-				checkpoint_->captured = std::move(value->state); checkpoint_->phase = Phase::EncodeBundle; release_pack();
+				checkpoint_->phase = Phase::EncodeBundle; release_pack();
 			}
 			else if (auto value = std::get_if<ActivateInstall>(&action)) {
 				if (!checkpoint_ || !std::holds_alternative<Incoming>(checkpoint_->mode) || checkpoint_->phase != Phase::Completion || value->prepared != checkpoint_->token || value->token != checkpoint_->persistence_token || value->boundary.index != std::get<Incoming>(checkpoint_->mode).context.descriptor.through || value->boundary.term != std::get<Incoming>(checkpoint_->mode).context.descriptor.term) { throw std::logic_error("activation lacks published image"); }
@@ -843,7 +928,7 @@ private:
 			else if (auto value = std::get_if<PersistCheckpoint>(&action)) {
 				if (!checkpoint_ || !std::holds_alternative<Local>(checkpoint_->mode) || checkpoint_->phase != Phase::Cutover || value->capture != checkpoint_->token) { throw std::logic_error("checkpoint lacks owned replacement"); }
 				checkpoint_->sequence = store_.frontier().sequence; checkpoint_->persistence_token = value->token;
-				checkpoint_->captured = std::move(value->state); checkpoint_->phase = Phase::EncodeBundle;
+				checkpoint_->phase = Phase::EncodeBundle;
 			}
 			else {
 				if (!output_.empty()) { throw std::logic_error("worker output batch occupied"); }
@@ -870,6 +955,10 @@ private:
 	}
 
 	void fail(std::string reason) {
+		if (closing_) {
+			failed_ = true; store_.fence_storage(); terminal_ = Fenced{std::move(reason)};
+			return;
+		}
 		if (failed_) { return; } failed_ = true;
 		store_.fence_storage(); if (core_) { core_->step(StorageFault{reason}); }
 		io_job_.reset(); maintenance_io_.reset(); io_persist_token_.reset(); io_dispatched_ = false;
@@ -910,7 +999,7 @@ private:
 	std::unique_ptr<Source> source_;
 	Token next_source_ = 0, next_source_chunk_ = 0;
 	std::size_t source_next_ = 0; unsigned maintenance_next_ = 1;
-	bool failed_ = false, cutover_debt_ = false, timer_due_ = true, timer_blocked_ = false;
+	bool failed_ = false, cutover_debt_ = false, timer_due_ = true, timer_blocked_ = false, closing_ = false;
 };
 
 } // namespace cluster::consensus

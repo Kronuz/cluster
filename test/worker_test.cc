@@ -59,6 +59,150 @@ private:
 	};
 	kronuz::journal::PosixIO backend;
 };
+void terminal_original_settlement() {
+ auto directory = std::filesystem::current_path() / ".scratch" / ("worker-terminal-" + std::to_string(::getpid()));
+ std::filesystem::create_directories(directory); ::chmod(directory.c_str(), 0700);
+ struct Cleanup { std::filesystem::path path; ~Cleanup() { std::filesystem::remove_all(path); } } cleanup{directory};
+ auto io = std::make_shared<kronuz::journal::PosixIO>(directory);
+ {
+  WorkerLimits scheduling; scheduling.async_appends = true;
+  Worker worker(io, configuration(), admission(), limits(), {}, scheduling);
+  Identity id{}; id[0] = 'S'; worker.create(id);
+  while (worker.run_one({0, 100}) != TurnResult::IOPending) {}
+  auto job = worker.take_io_operation();
+  check(job && !job->done(), "terminal fixture owns an accepted initialization original");
+  auto frontier = worker.storage_frontier(); auto debt = worker.accounting()->outstanding;
+  job->submitted(); auto original = kronuz::journal::detail::execute_primitive(job->io(), job->request());
+  worker.close(); worker.close();
+  check(!worker.ready() && !worker.drained() && worker.try_submit(Start{}) == SubmitResult::Busy,
+   "terminal close rejects protocol admission while accepted IO remains owned");
+  for (unsigned turn = 0; turn < 20; ++turn) {
+   check(worker.run_one({turn, 100}) == TurnResult::IOPending && worker.owns_io_operation(job) &&
+    worker.storage_frontier().sequence == frontier.sequence && worker.accounting()->outstanding == debt,
+    "terminal waits preserve original ownership and accounting without fabricated completion");
+  }
+  check(job->complete(std::move(original)), "terminal accepts original submitted completion");
+  kronuz::journal::drive_synchronously(*job);
+  for (unsigned turn = 0; !worker.drained() && turn < 100; ++turn) { worker.run_one({turn, 100}); }
+  check(worker.drained() && !worker.owns_io_operation(job) && !worker.fenced(),
+   "terminal drain follows original durable barriers and retained retirement");
+ }
+ Worker recovered(io, configuration(), admission(), limits()); recovered.recover([](auto&) {});
+ for (unsigned turn = 0; !recovered.ready() && turn < 100; ++turn) { recovered.run_one({turn, 100}); }
+ check(recovered.ready(), "accepted initialization survives terminal close and reopening");
+ recovered.close(); while (!recovered.drained()) { recovered.run_one({0, 100}); }
+}
+
+void terminal_checkpoint_originals() {
+ for (bool publishing : {false, true}) {
+  auto directory = std::filesystem::current_path() / ".scratch" /
+   ("worker-terminal-checkpoint-" + std::to_string(publishing) + "-" + std::to_string(::getpid()));
+  std::filesystem::create_directories(directory); ::chmod(directory.c_str(), 0700);
+  struct Cleanup { std::filesystem::path path; ~Cleanup() { std::filesystem::remove_all(path); } } cleanup{directory};
+  auto io = std::make_shared<kronuz::journal::PosixIO>(directory);
+  auto capacity = kronuz::journal::AdmissionLimits{{256 * 1024, 512}, {16 * 1024, 3}, {64 * 1024, 4}, 8, 3};
+  bool held = false;
+  {
+   Worker worker(io, configuration(), capacity, limits(), {}, {16, 128, false, true});
+   Identity id{}; id[0] = 'P'; worker.create(id);
+   auto pump = [&] {
+    worker.run_one({100, 100});
+    if (auto job = worker.take_io_operation()) { kronuz::journal::drive_synchronously(*job); }
+    for (auto &action : worker.take_actions()) {
+     if (auto range = std::get_if<Committed>(&action)) { worker.applied({range->entries.back().index}); }
+    }
+   };
+   for (unsigned turn = 0; turn < 500 && !worker.ready(); ++turn) { pump(); }
+   worker.try_submit(Start{}); worker.try_submit(Tick{100, 100});
+   for (unsigned turn = 0; turn < 500 && worker.applied_index() < 1; ++turn) { pump(); }
+   auto checkpoint = worker.reserve_checkpoint(16); check(bool(checkpoint), "terminal checkpoint owns replacement capacity");
+   if (!checkpoint) { continue; }
+   worker.attach_capture(*checkpoint, {70, 1, worker.term()}); worker.offer_application_chunk(*checkpoint, "image", true);
+   for (unsigned turn = 0; turn < 1000 && !held; ++turn) {
+    worker.run_one({100, 100});
+    if (auto job = worker.take_io_operation()) {
+     auto target = publishing ? bool(std::dynamic_pointer_cast<kronuz::journal::StorePublication>(job)) :
+      bool(std::dynamic_pointer_cast<kronuz::journal::StoreArtifactOperation>(job));
+     if (target) {
+      held = true; auto debt = worker.accounting()->outstanding; auto frontier = worker.storage_frontier();
+      job->submitted(); auto original = kronuz::journal::detail::execute_primitive(job->io(), job->request());
+      worker.close();
+      for (unsigned wait = 0; wait < 20; ++wait) {
+       check(worker.run_one({1000, 100}) == TurnResult::IOPending && !worker.drained() &&
+        worker.owns_io_operation(job) && worker.accounting()->outstanding == debt &&
+        worker.storage_frontier().generation == frontier.generation,
+        "terminal checkpoint retains original barriers, pins and quota until completion");
+      }
+      check(job->complete(std::move(original)), "terminal checkpoint reaps original completion");
+     }
+     kronuz::journal::drive_synchronously(*job);
+    }
+    if (!held) { worker.take_actions(); }
+   }
+   check(held, "terminal fixture reaches accepted preparation or publication");
+   for (unsigned turn = 0; turn < 1000 && !worker.drained(); ++turn) { worker.run_one({100, 100}); }
+   check(worker.drained() && !worker.fenced() && worker.take_actions().empty(),
+    "terminal checkpoint drains without fabricating publication or installation acknowledgments");
+   check(bool(worker.storage_frontier().checkpoint) == publishing,
+    "terminal close preserves only actually published checkpoints");
+  }
+  bool restored = false;
+  Worker recovered(io, configuration(), capacity, limits());
+  recovered.recover([&](auto &reader) {
+   std::array<char, 5> bytes{};
+   check(reader.descriptor().length == bytes.size() && reader.read_at(0, bytes) == bytes.size() &&
+    std::string_view(bytes.data(), bytes.size()) == "image", "terminal publication recovers exact application bytes");
+   restored = true;
+  });
+  check(restored == publishing && !recovered.fenced(), "terminal preparation and publication reopen at their actual durable boundaries");
+  recovered.close(); for (unsigned turn = 0; turn < 1000 && !recovered.drained(); ++turn) { recovered.run_one({0, 100}); }
+  check(recovered.drained(), "recovered terminal fixture retires all retained history");
+ }
+}
+
+void terminal_output_and_dispatch_failure() {
+ for (bool dispatch_failure : {false, true}) {
+  auto directory = std::filesystem::current_path() / ".scratch" /
+   ("worker-terminal-output-" + std::to_string(dispatch_failure) + "-" + std::to_string(::getpid()));
+  std::filesystem::create_directories(directory); ::chmod(directory.c_str(), 0700);
+  struct Cleanup { std::filesystem::path path; ~Cleanup() { std::filesystem::remove_all(path); } } cleanup{directory};
+  auto io = std::make_shared<kronuz::journal::PosixIO>(directory);
+  Worker worker(io, configuration(), admission(), limits(), {}, {16,128,true});
+  Identity id{}; id[0]='F'; worker.create(id);
+  for (unsigned turn=0; turn<100 && !worker.ready(); ++turn) {
+   worker.run_one({100,100});
+   if (auto job=worker.take_io_operation()) {
+    if (dispatch_failure) {
+     auto original=job;
+     worker.close(); worker.storage_operation_failed(job,"injected unsubmitted dispatch failure");
+     check(worker.fenced() && !original->done() && !original->in_flight() && !worker.owns_io_operation(original),
+      "unsubmitted driver failure abandons locally without fabricating operation completion");
+     break;
+    }
+    kronuz::journal::drive_synchronously(*job);
+   }
+  }
+  if (!dispatch_failure) {
+   worker.try_submit(Start{}); worker.try_submit(Tick{100,100});
+   for (unsigned turn=0; turn<100; ++turn) {
+    auto result=worker.run_one({100,100});
+    if (auto original=worker.take_io_operation()) { kronuz::journal::drive_synchronously(*original); }
+    if (result==TurnResult::Blocked) { break; }
+   }
+   auto applied=worker.applied_index(); worker.close();
+   check(worker.take_actions().empty(), "terminal output remains owned instead of releasing retained protocol effects");
+   worker.applied({1}); worker.application_failed(1,"late application failure");
+   check(worker.applied_index()==applied && !worker.fenced(), "late application callbacks cannot restart or fence unrelated terminal work");
+  }
+  for(unsigned turn=0;turn<1000 && !worker.drained();++turn) {
+   worker.run_one({100,100});
+   if(auto original=worker.take_io_operation()) { kronuz::journal::drive_synchronously(*original); }
+   check(worker.take_actions().empty(), "closed worker never hands protocol work to the host during retirement");
+  }
+  check(worker.drained(), "terminal output and dispatch-failure ownership drain without an actor waiting forever");
+ }
+}
+
 void completion_appends() {
 	for (bool fail : {false, true}) {
 		auto directory = std::filesystem::current_path() / ".scratch" / ("worker-completion-" + std::to_string(fail) + "-" + std::to_string(::getpid()));
@@ -658,6 +802,69 @@ void completion_channel_cancellation() {
 	check(worker.run_one({1000, 100}) == TurnResult::IOPending, "funded Raft append precedes the next maintenance quantum");
 	auto append = worker.take_io_operation(); check(bool(std::dynamic_pointer_cast<kronuz::journal::StoreAppend>(append)), "maintenance reaping resumes its pre-funded consensus append"); if (append) { kronuz::journal::drive_synchronously(*append); worker.run_one({1000, 100}); }
 }
+void terminal_reclamation_original() {
+	SnapshotFixture fixture("terminal-reclaim", SnapshotLimits{7, 100000}, SnapshotFixture::quota(), true, true);
+	auto& worker = fixture.worker;
+	bool held = false;
+	for (unsigned turn = 0; turn < 10000 && !held; ++turn) {
+		worker.try_submit(Read{turn + 1});
+		worker.run_one({0, 100});
+		if (auto job = worker.take_io_operation()) {
+			if (!std::dynamic_pointer_cast<kronuz::journal::StoreReclaim>(job)) { kronuz::journal::drive_synchronously(*job); }
+			else {
+				job->submitted(); auto outcome = kronuz::journal::detail::execute_primitive(job->io(), job->request());
+				auto debt = worker.accounting()->outstanding;
+				worker.close();
+				for (unsigned wait = 0; wait < 20; ++wait) {
+					worker.run_one({0, 100});
+					check(!worker.drained() && !job->done() && worker.owns_io_operation(job) && worker.accounting()->outstanding == debt,
+						"terminal reclamation retains its accepted original and quota");
+				}
+				check(job->complete(std::move(outcome)), "terminal reclamation observes its authentic completion");
+				kronuz::journal::drive_synchronously(*job);
+				for (unsigned wait = 0; wait < 10000 && !worker.drained(); ++wait) { worker.run_one({0, 100}); }
+				check(worker.drained() && !worker.fenced(), "terminal reclamation settles before bounded protocol retirement");
+				held = true;
+			}
+		}
+		fixture.drain();
+	}
+	check(held, "terminal regression reaches an accepted reclamation original");
+}
+void terminal_snapshot_readback() {
+	for (unsigned kind : {0u, 1u}) {
+		SnapshotFixture fixture("terminal-readback-" + std::to_string(kind), SnapshotLimits{7, 100000}, SnapshotFixture::quota(), true, true);
+		auto& worker = fixture.worker;
+		std::string payload(65553, 't');
+		auto id = worker.reserve_snapshot(fixture.context(payload));
+		check(bool(id), "terminal verification reserves incoming snapshot");
+		if (!id) { continue; }
+		fixture.send(*id, payload);
+		bool held = false;
+		for (unsigned turn = 0; turn < 10000 && !held; ++turn) {
+			worker.run_one({0, 100});
+			if (auto job = worker.take_io_operation()) {
+				bool target = kind == 0 ? bool(std::dynamic_pointer_cast<kronuz::journal::ArtifactOpen>(job)) : bool(std::dynamic_pointer_cast<kronuz::journal::ArtifactRead>(job));
+				if (!target) { kronuz::journal::drive_synchronously(*job); }
+				else {
+					job->submitted(); auto outcome = kronuz::journal::detail::execute_primitive(job->io(), job->request());
+					auto debt = worker.accounting()->outstanding;
+					worker.close();
+					for (unsigned wait = 0; wait < 20; ++wait) {
+						worker.run_one({0, 100});
+						check(!worker.drained() && !job->done() && worker.accounting()->outstanding == debt && !worker.validation_chunk(), "terminal verification retains original completion and admission debt");
+					}
+					check(job->complete(std::move(outcome)), "terminal verification reaps its authentic accepted completion");
+					kronuz::journal::drive_synchronously(*job);
+					for (unsigned wait = 0; wait < 10000 && !worker.drained(); ++wait) { worker.run_one({0, 100}); }
+					check(worker.drained() && !worker.fenced() && !worker.snapshot_activation() && worker.take_actions().empty(), "terminal verification drains without install or synthesized acknowledgement");
+					held = true;
+				}
+			}
+		}
+		check(held, "terminal verification reaches the requested original operation");
+	}
+}
 void completion_snapshot_readback() {
 	for (int cancel_kind : {-1, 0, 1}) {
 		SnapshotFixture fixture("completion-read-" + std::to_string(cancel_kind), SnapshotLimits{7, 100000}, SnapshotFixture::quota(), true, true);
@@ -898,6 +1105,26 @@ Token validate_incoming(SnapshotFixture& fixture, const SnapshotId& id, std::str
 	}
 	check(eof && fixture.worker.validation_succeeded(id, eof) == ValidationAck::Accepted, "installation fixture reaches consumed integrity EOF and semantic validation"); return eof;
 }
+void terminal_published_activation() {
+	SnapshotFixture fixture("terminal-published-activation", SnapshotLimits{7, 100000}, SnapshotFixture::quota(), true, true);
+	auto& worker = fixture.worker;
+	auto id = worker.reserve_snapshot(fixture.context("image"));
+	check(bool(id), "terminal activation reserves incoming image");
+	if (!id) { return; }
+	validate_incoming(fixture, *id, "image");
+	check(worker.request_install(*id) == SubmitResult::Accepted, "terminal activation admits validated image");
+	for (unsigned turn = 0; turn < 1000 && !worker.snapshot_activation(); ++turn) { fixture.pump(); }
+	auto activation = worker.snapshot_activation();
+	check(bool(activation) && bool(worker.storage_frontier().checkpoint), "terminal activation waits after actual manifest publication");
+	if (!activation) { return; }
+	worker.close();
+	check(worker.snapshot_activated(*id, activation->token) == ValidationAck::NotReady &&
+		worker.snapshot_activation_failed(*id, activation->token) == ValidationAck::NotReady,
+		"terminal activation ignores delayed success and failure consumers");
+	for (unsigned turn = 0; turn < 10000 && !worker.drained(); ++turn) { worker.run_one({0, 100}); }
+	check(worker.drained() && !worker.fenced() && !worker.accounting()->tainted && worker.take_actions().empty(),
+		"published terminal image drains without fabricated activation or storage taint");
+}
 void snapshot_installation() {
 	for (unsigned callback_case = 0; callback_case < 3; ++callback_case) {
 		bool failure = callback_case != 0;
@@ -1101,8 +1328,12 @@ void snapshot_publication_faults() {
 
 void owned_snapshot_sources() {
 	std::optional<SourceInfo> foreign_source;
-	for (auto [length, fault] : std::array<std::pair<std::size_t, unsigned>, 7>{{{0, 0}, {9, 0}, {65553, 0}, {9, 1}, {9, 2}, {9, 3}, {65553, 4}}}) {
-		SnapshotFixture fixture("source-" + std::to_string(length) + "-" + std::to_string(fault)); auto& worker = fixture.worker; std::string image(length, 's');
+	for (auto [length, fault] : std::array<std::pair<std::size_t, unsigned>, 9>{{{0, 0}, {9, 0}, {65553, 0}, {9, 1}, {9, 2}, {9, 3}, {65553, 4}, {65553, 5}, {65553, 6}}}) {
+		SnapshotFixture fixture("source-" + std::to_string(length) + "-" + std::to_string(fault), SnapshotLimits{7, 100000}, SnapshotFixture::quota(), true, fault >= 5); auto& worker = fixture.worker; std::string image(length, 's');
+		SnapshotChannel source_channel(worker);
+		Identity local{}, remote{}; local[0] = 'l'; remote[0] = 'r';
+		TrustedSession source_session{2, local, remote};
+		if (fault >= 5) { source_channel.register_session(source_session); }
 		auto id = worker.reserve_snapshot(fixture.context(image)); if (!id) { check(false, "source fixture reserves incoming publication"); continue; }
 		validate_incoming(fixture, *id, image); worker.request_install(*id);
 		for (unsigned turn = 0; turn < 200 && !worker.snapshot_activation(); ++turn) { fixture.pump(); }
@@ -1128,9 +1359,32 @@ void owned_snapshot_sources() {
 		auto pump = [&](std::uint64_t now) {
 			source_clock = std::max(source_clock, now);
 			if (!responses.empty()) { auto next = responses.begin(); if (worker.try_submit(next->second) == SubmitResult::Accepted) { responses.erase(next); } }
-			worker.run_one({source_clock, 100}); drain();
+			worker.run_one({source_clock, 100});
+			if (auto job = worker.take_io_operation()) {
+				if (fault >= 5 && std::dynamic_pointer_cast<kronuz::journal::ArtifactRead>(job)) {
+					job->submitted(); auto outcome = kronuz::journal::detail::execute_primitive(job->io(), job->request());
+					if (fault == 6) { worker.close(); }
+					source_channel.session_closed(source_session);
+					check(!source_channel.session_open(source_session) && !worker.source_chunk(), "channel disconnect cancels a source with an accepted verification original");
+					auto debt = worker.accounting()->outstanding;
+					for (unsigned wait = 0; wait < 20; ++wait) { worker.run_one({source_clock, 100}); check(!job->done() && worker.accounting()->outstanding == debt, "source disconnect retains authentic completion and debt"); }
+					check(job->complete(std::move(outcome)), "disconnected source original settles exactly once");
+					kronuz::journal::drive_synchronously(*job);
+					worker.run_one({source_clock, 100});
+					check(!worker.fenced() && !worker.source_chunk(), "disconnected verifier never resumes a destroyed consumer");
+					if (fault == 5) { worker.close(); }
+				} else { kronuz::journal::drive_synchronously(*job); }
+			}
+			drain();
 		};
 		worker.try_submit(Tick{100, 100}); drain();
+		if (fault >= 5) {
+			for (unsigned turn = 0; turn < 10000 && !worker.closing(); ++turn) { pump(100 + turn / 10); }
+			check(worker.closing(), "source regression reaches accepted verification disconnect");
+			for (unsigned turn = 0; turn < 10000 && !worker.drained(); ++turn) { worker.run_one({source_clock, 100}); }
+			check(worker.drained() && !worker.fenced(), "disconnected source completes bounded terminal retirement");
+			continue;
+		}
 		if (fault == 4) {
 			auto reads = fixture.io.payload_reads; bool canceled = false;
 			for (unsigned turn = 0; turn < 1000 && !canceled; ++turn) { pump(100 + turn / 10); if (fixture.io.payload_reads > reads) { canceled = worker.source_peer_failed(2) == ValidationAck::Accepted; } }
@@ -1410,7 +1664,10 @@ void binary_transfer_codec() {
 
 int main(int argc, char** argv) {
 	try {
+		if (argc == 2 && std::string_view(argv[1]) == "--terminal-regressions") { terminal_original_settlement(); terminal_checkpoint_originals(); terminal_output_and_dispatch_failure(); terminal_snapshot_readback(); terminal_published_activation(); terminal_reclamation_original(); std::cout << checks << " terminal checks, " << failures << " failures\n"; return failures ? 1 : 0; }
+		terminal_original_settlement(); terminal_checkpoint_originals(); terminal_output_and_dispatch_failure(); terminal_snapshot_readback(); terminal_published_activation(); terminal_reclamation_original();
 		if (argc == 2 && std::string_view(argv[1]) == "--retained-admission-benchmark") { admission_benchmark = true; real_worker(); return failures ? 1 : 0; }
+		if (argc == 2 && std::string_view(argv[1]) == "--source-regressions") { owned_snapshot_sources(); std::cout << checks << " source checks, " << failures << " failures\n"; return failures ? 1 : 0; }
 		if (argc == 2 && std::string_view(argv[1]) == "--completion-regressions") { completion_appends(); completion_storage(); completion_channel_cancellation(); completion_snapshot_readback(); retired_completion_worker(); for (unsigned mode : {0u, 1u, 3u}) { binary_transfer_integration(65553, mode, false, true); } std::cout << checks << " completion checks, " << failures << " failures\n"; return failures ? 1 : 0; }
 		if (argc == 2 && std::string_view(argv[1]) == "--review-regressions") { channel_dispatch_and_unstarted_result(); binary_transfer_integration(65553); binary_transfer_integration(65553, 5); owned_snapshot_sources(); std::cout << checks << " review checks, " << failures << " failures\n"; return failures ? 1 : 0; }
 		if (argc == 2 && std::string_view(argv[1]) == "--transfer-benchmark") { std::ofstream(std::filesystem::current_path() / ".scratch" / "snapshot-transfer-benchmark.csv") << "image_bytes,wall_s,cpu_s,wire_bytes,retained_frame_bytes,payload_buffer_capacity,process_maxrss_native,sender_payload_reads,receiver_payload_reads\n"; binary_transfer_integration(1048576, 0, true); binary_transfer_integration(67108864, 0, true); std::cout << checks << " benchmark checks, " << failures << " failures\n"; return failures ? 1 : 0; }

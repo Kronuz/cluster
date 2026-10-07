@@ -1,7 +1,7 @@
 #include "consensus/worker.h"
 #include "journal/asio_completion.h"
-#include "journal/native_completion.h"
 #include "journal/journal.h"
+#include "journal/native_completion.h"
 #include <filesystem>
 #include <iostream>
 
@@ -194,7 +194,7 @@ void native_worker(const std::filesystem::path &directory) {
 	worker.create(identity);
 	asio::io_context context;
 	auto queue = std::make_shared<DelayedQueue>();
-	auto driver = std::make_shared<AsioCompletionDriver<DelayedQueue>>(context.get_executor(), queue);
+	auto driver = std::make_shared<AsioCompletionDriver<DelayedQueue>>(context.get_executor(), queue, true);
 	std::exception_ptr error;
 	asio::co_spawn(context, worker_exercise(worker, driver, queue), [&](std::exception_ptr e) { error = e; });
 	context.run();
@@ -224,7 +224,8 @@ int main() {
 		journal.create(id);
 		asio::io_context context;
 		auto queue = std::make_shared<DelayedQueue>();
-		auto driver = std::make_shared<AsioCompletionDriver<DelayedQueue>>(context.get_executor(), queue);
+		auto driver =
+			std::make_shared<AsioCompletionDriver<DelayedQueue>>(context.get_executor(), queue, true);
 		bool done = false;
 		std::size_t ticks = 0;
 		std::exception_ptr error;
@@ -250,6 +251,15 @@ int main() {
 		}
 		if (!done || queue->stats().native_completed < 3) {
 			throw std::runtime_error("native backend did not complete");
+		}
+		auto timings = driver->stats();
+		std::uint64_t reaped = 0;
+		for (const auto &primitive : timings.submitted_to_reaped) {
+			reaped += primitive.count;
+		}
+		if (timings.original_drive.count != 1 || timings.original_drive.maximum_ns < 100000000 ||
+			reaped != queue->stats().native_completed + queue->stats().fallback_completed) {
+			throw std::runtime_error("original completion timing omitted ownership or held observation");
 		}
 		std::cout << "owner_timer_ticks=" << ticks << " native=" << queue->stats().native_completed << '\n';
 	} catch (const std::exception &error) {

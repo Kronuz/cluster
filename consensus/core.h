@@ -1,6 +1,8 @@
 #pragma once
 
 #include "types.h"
+#include "retained_log.h"
+#include "retirement.h"
 #include <algorithm>
 #include <limits>
 #include <map>
@@ -13,6 +15,7 @@ namespace cluster::consensus {
 // One owning executor. No I/O, clock reads, entropy, or application callbacks.
 // Persist changes are staged internally; all dependent actions are deferred.
 class Core {
+	struct CaptureOwner { const Core* core; };
 public:
 	Core(FixedConfiguration configuration, RecoveredState recovered, Limits limits = {}, Timing timing = {})
 		: configuration_(std::move(configuration)), hard_(recovered.hard), durable_(hard_),
@@ -43,6 +46,7 @@ public:
 			log_bytes_ += entry.payload.size(); previous_term = entry.term;
 		}
 	}
+	~Core() { capture_owner_->core = nullptr; }
 	Core(const Core&) = delete;
 	Core& operator=(const Core&) = delete;
 	Role role() const noexcept { return role_; }
@@ -50,17 +54,62 @@ public:
 	Index committed() const noexcept { return durable_.commit_index; }
 	Index applied() const noexcept { return applied_; }
 	std::size_t retained_log_bytes() const noexcept { return log_bytes_; }
+	std::size_t retired_log_bytes() const noexcept { return entries_.retired_bytes(); }
+	std::size_t retired_log_entries() const noexcept { return entries_.retired_entries(); }
+	void retire_log() noexcept { entries_.retire(256, limits_.command_bytes); }
+	// Terminal host operation: accepted storage and external capture consumers
+	// must settle first. This abandons protocol interest, never acknowledges IO.
+	void begin_retirement() noexcept {
+		if (retiring_) { return; }
+		retiring_ = true; capture_owner_->core = nullptr;
+		entries_.clear(); log_bytes_ = 0;
+	}
+	bool retirement_step(detail::RetirementBudget& budget) noexcept {
+		if (!retiring_) { return false; }
+		if (pending_) {
+			if (!detail::retire_actions(pending_->deferred, budget)) { return false; }
+			pending_.reset();
+		}
+		if (install_) {
+			if (!detail::retire_actions(install_->deferred, budget)) { return false; }
+			install_.reset();
+		}
+		if (captured_) {
+			if (!detail::retire_entries(captured_->state_.entries, budget)) { return false; }
+			captured_.reset();
+		}
+		while (!reads_.empty()) {
+			if (!budget.consume()) { return false; }
+			reads_.pop_back();
+		}
+		while (!peers_.empty()) {
+			if (!budget.consume()) { return false; }
+			peers_.erase(peers_.begin());
+		}
+		while (!grants_.empty()) {
+			if (!budget.consume()) { return false; }
+			grants_.erase(grants_.begin());
+		}
+		auto before = entries_.retired_bytes();
+		budget.units -= entries_.retire(budget.units, budget.bytes);
+		budget.bytes -= before - entries_.retired_bytes();
+		return retirement_drained();
+	}
+	bool retirement_drained() const noexcept {
+		return retiring_ && !pending_ && !install_ && !captured_ && reads_.empty() &&
+			peers_.empty() && grants_.empty() && !entries_.charged_entries();
+	}
 	Index last_index() const noexcept { return base_index_ + static_cast<Index>(entries_.size()); }
 	Index base_index() const noexcept { return base_index_; }
 	LogBoundary base_boundary() const noexcept { return {base_index_, base_term_}; }
 	std::optional<SnapshotKey> awaiting_snapshot(NodeId peer) const {
 		auto found = peers_.find(peer);
-		if (role_ != Role::Leader || found == peers_.end() || !found->second.snapshot || found->second.snapshot->phase != SnapshotPhase::AwaitSource) { return std::nullopt; }
+		if (retiring_ || role_ != Role::Leader || found == peers_.end() || !found->second.snapshot || found->second.snapshot->phase != SnapshotPhase::AwaitSource) { return std::nullopt; }
 		return found->second.snapshot->key;
 	}
 	bool snapshot_active(NodeId peer, const SnapshotKey& key) const {
 		auto found = peers_.find(peer);
-		return role_ == Role::Leader && hard_.term == durable_.term && found != peers_.end() && found->second.snapshot && found->second.snapshot->key == key;
+		return !retiring_ && role_ == Role::Leader && hard_.term == durable_.term && found != peers_.end() && found->second.snapshot && found->second.snapshot->key == key;
 	}
 	bool snapshot_sending(NodeId peer, const SnapshotKey& key) const {
 		auto found = peers_.find(peer);
@@ -70,7 +119,50 @@ public:
 	const HardState& durable_hard_state() const noexcept { return durable_; }
 	const FixedConfiguration& configuration() const noexcept { return configuration_; }
 
+	class FrozenCheckpoint {
+	public:
+		const RecoveredState& metadata() const { validate(); return state_; }
+		std::size_t size() const { validate(); return count_; }
+		const Entry& entry(std::size_t offset) const {
+			validate(); if (offset >= count_) { throw std::out_of_range("frozen checkpoint offset"); }
+			return owner_->core->log_entry(state_.base_index + offset + 1);
+		}
+		Token token() const noexcept { return token_; }
+	private:
+		friend class Core;
+		FrozenCheckpoint(const Core& owner, Token token, RecoveredState state, std::size_t count)
+			: owner_(owner.capture_owner_), token_(token), state_(std::move(state)), count_(count) {}
+		void validate() const {
+			auto* core = owner_ ? owner_->core : nullptr;
+			if (!core || core->role_ == Role::Fenced ||
+				!((core->pending_ && core->pending_->token == token_ && core->pending_->checkpoint) ||
+				(core->install_ && core->install_->token == token_ && !core->install_->published))) {
+				throw std::logic_error("stale frozen checkpoint capability");
+			}
+		}
+		std::shared_ptr<CaptureOwner> owner_;
+		Token token_;
+		RecoveredState state_;
+		std::size_t count_;
+	};
+	struct CapturedActions { Actions actions; std::optional<FrozenCheckpoint> capture; };
+	// Trusted Worker path: the same transition retains a validated range rather
+	// than materializing its entries into the legacy persistence action.
+	CapturedActions step_capture(Event event) {
+		if (!std::holds_alternative<LocalCheckpoint>(event) && !std::holds_alternative<InstallPrepared>(event)) {
+			throw std::invalid_argument("frozen capture requires checkpoint transition");
+		}
+		capture_mode_ = true;
+		struct ModeReset { bool& mode; ~ModeReset() { mode = false; } } reset{capture_mode_};
+		auto actions = step(std::move(event));
+		auto capture = std::move(captured_); captured_.reset();
+		if (role_ == Role::Fenced) { capture.reset(); }
+		return {std::move(actions), std::move(capture)};
+	}
+
 	Actions step(Event event) {
+		if (retiring_) { return {}; }
+		retire_log();
 		Actions output;
 		if (role_ == Role::Fenced) { return output; }
 		try { std::visit([&](auto&& value) { handle(std::move(value), output); }, std::move(event)); }
@@ -147,8 +239,8 @@ private:
 			auto& operation = *install_;
 			if (operation.retain_suffix) {
 				auto count = static_cast<std::size_t>(operation.boundary.index - base_index_);
-				for (std::size_t i = 0; i < count; ++i) { log_bytes_ -= entries_[i].payload.size(); }
-				entries_.erase(entries_.begin(), entries_.begin() + static_cast<std::ptrdiff_t>(count));
+				log_bytes_ = entries_.suffix_bytes(count);
+				entries_.erase_prefix(count);
 			} else { entries_.clear(); log_bytes_ = 0; }
 			base_index_ = operation.boundary.index; base_term_ = operation.boundary.term;
 			hard_ = durable_ = operation.hard; operation.published = true;
@@ -161,8 +253,8 @@ private:
 		if (completed.checkpoint) {
 			auto [through, term] = *completed.checkpoint;
 			auto count = static_cast<std::size_t>(through - base_index_);
-			for (std::size_t i = 0; i < count; ++i) { log_bytes_ -= entries_[i].payload.size(); }
-			entries_.erase(entries_.begin(), entries_.begin() + static_cast<std::ptrdiff_t>(count));
+			log_bytes_ = entries_.suffix_bytes(count);
+			entries_.erase_prefix(count);
 			base_index_ = through; base_term_ = term;
 		}
 		output = std::move(completed.deferred);
@@ -195,10 +287,14 @@ private:
 		RecoveredState state{configuration_, next_hard, request.boundary.index, request.boundary.term, {}, request.boundary.index};
 		if (retain) {
 			auto first = static_cast<std::size_t>(request.boundary.index - base_index_);
-			state.entries.assign(entries_.begin() + static_cast<std::ptrdiff_t>(first), entries_.end());
+			if (!capture_mode_) {
+			state.entries.reserve(entries_.size() - first);
+			for (std::size_t i = first; i < entries_.size(); ++i) { state.entries.push_back(entries_[i]); }
+		}
 		}
 		Actions deferred; hard_ = next_hard; follower(request.authenticated_peer, deferred);
 		auto id = token(); install_.emplace(PendingInstall{id, request.prepared, request.request, request.boundary, next_hard, std::move(deferred), retain});
+		if (capture_mode_) { captured_ = FrozenCheckpoint(*this, id, state, retain ? entries_.size() - static_cast<std::size_t>(request.boundary.index - base_index_) : 0); }
 		output.emplace_back(PersistInstall{id, request.prepared, std::move(state)});
 	}
 	void handle(InstallActivated completion, Actions& output) {
@@ -245,10 +341,14 @@ private:
 		}
 		RecoveredState state{configuration_, durable_, request.through, request.term, {}, request.through};
 		auto first = static_cast<std::size_t>(request.through - base_index_);
-		state.entries.assign(entries_.begin() + static_cast<std::ptrdiff_t>(first), entries_.end());
+		if (!capture_mode_) {
+			state.entries.reserve(entries_.size() - first);
+			for (std::size_t i = first; i < entries_.size(); ++i) { state.entries.push_back(entries_[i]); }
+		}
 		auto id = token();
 		Actions deferred; deferred.emplace_back(CheckpointPublished{request.request, request.through});
 		pending_.emplace(Pending{id, durable_, std::move(deferred), false, std::pair{request.through, request.term}});
+		if (capture_mode_) { captured_ = FrozenCheckpoint(*this, id, state, entries_.size() - first); }
 		output.emplace_back(PersistCheckpoint{id, request.capture, std::move(state)});
 	}
 	void handle(Failed failure, Actions& output) {
@@ -273,7 +373,7 @@ private:
 		if (last_index() - durable_.commit_index >= limits_.uncommitted_entries) {
 			output.emplace_back(Reject{proposal.request, RejectReason::Busy}); return;
 		}
-		if (last_index() >= maximum - 1 || entries_.size() >= limits_.log_entries - limits_.control_entries || proposal.command.size() > limits_.log_bytes - log_bytes_) {
+		if (last_index() >= maximum - 1 || entries_.charged_entries() >= limits_.log_entries - limits_.control_entries || entries_.charged_bytes() > limits_.log_bytes || proposal.command.size() > limits_.log_bytes - entries_.charged_bytes()) {
 			output.emplace_back(Reject{proposal.request, RejectReason::LogFull}); return;
 		}
 		Entry entry{last_index() + 1, hard_.term, EntryKind::Command, std::move(proposal.command)};
@@ -376,8 +476,7 @@ private:
 				// Honest peers can never conflict with committed state. Fail closed.
 				throw std::runtime_error("conflict with committed log prefix");
 			}
-			auto retained_bytes = log_bytes_;
-			for (Index i = replace_from; i <= last_index(); ++i) { retained_bytes -= log_entry(i).payload.size(); }
+			auto retained_bytes = log_bytes_ - entries_.suffix_bytes(static_cast<std::size_t>(replace_from - base_index_ - 1));
 			auto additional = request.entries.size() - first;
 			if (replace_from - base_index_ - 1 > limits_.log_entries || additional > limits_.log_entries - (replace_from - base_index_ - 1)) {
 				output.emplace_back(Send{source, AppendResponse{hard_.term, request.rpc, false, 0, replace_from, request.read_probe}}); return;
@@ -388,9 +487,16 @@ private:
 				}
 				retained_bytes += request.entries[i].payload.size();
 			}
+			std::size_t incoming_bytes = 0;
+			for (std::size_t i = first; i < request.entries.size(); ++i) { incoming_bytes += request.entries[i].payload.size(); }
+			// Overflow-free charged bounds include one reserved replacement RPC.
+			if (entries_.charged_entries() > limits_.log_entries || additional > limits_.rpc_entries ||
+				entries_.charged_bytes() > limits_.log_bytes || incoming_bytes > limits_.rpc_bytes) {
+				output.emplace_back(Send{source, AppendResponse{hard_.term, request.rpc, false, 0, replace_from, request.read_probe}}); return;
+			}
 			std::vector<Entry> suffix(request.entries.begin() + static_cast<std::ptrdiff_t>(first), request.entries.end());
 			entries_.resize(static_cast<std::size_t>(replace_from - base_index_ - 1));
-			entries_.insert(entries_.end(), suffix.begin(), suffix.end()); log_bytes_ = retained_bytes;
+			for (const auto& entry : suffix) { entries_.push_back(entry); } log_bytes_ = retained_bytes;
 			batch.log = LogMutation{replace_from, std::move(suffix)};
 		}
 		auto verified = request.previous + request.entries.size();
@@ -477,7 +583,7 @@ private:
 	}
 	void become_leader(Actions& output) {
 		if (busy()) { throw std::logic_error("leader election before vote persistence"); }
-		if (last_index() >= maximum - 1 || entries_.size() >= limits_.log_entries) {
+		if (last_index() >= maximum - 1 || entries_.charged_entries() >= limits_.log_entries) {
 			follower(0, output); return; // Control reserve exhausted: fail closed.
 		}
 		role_ = Role::Leader; leader_ = configuration_.local; peers_.clear(); grants_.clear();
@@ -544,7 +650,7 @@ private:
 
 	FixedConfiguration configuration_;
 	HardState hard_, durable_;
-	std::vector<Entry> entries_;
+	detail::RetainedLog entries_;
 	Index base_index_ = 0;
 	Term base_term_ = 0;
 	Limits limits_;
@@ -555,7 +661,9 @@ private:
 	std::uint64_t now_ = 0, election_delay_, election_deadline_ = 0, heartbeat_deadline_ = 0;
 	Token next_token_ = 0;
 	Index applied_ = 0, delivered_through_ = 0;
-	bool started_ = false;
+	bool started_ = false, capture_mode_ = false, retiring_ = false;
+	std::optional<FrozenCheckpoint> captured_;
+	std::shared_ptr<CaptureOwner> capture_owner_ = std::make_shared<CaptureOwner>(CaptureOwner{this});
 	std::optional<Pending> pending_;
 	std::optional<PendingInstall> install_;
 	std::map<NodeId, Peer> peers_;

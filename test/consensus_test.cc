@@ -1140,8 +1140,38 @@ void snapshot_sender_maximum_fanout() {
 	check(count == 30 && released.size() <= bound && core.durable_hard_state().term == 3, "simultaneous source releases and role effects fit the old action bound after durable term change");
 }
 
+void terminal_retirement() {
+ auto state = empty(1); state.hard = HardState{1, 1, 1};
+ for (Index index = 1; index <= 4096; ++index) {
+  state.entries.push_back({index, 1, EntryKind::Command, std::string(index == 4096 ? 1024 * 1024 : 1024, 'x')});
+ }
+ Core core(config(1), std::move(state));
+ core.step(Start{}); core.step(Applied{1});
+ auto frozen = core.step_capture(LocalCheckpoint{11, 7, 1, 1, config(1).cluster, config(1).configuration});
+ check(frozen.capture && frozen.capture->size() == 4095, "terminal fixture retains a frozen suffix");
+ core.begin_retirement(); core.begin_retirement();
+ check(core.retained_log_bytes() == 0 && core.retired_log_entries() == 4096,
+  "terminal close detaches live history without destroying payloads");
+ check(frozen.capture && throws([&] { frozen.capture->entry(0); }), "terminal close invalidates frozen capabilities");
+ check(core.step(Tick{1000, 100}).empty() && core.step(Propose{12, "closed"}).empty(),
+  "terminal close suppresses elections and new persistence");
+ unsigned turns = 0;
+ while (!core.retirement_drained()) {
+  detail::RetirementBudget budget{7, 1024 * 1024};
+  auto count = core.retired_log_entries(), bytes = core.retired_log_bytes();
+  core.retirement_step(budget);
+  check(count - core.retired_log_entries() <= 7 && bytes - core.retired_log_bytes() <= 1024 * 1024,
+   "terminal turns bound physical log reclamation");
+  check(++turns < 10000, "maximum legal payload cannot stall terminal reclamation");
+  if (turns >= 10000) { break; }
+ }
+ check(turns > 500 && core.retirement_drained(), "terminal owner yields until all live history is physically retired");
+ detail::RetirementBudget budget;
+ check(core.retirement_step(budget), "terminal drain is idempotent");
+}
+
 int main() {
-	try { snapshot_sender_maximum_fanout(); snapshot_sender_lost_ack_and_terms(); snapshot_sender_receiver_contact(); snapshot_sender_restart_clock_and_admission(); snapshot_sender_correlation(); snapshot_sender_keepalive_pacing(); snapshot_sender_retries_and_retention(); snapshot_timeout_retries(); portable_snapshot_installation(); portable_snapshot_descriptors(); event_admission_plans(); storage_footprint_plans(); persistence_barriers(); delayed_completions_do_not_campaign(); replication_and_restart(); affirmative_majority_and_inheritance(); simultaneous_completions(); reads_and_partitions(); overlapping_reads_preserve_data(); application_lag_does_not_spin_reads(); stale_rpc_and_failure_transitions(); bounds_and_semantic_recovery(); local_checkpoint_core(); compacted_index_exhaustion(); compacted_replication(); checkpoint_semantic_recovery(); real_journal_integration(); real_store_integration(); reordered_crash_schedules(3, 0x52414654); reordered_crash_schedules(5, 0x434c5553); }
+	try { terminal_retirement(); snapshot_sender_maximum_fanout(); snapshot_sender_lost_ack_and_terms(); snapshot_sender_receiver_contact(); snapshot_sender_restart_clock_and_admission(); snapshot_sender_correlation(); snapshot_sender_keepalive_pacing(); snapshot_sender_retries_and_retention(); snapshot_timeout_retries(); portable_snapshot_installation(); portable_snapshot_descriptors(); event_admission_plans(); storage_footprint_plans(); persistence_barriers(); delayed_completions_do_not_campaign(); replication_and_restart(); affirmative_majority_and_inheritance(); simultaneous_completions(); reads_and_partitions(); overlapping_reads_preserve_data(); application_lag_does_not_spin_reads(); stale_rpc_and_failure_transitions(); bounds_and_semantic_recovery(); local_checkpoint_core(); compacted_index_exhaustion(); compacted_replication(); checkpoint_semantic_recovery(); real_journal_integration(); real_store_integration(); reordered_crash_schedules(3, 0x52414654); reordered_crash_schedules(5, 0x434c5553); }
 	catch (const std::exception& error) { check(false, error.what()); }
 	std::cout << checks << " consensus checks, " << failures << " failures\n";
 	return failures ? 1 : 0;

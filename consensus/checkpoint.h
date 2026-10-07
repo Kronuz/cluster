@@ -1,7 +1,6 @@
 #pragma once
 
-#include "storage.h"
-#include "../journal/artifact.h"
+#include "checkpoint_encoder.h"
 
 namespace cluster::consensus {
 struct CheckpointBundle {
@@ -10,18 +9,6 @@ struct CheckpointBundle {
 	RecoveredState state;
 	std::optional<std::uint32_t> application_format{};
 };
-namespace checkpoint_detail {
-constexpr std::uint64_t magic = 0x31504b4342544652ull;
-constexpr std::uint64_t magic_v2 = 0x32504b4342544652ull;
-inline std::size_t maximum_size(Limits limits) {
-	constexpr std::size_t fixed = 400;
-	if (limits.log_entries > (std::numeric_limits<std::size_t>::max() - fixed) / 21 ||
-		limits.log_bytes > std::numeric_limits<std::size_t>::max() - fixed - limits.log_entries * 21) {
-		throw std::length_error("checkpoint encoded bound overflow");
-	}
-	return fixed + limits.log_entries * 21 + limits.log_bytes;
-}
-}
 inline std::string encode_checkpoint(const RecoveredState& state, std::uint64_t storage_sequence,
 	const kronuz::journal::ArtifactDescriptor& application, Limits limits = {}, std::optional<std::uint32_t> application_format = {}) {
 	using namespace storage_detail;
@@ -36,17 +23,13 @@ inline std::string encode_checkpoint(const RecoveredState& state, std::uint64_t 
 	}
 	auto encoded_size = std::size_t(application_format ? 96 : 92) + initialization.size() + state.entries.size() * 21 + payload_bytes;
 	if (encoded_size > maximum) { throw std::length_error("checkpoint exceeds encoded bound"); }
-	std::string result; result.reserve(encoded_size); put64(result, application_format ? checkpoint_detail::magic_v2 : checkpoint_detail::magic);
-	if (application_format) { put32(result, *application_format); }
-	put64(result, storage_sequence);
-	identity(result, application.identity); put64(result, application.length); put32(result, application.checksum);
-	put32(result, static_cast<std::uint32_t>(initialization.size())); result.append(initialization);
-	put64(result, state.base_index); put64(result, state.base_term);
-	put64(result, state.hard.term); put64(result, state.hard.voted_for.value_or(0)); put64(result, state.hard.commit_index);
-	put32(result, static_cast<std::uint32_t>(state.entries.size()));
-	for (const auto& entry : state.entries) {
-		put64(result, entry.index); put64(result, entry.term); result.push_back(static_cast<char>(entry.kind));
-		put32(result, static_cast<std::uint32_t>(entry.payload.size())); result.append(entry.payload);
+	std::string result; result.reserve(encoded_size);
+	IncrementalCheckpointEncoder encoder(BorrowedCheckpointState{&state}, storage_sequence, application, limits, application_format);
+	std::array<char, 65536> buffer{};
+	while (!encoder.done()) {
+		auto count = encoder.next(buffer);
+		if (!count) { throw std::logic_error("checkpoint encoder made no progress"); }
+		result.append(buffer.data(), count);
 	}
 	if (result.size() != encoded_size) { throw std::length_error("checkpoint exceeds encoded bound"); }
 	return result;

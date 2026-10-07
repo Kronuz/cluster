@@ -100,15 +100,18 @@ public:
 	}
 	// Pure semantic validation, shared by encoding, decoding, and restore.
 	// Return aggregate payload bytes without copying the retained suffix.
-	std::size_t validate_checkpoint_state(const RecoveredState& state) const {
+	void validate_checkpoint_metadata(const RecoveredState& state, std::size_t entry_count) const {
 		if (state.configuration != expected_ || state.base_index == 0 ||
 			state.base_index >= std::numeric_limits<Index>::max() || state.base_term == 0 || state.base_term > state.hard.term ||
 			state.applied_index != state.base_index || state.hard.commit_index < state.base_index ||
-			state.entries.size() > limits_.log_entries || state.entries.size() >= std::numeric_limits<Index>::max() - state.base_index ||
-			state.hard.commit_index > state.base_index + state.entries.size() ||
+			entry_count > limits_.log_entries || entry_count >= std::numeric_limits<Index>::max() - state.base_index ||
+			state.hard.commit_index > state.base_index + entry_count ||
 			(state.hard.voted_for && std::find(expected_.voters.begin(), expected_.voters.end(), *state.hard.voted_for) == expected_.voters.end())) {
 			throw storage_detail::Corruption("invalid consensus checkpoint state");
 		}
+	}
+	std::size_t validate_checkpoint_state(const RecoveredState& state) const {
+		validate_checkpoint_metadata(state, state.entries.size());
 		Term previous = state.base_term; std::size_t bytes = 0;
 		for (std::size_t i = 0; i < state.entries.size(); ++i) {
 			const auto& entry = state.entries[i];

@@ -1,23 +1,50 @@
 #pragma once
 
+#include "../metrics.h"
 #include "mutation.h"
 #include <asio.hpp>
 #include <asio/experimental/awaitable_operators.hpp>
+#include <chrono>
 #include <fcntl.h>
 #include <unistd.h>
 
 namespace kronuz::journal {
+
+inline constexpr std::size_t completion_primitive_count = static_cast<std::size_t>(PrimitiveKind::Remove) + 1;
+struct CompletionDriverStats {
+	std::array<kronuz::metrics::DurationSnapshot, completion_primitive_count> submitted_to_reaped{},
+		failed_submitted_to_reaped{};
+	kronuz::metrics::DurationSnapshot original_drive;
+};
+struct CompletionDriverMetrics {
+	std::array<kronuz::metrics::DurationHistogram<>, completion_primitive_count> submitted_to_reaped{},
+		failed_submitted_to_reaped{};
+	kronuz::metrics::DurationHistogram<> original_drive;
+	CompletionDriverStats snapshot() const noexcept {
+		CompletionDriverStats result;
+		for (std::size_t i = 0; i < completion_primitive_count; ++i) {
+			result.submitted_to_reaped[i] = submitted_to_reaped[i].snapshot();
+			result.failed_submitted_to_reaped[i] = failed_submitted_to_reaped[i].snapshot();
+		}
+		result.original_drive = original_drive.snapshot();
+		return result;
+	}
+};
 
 // Optional Asio adapter. The generic journal and completion backend do not
 // depend on Asio. A single owner executor invokes one run() at a time.
 template <class Queue>
 class AsioCompletionDriver : public std::enable_shared_from_this<AsioCompletionDriver<Queue>> {
   public:
-	AsioCompletionDriver(asio::any_io_executor executor, std::shared_ptr<Queue> queue)
+	AsioCompletionDriver(asio::any_io_executor executor, std::shared_ptr<Queue> queue,
+						 bool collect_metrics = false)
 		: executor_(std::move(executor)), queue_(std::move(queue)), notification_(executor_),
 		  timer_(executor_) {
 		if (!queue_) {
 			throw std::invalid_argument("null completion queue");
+		}
+		if (collect_metrics) {
+			metrics_ = std::make_unique<CompletionDriverMetrics>();
 		}
 		int fd = ::dup(queue_->notification_descriptor());
 		if (fd < 0) {
@@ -35,6 +62,9 @@ class AsioCompletionDriver : public std::enable_shared_from_this<AsioCompletionD
 			throw std::system_error(error);
 		}
 	}
+	CompletionDriverStats stats() const noexcept {
+		return metrics_ ? metrics_->snapshot() : CompletionDriverStats{};
+	}
 	asio::awaitable<void> run(std::shared_ptr<IOOperation> operation) {
 		using namespace asio::experimental::awaitable_operators;
 		auto lifetime = this->shared_from_this();
@@ -49,6 +79,7 @@ class AsioCompletionDriver : public std::enable_shared_from_this<AsioCompletionD
 		// destroy accepted IO buffers or skip the remaining durable barriers.
 		co_await asio::this_coro::reset_cancellation_state(asio::disable_cancellation());
 		active_ = true;
+		auto started = metrics_ ? Clock::now() : Clock::time_point{};
 		struct Reset {
 			bool &active;
 			~Reset() { active = false; }
@@ -60,14 +91,26 @@ class AsioCompletionDriver : public std::enable_shared_from_this<AsioCompletionD
 				immediate_steps = 0;
 				co_await asio::post(executor_, asio::use_awaitable);
 			}
+			auto kind = static_cast<std::size_t>(operation->request().kind);
+			if (kind >= completion_primitive_count) {
+				throw std::invalid_argument("invalid completion primitive kind");
+			}
+			auto submitted = metrics_ ? Clock::now() : Clock::time_point{};
 			if (!queue_->submit(operation)) {
 				throw std::logic_error("reserved completion queue is busy");
 			}
 			for (;;) {
 				if (auto result = queue_->poll()) {
+					auto latency = metrics_ ? elapsed_ns(submitted) : 0;
+					bool failed = static_cast<bool>(result->completion.error);
 					if (result->operation != operation ||
 						!operation->complete(std::move(result->completion))) {
 						throw std::logic_error("completion ownership mismatch");
+					}
+					if (metrics_) {
+						auto &histogram = failed ? metrics_->failed_submitted_to_reaped[kind]
+												 : metrics_->submitted_to_reaped[kind];
+						histogram.observe(latency);
 					}
 					break;
 				}
@@ -88,9 +131,18 @@ class AsioCompletionDriver : public std::enable_shared_from_this<AsioCompletionD
 				}
 			}
 		}
+		if (metrics_) {
+			metrics_->original_drive.observe(elapsed_ns(started));
+		}
 	}
 
   private:
+	using Clock = std::chrono::steady_clock;
+	static std::uint64_t elapsed_ns(Clock::time_point start) noexcept {
+		auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count();
+		return elapsed > 0 ? static_cast<std::uint64_t>(elapsed) : 0;
+	}
+	std::unique_ptr<CompletionDriverMetrics> metrics_;
 	asio::any_io_executor executor_;
 	std::shared_ptr<Queue> queue_;
 	asio::posix::stream_descriptor notification_;
