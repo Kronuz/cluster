@@ -26,7 +26,7 @@ class PreparedImage {
 	struct State {
 		std::shared_ptr<IO> io;
 		std::shared_ptr<void> lease;
-		std::shared_ptr<File> file;
+		std::unique_ptr<File> file;
 		std::string name;
 		bool selected = false;
 	};
@@ -107,7 +107,9 @@ class ImagePreparation final : public Operation {
 	void prepare_request() {
 		request_ = {};
 		request_.token = token_;
-		request_.file = state_->file;
+		// Retain the admitted state without allocating a second file control.
+		if (state_->file)
+			request_.file = std::shared_ptr<File>(state_, state_->file.get());
 		if (phase_ == 0) {
 			request_.kind = Kind::Create;
 			request_.source = state_->name;
