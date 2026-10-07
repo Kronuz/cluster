@@ -3,9 +3,14 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	project(kronuz_journal LANGUAGES CXX)
 endif()
 
+if(NOT TARGET kronuz::completion)
+  add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/../completion" "${CMAKE_CURRENT_BINARY_DIR}/completion")
+endif()
+
 add_library(cluster_journal INTERFACE)
 target_include_directories(cluster_journal INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/..")
 target_compile_features(cluster_journal INTERFACE cxx_std_20)
+target_link_libraries(cluster_journal INTERFACE kronuz::completion)
 add_library(cluster::journal ALIAS cluster_journal)
 
 find_package(Threads REQUIRED)
