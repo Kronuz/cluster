@@ -107,6 +107,26 @@ class ImagePreparation final : public Operation {
 					 std::size_t maximum, PreparationFilePolicy policy)
 		: ImagePreparation(std::move(context), std::move(io), std::move(lease), token, name, bytes,
 						   bytes ? std::string_view(*bytes) : std::string_view{}, maximum, policy) {}
+	// The caller supplies a fresh closed control from this backend. All control
+	// storage is admitted before the first CreateInto; this overload always
+	// settles explicit worker-side close before publishing a prepared capability.
+	ImagePreparation(AllocationContext context, std::shared_ptr<IO> io, std::shared_ptr<void> lease,
+					 Token token, std::string_view name, std::shared_ptr<const void> owner,
+					 std::string_view bytes, std::size_t maximum, std::unique_ptr<File> closed_file)
+		: ImagePreparation(std::move(context), std::move(io), std::move(lease), token, name, std::move(owner),
+						   bytes, maximum, PreparationFilePolicy::CloseAfterSeal) {
+		if (!closed_file || !state_->io->managed_capabilities().reusable_create)
+			throw std::invalid_argument("preallocated preparation requires reusable creation");
+		state_->file = std::move(closed_file);
+		preallocated_ = true;
+		prepare_request();
+	}
+	ImagePreparation(AllocationContext context, std::shared_ptr<IO> io, std::shared_ptr<void> lease,
+					 Token token, std::string_view name, std::shared_ptr<const std::string> bytes,
+					 std::size_t maximum, std::unique_ptr<File> closed_file)
+		: ImagePreparation(std::move(context), std::move(io), std::move(lease), token, name, bytes,
+						   bytes ? std::string_view(*bytes) : std::string_view{}, maximum,
+						   std::move(closed_file)) {}
 
   private:
 	void configure_policy(PreparationFilePolicy policy) {
@@ -127,7 +147,7 @@ class ImagePreparation final : public Operation {
 		bytes_ = {};
 	}
 	void close_or_finish() {
-		if (!state_->file) {
+		if (!state_->file || (preallocated_ && !preallocated_open_)) {
 			terminal();
 			return;
 		}
@@ -162,9 +182,12 @@ class ImagePreparation final : public Operation {
 			original_error_ = result.error;
 		const bool managed = policy_ == PreparationFilePolicy::CloseAfterSeal;
 		// An authentic returned handle belongs to this original, even on error.
-		if (managed && phase_ == 0 && result.file)
+		if (managed && phase_ == 0 && !preallocated_ && result.file)
 			state_->file = std::move(result.file);
+		if (preallocated_ && phase_ == 0 && !result.error)
+			preallocated_open_ = true;
 		if (managed && phase_ == 4) {
+			preallocated_open_ = false;
 			cleanup_error_ = result.error;
 			if (!error_)
 				error_ = result.error;
@@ -262,7 +285,7 @@ class ImagePreparation final : public Operation {
 		if (state_->file)
 			request_.file = std::shared_ptr<File>(state_, state_->file.get());
 		if (phase_ == 0) {
-			request_.kind = Kind::Create;
+			request_.kind = preallocated_ ? Kind::CreateInto : Kind::Create;
 			request_.source = state_->name;
 		} else if (phase_ == 1) {
 			request_.kind = Kind::Write;
@@ -280,7 +303,7 @@ class ImagePreparation final : public Operation {
 	PreparationFilePolicy policy_ = PreparationFilePolicy::Retain;
 	std::size_t offset_ = 0;
 	unsigned phase_ = 0;
-	bool done_ = false, in_flight_ = false;
+	bool done_ = false, in_flight_ = false, preallocated_ = false, preallocated_open_ = false;
 };
 
 // Publish a prepared descriptor, never an application image itself. Its opaque

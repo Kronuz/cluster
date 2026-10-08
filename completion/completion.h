@@ -12,9 +12,9 @@ struct CompletionStats {
 	std::array<std::uint64_t, 12> native_by_primitive{}, fallback_by_primitive{};
 	// Keep legacy array indices/types stable. Additive primitives have their
 	// own counters; drivers validate the kind before accepting an original.
-	std::array<std::uint64_t, 10> native_extensions{}, fallback_extensions{};
+	std::array<std::uint64_t, 11> native_extensions{}, fallback_extensions{};
 	static bool supported(PrimitiveKind kind) noexcept {
-		return static_cast<std::size_t>(kind) <= static_cast<std::size_t>(PrimitiveKind::ScanInto);
+		return static_cast<std::size_t>(kind) <= static_cast<std::size_t>(PrimitiveKind::CreateInto);
 	}
 	void submitted(PrimitiveKind kind, bool native) noexcept {
 		auto index = static_cast<std::size_t>(kind);

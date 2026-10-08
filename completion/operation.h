@@ -14,7 +14,7 @@ struct MutationToken {
 	bool operator==(const MutationToken &) const = default;
 };
 
-enum class PrimitiveKind { Write, Sync, Create, Replace, DirectorySync, Read, Open, Size, Scan, Next, OpenCandidate, Remove, NextInto, InspectEntry, InspectFile, SharedLease, ExclusiveLease, CloseFile, CloseCursor, OpenInto, OpenCandidateInto, ScanInto };
+enum class PrimitiveKind { Write, Sync, Create, Replace, DirectorySync, Read, Open, Size, Scan, Next, OpenCandidate, Remove, NextInto, InspectEntry, InspectFile, SharedLease, ExclusiveLease, CloseFile, CloseCursor, OpenInto, OpenCandidateInto, ScanInto, CreateInto };
 
 // Views belong to the operation. An accepted driver retains that operation
 // until the original primitive completes, including after cancellation.
@@ -55,6 +55,10 @@ inline MutationCompletion execute_primitive(IO &io, const MutationRequest &reque
 	result.token = request.token;
 	try {
 		switch (request.kind) {
+		case PrimitiveKind::CreateInto:
+			if (!request.file) { throw std::invalid_argument("reusable creation requires a file control"); }
+			io.create_exclusive_into(request.source, *request.file);
+			break;
 		case PrimitiveKind::OpenInto:
 			if (!request.file) { throw std::invalid_argument("reusable open requires a file control"); }
 			io.open_existing_into(request.source, *request.file);

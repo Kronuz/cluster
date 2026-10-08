@@ -29,6 +29,8 @@ struct ManagedCapabilities {
 	bool caller_scan = false, entry_inspection = false, file_inspection = false;
 	bool nonblocking_leases = false, file_close = false;
 	bool cursor_close = false, reusable_controls = false;
+	// Separate mutation capability; complete() retains its collector-profile meaning.
+	bool reusable_create = false;
 	bool complete() const noexcept {
 		return caller_scan && entry_inspection && file_inspection && nonblocking_leases && file_close && cursor_close && reusable_controls;
 	}
@@ -85,6 +87,9 @@ public:
 	// Admit reusable closed controls during startup. Into hooks use this same
 	// backend, reject live/foreign destinations before IO, and allocate no control.
 	virtual std::unique_ptr<File> make_closed_file() { throw std::logic_error("reusable file controls unsupported"); }
+	// No control allocation. With a valid closed destination, failure consumes
+	// temporary descriptors but may leave an exclusively created name behind.
+	virtual void create_exclusive_into(std::string_view, File&) { throw std::logic_error("reusable creation unsupported"); }
 	virtual std::unique_ptr<DirectoryCursor> make_closed_cursor() { throw std::logic_error("reusable cursor controls unsupported"); }
 	virtual void open_existing_into(std::string_view, File&) { throw std::logic_error("reusable file open unsupported"); }
 	virtual bool open_reclaim_candidate_into(std::string_view, File&) { throw std::logic_error("reusable candidate open unsupported"); }

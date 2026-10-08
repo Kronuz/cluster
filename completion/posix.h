@@ -241,7 +241,7 @@ public:
 	~PosixIO() override { ::close(directory_); }
 	PosixIO(const PosixIO&) = delete;
 	PosixIO& operator=(const PosixIO&) = delete;
-	ManagedCapabilities managed_capabilities() const noexcept override { return {true, true, true, true, true, true, true}; }
+	ManagedCapabilities managed_capabilities() const noexcept override { return {true, true, true, true, true, true, true, true}; }
 
 	std::unique_ptr<OwnerLock> acquire_owner(bool create) override {
 		if (owner_fd_ >= 0) { throw std::logic_error("journal directory already owned"); }
@@ -256,6 +256,10 @@ public:
 		} catch (...) { ::close(fd); throw; }
 	}
 	std::unique_ptr<File> make_closed_file() override { return control<ReusableFile>(*this); }
+	void create_exclusive_into(std::string_view name, File& destination) override {
+		auto &target = file_destination(destination);
+		target.install(open_file(name, true));
+	}
 	std::unique_ptr<DirectoryCursor> make_closed_cursor() override { return control<ReusableCursor>(*this); }
 	void open_existing_into(std::string_view name, File& destination) override {
 		auto &target = file_destination(destination);

@@ -97,6 +97,8 @@ class Operation final : public c::Operation {
 		request_.token.step = step_;
 		request_.kind = single_.value_or(kinds_[step_]);
 		request_.source = single_ ? "../invalid" : "anchor";
+		if (!single_ && request_.kind == c::Kind::CreateInto)
+			request_.source = "created";
 		request_.destination_bytes = state_->name;
 		if (step_ >= 12 && !single_) {
 			request_.cursor = std::shared_ptr<c::DirectoryCursor>(state_, state_->reusable_cursor.get());
@@ -113,7 +115,8 @@ class Operation final : public c::Operation {
 		c::Kind::Open,	   c::Kind::InspectFile,	c::Kind::SharedLease,		c::Kind::CloseFile,
 		c::Kind::Open,	   c::Kind::ExclusiveLease, c::Kind::CloseFile,			c::Kind::CloseCursor,
 		c::Kind::OpenInto, c::Kind::CloseFile,		c::Kind::OpenCandidateInto, c::Kind::CloseFile,
-		c::Kind::ScanInto, c::Kind::NextInto,		c::Kind::CloseCursor};
+		c::Kind::ScanInto, c::Kind::NextInto,		c::Kind::CloseCursor,		c::Kind::CreateInto,
+		c::Kind::CloseFile};
 	std::shared_ptr<State> state_;
 	std::optional<c::Kind> single_;
 	c::Request request_;
@@ -134,6 +137,7 @@ int main(int argc, char **argv) {
 			check(file->write_at(0, "proof") == 5);
 		}
 		for (bool metrics : {false, true}) {
+			backend->remove("created");
 			asio::io_context context;
 			auto queue = std::make_shared<c::NativeQueue>();
 			auto driver = std::make_shared<j::AsioCompletionDriver<c::NativeQueue>>(context.get_executor(),
@@ -157,7 +161,7 @@ int main(int argc, char **argv) {
 				std::rethrow_exception(failure);
 			if (state->error)
 				std::rethrow_exception(state->error);
-			check(done && weak.expired() && state->completed == 19 && !queue->busy());
+			check(done && weak.expired() && state->completed == 21 && !queue->busy());
 			check(driver->stats().submitted_to_reaped.size() == 12);
 			context.restart();
 			auto invalid = std::make_shared<Operation>(state, static_cast<c::Kind>(999));
@@ -174,7 +178,7 @@ int main(int argc, char **argv) {
 			auto stats = driver->stats();
 			for (std::size_t at = 0; at < j::completion_extension_count; ++at)
 				check(stats.extension_submitted_to_reaped[at].count == (metrics ? (at == 0	 ? 3
-																				   : at == 5 ? 4
+																				   : at == 5 ? 5
 																				   : at == 6 ? 2
 																							 : 1)
 																				: 0));
