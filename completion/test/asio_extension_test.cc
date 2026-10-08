@@ -15,6 +15,8 @@ struct State {
 	std::shared_ptr<c::IO> io;
 	std::unique_ptr<j::DirectoryCursor> cursor;
 	std::unique_ptr<c::File> file;
+	std::unique_ptr<c::File> reusable_file;
+	std::unique_ptr<c::DirectoryCursor> reusable_cursor;
 	std::array<char, 255> name{};
 	std::optional<c::EntryInspection> named;
 	std::exception_ptr error;
@@ -49,8 +51,8 @@ class Operation final : public c::Operation {
 				state_->cursor = std::move(result.cursor);
 				break;
 			case c::Kind::NextInto:
-				check(result.count == (step_ == 1 ? 6 : 0));
-				if (step_ == 1)
+				check(result.count == (step_ == 1 || step_ == 17 ? 6 : 0));
+				if (step_ == 1 || step_ == 17)
 					check(std::string_view(state_->name.data(), result.count) == "anchor");
 				break;
 			case c::Kind::InspectEntry:
@@ -64,6 +66,7 @@ class Operation final : public c::Operation {
 			case c::Kind::InspectFile:
 				check(result.inspection == state_->named);
 				break;
+			case c::Kind::OpenCandidateInto:
 			case c::Kind::SharedLease:
 			case c::Kind::ExclusiveLease:
 				check(result.count == 1);
@@ -95,15 +98,22 @@ class Operation final : public c::Operation {
 		request_.kind = single_.value_or(kinds_[step_]);
 		request_.source = single_ ? "../invalid" : "anchor";
 		request_.destination_bytes = state_->name;
+		if (step_ >= 12 && !single_) {
+			request_.cursor = std::shared_ptr<c::DirectoryCursor>(state_, state_->reusable_cursor.get());
+			request_.file = std::shared_ptr<c::File>(state_, state_->reusable_file.get());
+			return;
+		}
 		if (state_->cursor)
 			request_.cursor = std::shared_ptr<j::DirectoryCursor>(state_, state_->cursor.get());
 		if (state_->file)
 			request_.file = std::shared_ptr<c::File>(state_, state_->file.get());
 	}
 	inline static constexpr std::array kinds_{
-		c::Kind::Scan, c::Kind::NextInto,		c::Kind::NextInto,	  c::Kind::InspectEntry,
-		c::Kind::Open, c::Kind::InspectFile,	c::Kind::SharedLease, c::Kind::CloseFile,
-		c::Kind::Open, c::Kind::ExclusiveLease, c::Kind::CloseFile,	  c::Kind::CloseCursor};
+		c::Kind::Scan,	   c::Kind::NextInto,		c::Kind::NextInto,			c::Kind::InspectEntry,
+		c::Kind::Open,	   c::Kind::InspectFile,	c::Kind::SharedLease,		c::Kind::CloseFile,
+		c::Kind::Open,	   c::Kind::ExclusiveLease, c::Kind::CloseFile,			c::Kind::CloseCursor,
+		c::Kind::OpenInto, c::Kind::CloseFile,		c::Kind::OpenCandidateInto, c::Kind::CloseFile,
+		c::Kind::ScanInto, c::Kind::NextInto,		c::Kind::CloseCursor};
 	std::shared_ptr<State> state_;
 	std::optional<c::Kind> single_;
 	c::Request request_;
@@ -130,6 +140,8 @@ int main(int argc, char **argv) {
 																					queue, metrics);
 			auto state = std::make_shared<State>();
 			state->io = backend;
+			state->reusable_file = backend->make_closed_file();
+			state->reusable_cursor = backend->make_closed_cursor();
 			auto operation = std::make_shared<Operation>(state);
 			std::weak_ptr<Operation> weak = operation;
 			std::exception_ptr failure;
@@ -145,7 +157,7 @@ int main(int argc, char **argv) {
 				std::rethrow_exception(failure);
 			if (state->error)
 				std::rethrow_exception(state->error);
-			check(done && weak.expired() && state->completed == 12 && !queue->busy());
+			check(done && weak.expired() && state->completed == 19 && !queue->busy());
 			check(driver->stats().submitted_to_reaped.size() == 12);
 			context.restart();
 			auto invalid = std::make_shared<Operation>(state, static_cast<c::Kind>(999));
@@ -161,8 +173,11 @@ int main(int argc, char **argv) {
 			check(driver->stats().original_drive.count == (metrics ? 2 : 0));
 			auto stats = driver->stats();
 			for (std::size_t at = 0; at < j::completion_extension_count; ++at)
-				check(stats.extension_submitted_to_reaped[at].count ==
-					  (metrics ? (at == 0 || at == 5 ? 2 : 1) : 0));
+				check(stats.extension_submitted_to_reaped[at].count == (metrics ? (at == 0	 ? 3
+																				   : at == 5 ? 4
+																				   : at == 6 ? 2
+																							 : 1)
+																				: 0));
 			check(stats.extension_failed_submitted_to_reaped[1].count == (metrics ? 1 : 0));
 		}
 		std::filesystem::remove_all(directory);

@@ -4,6 +4,7 @@
 #include "allocation.h"
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <filesystem>
 #include <fcntl.h>
@@ -43,6 +44,17 @@ public:
 	}
 	static void operator delete(void* pointer, const Context&) noexcept { operator delete(pointer); }
 };
+// Controls may outlive a backend; an address can be reused by a later backend.
+inline std::uint64_t next_posix_instance() {
+	static std::atomic<std::uint64_t> last{0};
+	auto observed = last.load(std::memory_order_relaxed);
+	for (;;) {
+		if (observed == std::numeric_limits<std::uint64_t>::max()) {
+			throw std::overflow_error("POSIX backend identity exhausted");
+		}
+		if (last.compare_exchange_weak(observed, observed + 1, std::memory_order_relaxed)) { return observed + 1; }
+	}
+}
 [[noreturn]] inline void system_failure(const char* operation) {
 	throw std::system_error(errno, std::generic_category(), operation);
 }
@@ -102,6 +114,7 @@ public:
 	explicit PosixCursor(DIR* directory) : directory_(directory) {}
 	~PosixCursor() override { if (directory_) { ::closedir(directory_); } }
 	void install(DIR* directory) noexcept { directory_ = directory; }
+	bool closed() const noexcept { return directory_ == nullptr; }
 	std::optional<std::string> next() override {
 		auto name = next_name();
 		return name ? std::optional<std::string>(std::string(*name)) : std::nullopt;
@@ -228,7 +241,7 @@ public:
 	~PosixIO() override { ::close(directory_); }
 	PosixIO(const PosixIO&) = delete;
 	PosixIO& operator=(const PosixIO&) = delete;
-	ManagedCapabilities managed_capabilities() const noexcept override { return {true, true, true, true, true, true}; }
+	ManagedCapabilities managed_capabilities() const noexcept override { return {true, true, true, true, true, true, true}; }
 
 	std::unique_ptr<OwnerLock> acquire_owner(bool create) override {
 		if (owner_fd_ >= 0) { throw std::logic_error("journal directory already owned"); }
@@ -241,6 +254,31 @@ public:
 			owner_fd_ = fd;
 			return owner;
 		} catch (...) { ::close(fd); throw; }
+	}
+	std::unique_ptr<File> make_closed_file() override { return control<ReusableFile>(*this); }
+	std::unique_ptr<DirectoryCursor> make_closed_cursor() override { return control<ReusableCursor>(*this); }
+	void open_existing_into(std::string_view name, File& destination) override {
+		auto &target = file_destination(destination);
+		target.install(open_file(name, false));
+	}
+	bool open_reclaim_candidate_into(std::string_view name, File& destination) override {
+		auto &target = file_destination(destination);
+		detail::PosixName component(name); struct stat status{};
+		if (::fstatat(directory_, component.c_str(), &status, AT_SYMLINK_NOFOLLOW)) {
+			if (errno == ENOENT) { return false; } detail::system_failure("inspect reclamation candidate");
+		}
+		if (!S_ISREG(status.st_mode) || status.st_uid != ::geteuid() || status.st_nlink != 1 || (status.st_mode & 0022) ||
+			(status.st_mode & 0600) != 0600 || status.st_dev != device_) { return false; }
+		target.install(open_file(name, false));
+		return true;
+	}
+	void scan_directory_into(DirectoryCursor& destination) override {
+		auto &target = cursor_destination(destination);
+		int fd = ::openat(directory_, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+		if (fd < 0) { detail::system_failure("open reusable scan cursor"); }
+		auto directory = ::fdopendir(fd);
+		if (!directory) { auto error = errno; ::close(fd); errno = error; detail::system_failure("create reusable scan cursor"); }
+		target.install(directory);
 	}
 	std::unique_ptr<File> open_existing(std::string_view name) override { return file(name, false); }
 	std::unique_ptr<File> create_exclusive(std::string_view name) override { return file(name, true); }
@@ -297,6 +335,30 @@ public:
 	}
 
 private:
+	class ReusableFile : public detail::PosixFile {
+	public:
+		explicit ReusableFile(const PosixIO& io) : detail::PosixFile(-1), owner(io.instance_) {}
+		const std::uint64_t owner;
+	};
+	class ReusableCursor : public detail::PosixCursor {
+	public:
+		explicit ReusableCursor(const PosixIO& io) : detail::PosixCursor(nullptr), owner(io.instance_) {}
+		const std::uint64_t owner;
+	};
+	ReusableFile& file_destination(File& destination) {
+		auto target = dynamic_cast<ReusableFile*>(&destination);
+		if (!target || target->owner != instance_ || target->native_handle() >= 0) {
+			throw std::invalid_argument("reusable file destination must be closed and belong to its backend");
+		}
+		return *target;
+	}
+	ReusableCursor& cursor_destination(DirectoryCursor& destination) {
+		auto target = dynamic_cast<ReusableCursor*>(&destination);
+		if (!target || target->owner != instance_ || !target->closed()) {
+			throw std::invalid_argument("reusable cursor destination must be closed and belong to its backend");
+		}
+		return *target;
+	}
 	class Lock : public OwnerLock {
 	public:
 		Lock(PosixIO& io, int fd) : io_(io), fd_(fd) {}
@@ -342,6 +404,7 @@ private:
 		}
 		return std::make_unique<T>(std::forward<Args>(args)...);
 	}
+	const std::uint64_t instance_ = detail::next_posix_instance();
 	kronuz::io::completion::AllocationContext context_;
 	int directory_ = -1, owner_fd_ = -1;
 	dev_t device_{};

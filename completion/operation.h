@@ -14,7 +14,7 @@ struct MutationToken {
 	bool operator==(const MutationToken &) const = default;
 };
 
-enum class PrimitiveKind { Write, Sync, Create, Replace, DirectorySync, Read, Open, Size, Scan, Next, OpenCandidate, Remove, NextInto, InspectEntry, InspectFile, SharedLease, ExclusiveLease, CloseFile, CloseCursor };
+enum class PrimitiveKind { Write, Sync, Create, Replace, DirectorySync, Read, Open, Size, Scan, Next, OpenCandidate, Remove, NextInto, InspectEntry, InspectFile, SharedLease, ExclusiveLease, CloseFile, CloseCursor, OpenInto, OpenCandidateInto, ScanInto };
 
 // Views belong to the operation. An accepted driver retains that operation
 // until the original primitive completes, including after cancellation.
@@ -55,6 +55,18 @@ inline MutationCompletion execute_primitive(IO &io, const MutationRequest &reque
 	result.token = request.token;
 	try {
 		switch (request.kind) {
+		case PrimitiveKind::OpenInto:
+			if (!request.file) { throw std::invalid_argument("reusable open requires a file control"); }
+			io.open_existing_into(request.source, *request.file);
+			break;
+		case PrimitiveKind::OpenCandidateInto:
+			if (!request.file) { throw std::invalid_argument("candidate open requires a file control"); }
+			result.count = io.open_reclaim_candidate_into(request.source, *request.file) ? 1 : 0;
+			break;
+		case PrimitiveKind::ScanInto:
+			if (!request.cursor) { throw std::invalid_argument("reusable scan requires a cursor control"); }
+			io.scan_directory_into(*request.cursor);
+			break;
 		case PrimitiveKind::Scan: result.cursor = io.scan_directory(); break;
 		case PrimitiveKind::CloseCursor:
 			if (!request.cursor) { throw std::invalid_argument("close requires a directory cursor"); }
