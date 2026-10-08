@@ -15,6 +15,7 @@
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <utility>
 
 namespace kronuz::journal {
 
@@ -68,6 +69,18 @@ inline void validate_file(int fd) {
 	if (!S_ISREG(status.st_mode) || status.st_uid != ::geteuid() || status.st_nlink != 1 || (status.st_mode & 0022)) {
 		throw std::runtime_error("journal file requires exclusive ownership and a singly linked regular inode");
 	}
+}
+inline EntryInspection inspect_status(const struct stat& status) {
+	if (status.st_size < 0 || status.st_blocks < 0 ||
+		static_cast<std::uint64_t>(status.st_blocks) > std::numeric_limits<std::uint64_t>::max() / 512) {
+		throw std::overflow_error("invalid storage footprint");
+	}
+	auto kind = S_ISREG(status.st_mode) ? EntryKind::Regular : (S_ISDIR(status.st_mode) ? EntryKind::Directory :
+		(S_ISLNK(status.st_mode) ? EntryKind::Symlink : EntryKind::Other));
+	return {{kind, static_cast<std::uint64_t>(status.st_size), static_cast<std::uint64_t>(status.st_blocks) * 512},
+		static_cast<std::uint64_t>(status.st_dev), static_cast<std::uint64_t>(status.st_ino),
+		static_cast<std::uint64_t>(status.st_uid), static_cast<std::uint64_t>(status.st_nlink),
+		static_cast<std::uint32_t>(status.st_mode & 07777)};
 }
 inline void file_sync(int fd) {
 	int result;
@@ -145,8 +158,37 @@ public:
 		if (result < 0) { system_failure("truncate journal tail"); }
 	}
 	void sync() override { file_sync(fd_); }
+	EntryInspection inspect() override {
+		struct stat status{};
+		if (::fstat(fd_, &status)) { system_failure("inspect held file"); }
+		return inspect_status(status);
+	}
+	bool try_lease(LeaseMode mode) override {
+		if (mode != LeaseMode::Shared && mode != LeaseMode::Exclusive) {
+			throw std::invalid_argument("unsupported file lease mode");
+		}
+		// Lock conversion is forbidden; GC opens a separate fresh handle.
+		if (lease_) { throw std::logic_error("file lease already acquired"); }
+		int result;
+		do { result = ::flock(fd_, (mode == LeaseMode::Shared ? LOCK_SH : LOCK_EX) | LOCK_NB); }
+		while (result < 0 && errno == EINTR);
+		if (result < 0) {
+			if (errno == EWOULDBLOCK || errno == EAGAIN) { return false; }
+			system_failure("acquire nonblocking file lease");
+		}
+		lease_ = true;
+		return true;
+	}
+	void close() override {
+		if (fd_ < 0) { throw std::logic_error("file already closed"); }
+		// Never retry close: the original descriptor may already be reused.
+		auto descriptor = std::exchange(fd_, -1);
+		lease_ = false;
+		if (::close(descriptor)) { system_failure("close held file"); }
+	}
 private:
 	int fd_;
+	bool lease_ = false;
 };
 } // namespace detail
 
@@ -179,6 +221,7 @@ public:
 	~PosixIO() override { ::close(directory_); }
 	PosixIO(const PosixIO&) = delete;
 	PosixIO& operator=(const PosixIO&) = delete;
+	ManagedCapabilities managed_capabilities() const noexcept override { return {true, true, true, true, true}; }
 
 	std::unique_ptr<OwnerLock> acquire_owner(bool create) override {
 		if (owner_fd_ >= 0) { throw std::logic_error("journal directory already owned"); }
@@ -223,18 +266,16 @@ public:
 		return file(name, false);
 	}
 	std::optional<EntryFootprint> entry_footprint(std::string_view name) override {
+		auto inspection = inspect_entry(name);
+		return inspection ? std::optional<EntryFootprint>(inspection->footprint) : std::nullopt;
+	}
+	std::optional<EntryInspection> inspect_entry(std::string_view name) override {
 		// Census foreign names too, beyond the journal's own 128-byte bound.
 		detail::PosixName component(name, 255); struct stat status{};
 		if (::fstatat(directory_, component.c_str(), &status, AT_SYMLINK_NOFOLLOW)) {
 			if (errno == ENOENT) { return std::nullopt; } detail::system_failure("inspect storage footprint");
 		}
-		if (status.st_size < 0 || status.st_blocks < 0 ||
-			static_cast<std::uint64_t>(status.st_blocks) > std::numeric_limits<std::uint64_t>::max() / 512) {
-			throw std::overflow_error("invalid storage footprint");
-		}
-		auto kind = S_ISREG(status.st_mode) ? EntryKind::Regular : (S_ISDIR(status.st_mode) ? EntryKind::Directory :
-			(S_ISLNK(status.st_mode) ? EntryKind::Symlink : EntryKind::Other));
-		return EntryFootprint{kind, static_cast<std::uint64_t>(status.st_size), static_cast<std::uint64_t>(status.st_blocks) * 512};
+		return detail::inspect_status(status);
 	}
 	void sync_directory() override {
 		int result;

@@ -9,6 +9,11 @@ namespace kronuz::io::completion {
 using Identity = kronuz::journal::Identity;
 using File = kronuz::journal::File;
 using IO = kronuz::journal::IO;
+using EntryKind = kronuz::journal::EntryKind;
+using EntryFootprint = kronuz::journal::EntryFootprint;
+using EntryInspection = kronuz::journal::EntryInspection;
+using LeaseMode = kronuz::journal::LeaseMode;
+using ManagedCapabilities = kronuz::journal::ManagedCapabilities;
 using OwnerLock = kronuz::journal::OwnerLock;
 using PosixIO = kronuz::journal::PosixIO;
 using kronuz::journal::make_posix_io;

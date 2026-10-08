@@ -14,7 +14,7 @@ struct MutationToken {
 	bool operator==(const MutationToken &) const = default;
 };
 
-enum class PrimitiveKind { Write, Sync, Create, Replace, DirectorySync, Read, Open, Size, Scan, Next, OpenCandidate, Remove, NextInto };
+enum class PrimitiveKind { Write, Sync, Create, Replace, DirectorySync, Read, Open, Size, Scan, Next, OpenCandidate, Remove, NextInto, InspectEntry, InspectFile, SharedLease, ExclusiveLease, CloseFile };
 
 // Views belong to the operation. An accepted driver retains that operation
 // until the original primitive completes, including after cancellation.
@@ -35,6 +35,7 @@ struct MutationCompletion {
 	std::unique_ptr<DirectoryCursor> cursor;
 	std::optional<std::string> name;
 	std::exception_ptr error;
+	std::optional<EntryInspection> inspection;
 };
 
 class IOOperation {
@@ -55,6 +56,20 @@ inline MutationCompletion execute_primitive(IO &io, const MutationRequest &reque
 	try {
 		switch (request.kind) {
 		case PrimitiveKind::Scan: result.cursor = io.scan_directory(); break;
+		case PrimitiveKind::InspectEntry: result.inspection = io.inspect_entry(request.source); break;
+		case PrimitiveKind::InspectFile:
+			if (!request.file) { throw std::invalid_argument("held inspection requires a file"); }
+			result.inspection = request.file->inspect();
+			break;
+		case PrimitiveKind::SharedLease:
+		case PrimitiveKind::ExclusiveLease:
+			if (!request.file) { throw std::invalid_argument("lease acquisition requires a file"); }
+			result.count = request.file->try_lease(request.kind == PrimitiveKind::SharedLease ? LeaseMode::Shared : LeaseMode::Exclusive) ? 1 : 0;
+			break;
+		case PrimitiveKind::CloseFile:
+			if (!request.file) { throw std::invalid_argument("close requires a file"); }
+			request.file->close();
+			break;
 		case PrimitiveKind::Next: result.name = request.cursor->next(); break;
 		case PrimitiveKind::NextInto: {
 			if (!request.cursor) { throw std::invalid_argument("caller-buffer scan requires a cursor"); }

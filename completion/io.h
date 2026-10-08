@@ -11,6 +11,28 @@
 
 namespace kronuz::journal {
 
+enum class EntryKind { Regular, Directory, Symlink, Other };
+struct EntryFootprint {
+	EntryKind kind = EntryKind::Other;
+	std::uint64_t logical_bytes = 0;
+	std::optional<std::uint64_t> allocated_bytes;
+	bool operator==(const EntryFootprint&) const = default;
+};
+struct EntryInspection {
+	EntryFootprint footprint;
+	std::uint64_t device = 0, inode = 0, owner = 0, links = 0;
+	std::uint32_t permissions = 0;
+	bool operator==(const EntryInspection&) const = default;
+};
+enum class LeaseMode { Shared, Exclusive };
+struct ManagedCapabilities {
+	bool caller_scan = false, entry_inspection = false, file_inspection = false;
+	bool nonblocking_leases = false, file_close = false;
+	bool complete() const noexcept {
+		return caller_scan && entry_inspection && file_inspection && nonblocking_leases && file_close;
+	}
+};
+
 // Implementations own a trusted, already-created directory. Names are single
 // components; ownership and file-type checks belong to the implementation.
 class File {
@@ -21,6 +43,12 @@ public:
 	virtual std::size_t write_at(std::uint64_t offset, std::string_view bytes) = 0;
 	virtual void truncate(std::uint64_t size) = 0;
 	virtual void sync() = 0;
+	virtual EntryInspection inspect() { throw std::logic_error("held-file inspection unsupported"); }
+	// Fresh handles only: converting a shared lock may release its protection.
+	// False means busy, never a blocking wait. Errors remain exceptional.
+	virtual bool try_lease(LeaseMode) { throw std::logic_error("nonblocking file leases unsupported"); }
+	// Called by a retained worker-side original after preceding work settles.
+	virtual void close() { throw std::logic_error("explicit file close unsupported"); }
 };
 
 class OwnerLock {
@@ -42,16 +70,10 @@ public:
 	}
 };
 
-enum class EntryKind { Regular, Directory, Symlink, Other };
-struct EntryFootprint {
-	EntryKind kind = EntryKind::Other;
-	std::uint64_t logical_bytes = 0;
-	std::optional<std::uint64_t> allocated_bytes;
-};
-
 class IO {
 public:
 	virtual ~IO() = default;
+	virtual ManagedCapabilities managed_capabilities() const noexcept { return {}; }
 	// Creation is exclusive. Recovery opens the existing stable lock; neither
 	// manifest replacement nor fencing releases or replaces this lock.
 	// Successful creation adds exactly one zero-length owner.lock and no
@@ -67,6 +89,7 @@ public:
 	// its target. Missing names return null; genuine errors throw. A quiescent
 	// inventory requires exact-once enumeration with no concurrent mutations.
 	virtual std::optional<EntryFootprint> entry_footprint(std::string_view) { throw std::logic_error("entry accounting unsupported"); }
+	virtual std::optional<EntryInspection> inspect_entry(std::string_view) { throw std::logic_error("entry inspection unsupported"); }
 	// Null means absent or unsafe/nonregular: preserve it. Genuine I/O
 	// failures throw. A backend supporting reclamation overrides both hooks.
 	virtual std::unique_ptr<File> open_reclaim_candidate(std::string_view name) { return open_existing(name); }
