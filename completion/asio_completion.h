@@ -1,7 +1,7 @@
 #pragma once
 
+#include "completion.h"
 #include "metrics.h"
-#include "operation.h"
 #include <asio.hpp>
 #include <asio/experimental/awaitable_operators.hpp>
 #include <chrono>
@@ -11,20 +11,31 @@
 namespace kronuz::journal {
 
 inline constexpr std::size_t completion_primitive_count = static_cast<std::size_t>(PrimitiveKind::Remove) + 1;
+inline constexpr std::size_t completion_extension_count =
+	std::tuple_size_v<decltype(CompletionStats::native_extensions)>;
 struct CompletionDriverStats {
 	std::array<kronuz::metrics::DurationSnapshot, completion_primitive_count> submitted_to_reaped{},
 		failed_submitted_to_reaped{};
+	std::array<kronuz::metrics::DurationSnapshot, completion_extension_count> extension_submitted_to_reaped{},
+		extension_failed_submitted_to_reaped{};
 	kronuz::metrics::DurationSnapshot original_drive;
 };
 struct CompletionDriverMetrics {
 	std::array<kronuz::metrics::DurationHistogram<>, completion_primitive_count> submitted_to_reaped{},
 		failed_submitted_to_reaped{};
+	std::array<kronuz::metrics::DurationHistogram<>, completion_extension_count>
+		extension_submitted_to_reaped{}, extension_failed_submitted_to_reaped{};
 	kronuz::metrics::DurationHistogram<> original_drive;
 	CompletionDriverStats snapshot() const noexcept {
 		CompletionDriverStats result;
 		for (std::size_t i = 0; i < completion_primitive_count; ++i) {
 			result.submitted_to_reaped[i] = submitted_to_reaped[i].snapshot();
 			result.failed_submitted_to_reaped[i] = failed_submitted_to_reaped[i].snapshot();
+		}
+		for (std::size_t i = 0; i < completion_extension_count; ++i) {
+			result.extension_submitted_to_reaped[i] = extension_submitted_to_reaped[i].snapshot();
+			result.extension_failed_submitted_to_reaped[i] =
+				extension_failed_submitted_to_reaped[i].snapshot();
 		}
 		result.original_drive = original_drive.snapshot();
 		return result;
@@ -91,8 +102,9 @@ class AsioCompletionDriver : public std::enable_shared_from_this<AsioCompletionD
 				immediate_steps = 0;
 				co_await asio::post(executor_, asio::use_awaitable);
 			}
-			auto kind = static_cast<std::size_t>(operation->request().kind);
-			if (kind >= completion_primitive_count) {
+			auto primitive = operation->request().kind;
+			auto kind = static_cast<std::size_t>(primitive);
+			if (!CompletionStats::supported(primitive)) {
 				throw std::invalid_argument("invalid completion primitive kind");
 			}
 			auto submitted = metrics_ ? Clock::now() : Clock::time_point{};
@@ -108,8 +120,15 @@ class AsioCompletionDriver : public std::enable_shared_from_this<AsioCompletionD
 						throw std::logic_error("completion ownership mismatch");
 					}
 					if (metrics_) {
-						auto &histogram = failed ? metrics_->failed_submitted_to_reaped[kind]
-												 : metrics_->submitted_to_reaped[kind];
+						auto &histogram =
+							kind < completion_primitive_count
+								? (failed ? metrics_->failed_submitted_to_reaped[kind]
+										  : metrics_->submitted_to_reaped[kind])
+								: (failed
+									   ? metrics_->extension_failed_submitted_to_reaped
+											 [kind - completion_primitive_count]
+									   : metrics_->extension_submitted_to_reaped[kind -
+																				 completion_primitive_count]);
 						histogram.observe(latency);
 					}
 					break;
