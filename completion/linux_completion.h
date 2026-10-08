@@ -82,8 +82,7 @@ class LinuxCompletionQueue {
 		if (!operation || operation->done() || operation->in_flight())
 			throw std::invalid_argument("invalid IO operation submission");
 		auto request = operation->request();
-		const auto kind = static_cast<std::size_t>(request.kind);
-		if (kind >= stats_.native_by_primitive.size())
+		if (!CompletionStats::supported(request.kind))
 			throw std::invalid_argument("invalid IO primitive");
 		io_uring_sqe entry{};
 		// All checks and owned basename allocations precede publication.
@@ -98,7 +97,7 @@ class LinuxCompletionQueue {
 		stats_.maximum_outstanding = 1;
 		if (!native) {
 			++stats_.fallback_submitted;
-			++stats_.fallback_by_primitive.at(kind);
+			stats_.submitted(request_.kind, false);
 			work_.release();
 			return true;
 		}
@@ -110,7 +109,7 @@ class LinuxCompletionQueue {
 		sq_array_[index] = index;
 		native_pending_ = true;
 		++stats_.native_submitted;
-		++stats_.native_by_primitive.at(kind);
+		stats_.submitted(request_.kind, true);
 		store(sq_tail_, tail + 1); // Kernel may now own the original request.
 		kick();
 		return true;

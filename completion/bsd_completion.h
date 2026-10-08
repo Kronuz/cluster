@@ -75,6 +75,9 @@ class BsdCompletionQueue {
 			throw std::invalid_argument("invalid IO operation submission");
 		}
 		auto request = operation->request();
+		if (!CompletionStats::supported(request.kind)) {
+			throw std::invalid_argument("invalid IO primitive");
+		}
 		// Validate every native argument before marking this primitive submitted.
 		auto file = std::dynamic_pointer_cast<detail::PosixFile>(request.file);
 		bool native = file && (request.kind == PrimitiveKind::Write || request.kind == PrimitiveKind::Read);
@@ -109,7 +112,7 @@ class BsdCompletionQueue {
 			if (result == 0) {
 				native_pending_ = true;
 				++stats_.native_submitted;
-				++stats_.native_by_primitive.at(static_cast<std::size_t>(request_.kind));
+				stats_.submitted(request_.kind, true);
 				return true;
 			}
 			auto error = errno;
@@ -123,7 +126,7 @@ class BsdCompletionQueue {
 			}
 		}
 		++stats_.fallback_submitted;
-		++stats_.fallback_by_primitive.at(static_cast<std::size_t>(request_.kind));
+		stats_.submitted(request_.kind, false);
 		fallback_pending_ = true;
 		work_.release();
 		return true;

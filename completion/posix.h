@@ -90,11 +90,23 @@ public:
 	~PosixCursor() override { if (directory_) { ::closedir(directory_); } }
 	void install(DIR* directory) noexcept { directory_ = directory; }
 	std::optional<std::string> next() override {
+		auto name = next_name();
+		return name ? std::optional<std::string>(std::string(*name)) : std::nullopt;
+	}
+	std::optional<std::size_t> next_into(std::span<char> destination) override {
+		auto name = next_name();
+		if (!name) { return std::nullopt; }
+		if (name->size() > destination.size()) { throw std::length_error("directory name exceeds caller buffer"); }
+		std::copy(name->begin(), name->end(), destination.begin());
+		return name->size();
+	}
+private:
+	std::optional<std::string_view> next_name() {
 		for (;;) {
 			errno = 0; auto entry = ::readdir(directory_);
 			if (!entry) { if (errno) { system_failure("scan journal directory"); } return std::nullopt; }
 			std::string_view name(entry->d_name);
-			if (name != "." && name != "..") { return std::string(name); }
+			if (name != "." && name != "..") { return name; }
 		}
 	}
 private:

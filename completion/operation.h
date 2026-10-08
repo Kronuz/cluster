@@ -14,7 +14,7 @@ struct MutationToken {
 	bool operator==(const MutationToken &) const = default;
 };
 
-enum class PrimitiveKind { Write, Sync, Create, Replace, DirectorySync, Read, Open, Size, Scan, Next, OpenCandidate, Remove };
+enum class PrimitiveKind { Write, Sync, Create, Replace, DirectorySync, Read, Open, Size, Scan, Next, OpenCandidate, Remove, NextInto };
 
 // Views belong to the operation. An accepted driver retains that operation
 // until the original primitive completes, including after cancellation.
@@ -56,6 +56,15 @@ inline MutationCompletion execute_primitive(IO &io, const MutationRequest &reque
 		switch (request.kind) {
 		case PrimitiveKind::Scan: result.cursor = io.scan_directory(); break;
 		case PrimitiveKind::Next: result.name = request.cursor->next(); break;
+		case PrimitiveKind::NextInto: {
+			if (!request.cursor) { throw std::invalid_argument("caller-buffer scan requires a cursor"); }
+			auto size = request.cursor->next_into(request.destination_bytes);
+			if (size && (!*size || *size > request.destination_bytes.size())) {
+				throw std::runtime_error("invalid caller-buffer scan result");
+			}
+			result.count = size.value_or(0); // Zero is end; basenames cannot be empty.
+			break;
+		}
 		case PrimitiveKind::OpenCandidate: result.file = io.open_reclaim_candidate(request.source); break;
 		case PrimitiveKind::Remove: io.remove(request.source); break;
 		case PrimitiveKind::Open:
@@ -76,6 +85,8 @@ inline MutationCompletion execute_primitive(IO &io, const MutationRequest &reque
 		case PrimitiveKind::Create:
 			result.file = io.create_exclusive(request.source);
 			break;
+		default:
+			throw std::invalid_argument("unsupported IO primitive");
 		case PrimitiveKind::Replace:
 			io.replace(request.source, request.destination);
 			break;

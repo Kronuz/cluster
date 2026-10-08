@@ -34,6 +34,12 @@ public:
 	// One bounded basename, or end of pass. Concurrent namespace mutations
 	// may cause repeats/omissions; callers must recheck roots before removal.
 	virtual std::optional<std::string> next() = 0;
+	// Managed callers supply retained scratch storage. A present result is the
+	// number of copied name bytes (no NUL); null means end of pass. The default
+	// deliberately does not call the allocating legacy interface.
+	virtual std::optional<std::size_t> next_into(std::span<char>) {
+		throw std::logic_error("caller-buffer directory scanning unsupported");
+	}
 };
 
 enum class EntryKind { Regular, Directory, Symlink, Other };
