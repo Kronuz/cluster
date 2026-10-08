@@ -3,6 +3,7 @@
 #include "api.h"
 #include <algorithm>
 #include <limits>
+#include <system_error>
 #include <variant>
 
 namespace kronuz::io::completion {
@@ -66,6 +67,8 @@ class PreparedImage {
 	friend class ImagePublication;
 };
 
+enum class PreparationFilePolicy { Retain, CloseAfterSeal };
+
 class ImagePreparation final : public Operation {
   public:
 	ImagePreparation(std::shared_ptr<IO> io, std::shared_ptr<void> lease, Token token, std::string name,
@@ -92,7 +95,50 @@ class ImagePreparation final : public Operation {
 		: ImagePreparation(std::move(context), std::move(io), std::move(lease), token, name, bytes,
 						   bytes ? std::string_view(*bytes) : std::string_view{}, maximum) {}
 
+	ImagePreparation(AllocationContext context, std::shared_ptr<IO> io, std::shared_ptr<void> lease,
+					 Token token, std::string_view name, std::shared_ptr<const void> owner,
+					 std::string_view bytes, std::size_t maximum, PreparationFilePolicy policy)
+		: ImagePreparation(std::move(context), std::move(io), std::move(lease), token, name, std::move(owner),
+						   bytes, maximum) {
+		configure_policy(policy);
+	}
+	ImagePreparation(AllocationContext context, std::shared_ptr<IO> io, std::shared_ptr<void> lease,
+					 Token token, std::string_view name, std::shared_ptr<const std::string> bytes,
+					 std::size_t maximum, PreparationFilePolicy policy)
+		: ImagePreparation(std::move(context), std::move(io), std::move(lease), token, name, bytes,
+						   bytes ? std::string_view(*bytes) : std::string_view{}, maximum, policy) {}
+
   private:
+	void configure_policy(PreparationFilePolicy policy) {
+		if (policy != PreparationFilePolicy::Retain && policy != PreparationFilePolicy::CloseAfterSeal)
+			throw std::invalid_argument("unsupported preparation file policy");
+		if (policy == PreparationFilePolicy::CloseAfterSeal) {
+			if (!state_->io->managed_capabilities().file_close)
+				throw std::invalid_argument("managed preparation requires explicit file close");
+			const auto maximum_step = std::numeric_limits<std::uint64_t>::max();
+			// One-byte short writes bound the worst case, plus seal and cleanup.
+			if (bytes_.view.size() > maximum_step - 3 || token_.step > maximum_step - 3 - bytes_.view.size())
+				throw std::length_error("preparation exceeds cleanup token capacity");
+		}
+		policy_ = policy;
+	}
+	void terminal() noexcept {
+		done_ = true;
+		bytes_ = {};
+	}
+	void close_or_finish() {
+		if (!state_->file) {
+			terminal();
+			return;
+		}
+		if (phase_ != 4) {
+			if (token_.step == std::numeric_limits<std::uint64_t>::max())
+				throw std::overflow_error("preparation close token exhausted");
+			++token_.step;
+			phase_ = 4;
+			prepare_request();
+		}
+	}
 	void initialize(std::shared_ptr<IO> io, std::shared_ptr<void> lease, std::size_t maximum) {
 		if (!io || !lease || !bytes_.owner || bytes_.view.size() > maximum)
 			throw std::invalid_argument("image preparation admission invalid");
@@ -112,13 +158,31 @@ class ImagePreparation final : public Operation {
 		if (!in_flight_ || result.token != request_.token)
 			return false;
 		in_flight_ = false;
+		if (result.error && !original_error_)
+			original_error_ = result.error;
+		const bool managed = policy_ == PreparationFilePolicy::CloseAfterSeal;
+		// An authentic returned handle belongs to this original, even on error.
+		if (managed && phase_ == 0 && result.file)
+			state_->file = std::move(result.file);
+		if (managed && phase_ == 4) {
+			cleanup_error_ = result.error;
+			if (!error_)
+				error_ = result.error;
+			terminal(); // Close consumes its native handle; never retry an error.
+			return true;
+		}
 		try {
 			if (result.error)
 				std::rethrow_exception(result.error);
+			if (managed && error_) {
+				close_or_finish();
+				return true;
+			}
 			if (phase_ == 0) {
-				if (!result.file)
+				if (!managed)
+					state_->file = std::move(result.file);
+				if (!state_->file)
 					throw std::runtime_error("image create returned no file");
-				state_->file = std::move(result.file);
 				phase_ = bytes_.view.empty() ? 2 : 1;
 			} else if (phase_ == 1) {
 				if (!result.count || result.count > request_.bytes.size())
@@ -129,8 +193,10 @@ class ImagePreparation final : public Operation {
 			} else if (phase_ == 2) {
 				phase_ = 3;
 			} else {
-				done_ = true;
-				bytes_ = {};
+				if (managed)
+					close_or_finish();
+				else
+					terminal();
 				return true;
 			}
 			if (token_.step == std::numeric_limits<std::uint64_t>::max())
@@ -138,11 +204,44 @@ class ImagePreparation final : public Operation {
 			++token_.step;
 			prepare_request();
 		} catch (...) {
-			error_ = std::current_exception();
-			done_ = true;
+			if (!error_)
+				error_ = std::current_exception();
+			if (managed) {
+				try {
+					close_or_finish();
+				} catch (...) {
+					if (!cleanup_error_)
+						cleanup_error_ = std::current_exception();
+					terminal();
+				}
+			} else
+				done_ = true;
 		}
 		return true;
 	}
+	// Only the opt-in managed policy can stop work and drain native cleanup.
+	// The host continues driving this operation through authentic settlement.
+	bool cancel() noexcept {
+		if (done_ || policy_ != PreparationFilePolicy::CloseAfterSeal)
+			return false;
+		if (!error_) {
+			try {
+				throw std::system_error(std::make_error_code(std::errc::operation_canceled));
+			} catch (...) {
+				error_ = std::current_exception();
+			}
+		}
+		if (!in_flight_) {
+			try {
+				close_or_finish();
+			} catch (...) {
+				cleanup_error_ = std::current_exception();
+				terminal();
+			}
+		}
+		return true;
+	}
+
 	bool done() const noexcept override { return done_; }
 	bool in_flight() const noexcept override { return in_flight_; }
 	IO &io() const noexcept override { return *state_->io; }
@@ -152,6 +251,8 @@ class ImagePreparation final : public Operation {
 		return PreparedImage(state_);
 	}
 	std::exception_ptr error() const noexcept { return error_; }
+	std::exception_ptr cleanup_error() const noexcept { return cleanup_error_; }
+	std::exception_ptr original_error() const noexcept { return original_error_; }
 
   private:
 	void prepare_request() {
@@ -169,13 +270,14 @@ class ImagePreparation final : public Operation {
 			request_.bytes =
 				bytes_.view.substr(offset_, std::min<std::size_t>(65536, bytes_.view.size() - offset_));
 		} else
-			request_.kind = phase_ == 2 ? Kind::Sync : Kind::DirectorySync;
+			request_.kind = phase_ == 2 ? Kind::Sync : phase_ == 4 ? Kind::CloseFile : Kind::DirectorySync;
 	}
 	std::shared_ptr<PreparedImage::State> state_;
 	ImmutableBytes bytes_;
 	Token token_;
 	Request request_;
-	std::exception_ptr error_;
+	std::exception_ptr error_, cleanup_error_, original_error_;
+	PreparationFilePolicy policy_ = PreparationFilePolicy::Retain;
 	std::size_t offset_ = 0;
 	unsigned phase_ = 0;
 	bool done_ = false, in_flight_ = false;

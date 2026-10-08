@@ -49,6 +49,7 @@ public:
 	// False means busy, never a blocking wait. Errors remain exceptional.
 	virtual bool try_lease(LeaseMode) { throw std::logic_error("nonblocking file leases unsupported"); }
 	// Called by a retained worker-side original after preceding work settles.
+	// Supporting backends consume the native handle even on error; never retry.
 	virtual void close() { throw std::logic_error("explicit file close unsupported"); }
 };
 
