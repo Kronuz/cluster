@@ -113,8 +113,15 @@ public:
 		std::copy(name->begin(), name->end(), destination.begin());
 		return name->size();
 	}
+	void close() override {
+		if (!directory_) { throw std::logic_error("directory cursor already closed"); }
+		// closedir consumes the stream even when it reports an error.
+		auto directory = std::exchange(directory_, nullptr);
+		if (::closedir(directory)) { system_failure("close directory cursor"); }
+	}
 private:
 	std::optional<std::string_view> next_name() {
+		if (!directory_) { throw std::logic_error("directory cursor closed"); }
 		for (;;) {
 			errno = 0; auto entry = ::readdir(directory_);
 			if (!entry) { if (errno) { system_failure("scan journal directory"); } return std::nullopt; }
@@ -221,7 +228,7 @@ public:
 	~PosixIO() override { ::close(directory_); }
 	PosixIO(const PosixIO&) = delete;
 	PosixIO& operator=(const PosixIO&) = delete;
-	ManagedCapabilities managed_capabilities() const noexcept override { return {true, true, true, true, true}; }
+	ManagedCapabilities managed_capabilities() const noexcept override { return {true, true, true, true, true, true}; }
 
 	std::unique_ptr<OwnerLock> acquire_owner(bool create) override {
 		if (owner_fd_ >= 0) { throw std::logic_error("journal directory already owned"); }

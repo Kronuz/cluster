@@ -8,6 +8,7 @@
 namespace kronuz::io::completion {
 using Identity = kronuz::journal::Identity;
 using File = kronuz::journal::File;
+using DirectoryCursor = kronuz::journal::DirectoryCursor;
 using IO = kronuz::journal::IO;
 using EntryKind = kronuz::journal::EntryKind;
 using EntryFootprint = kronuz::journal::EntryFootprint;

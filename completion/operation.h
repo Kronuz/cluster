@@ -14,7 +14,7 @@ struct MutationToken {
 	bool operator==(const MutationToken &) const = default;
 };
 
-enum class PrimitiveKind { Write, Sync, Create, Replace, DirectorySync, Read, Open, Size, Scan, Next, OpenCandidate, Remove, NextInto, InspectEntry, InspectFile, SharedLease, ExclusiveLease, CloseFile };
+enum class PrimitiveKind { Write, Sync, Create, Replace, DirectorySync, Read, Open, Size, Scan, Next, OpenCandidate, Remove, NextInto, InspectEntry, InspectFile, SharedLease, ExclusiveLease, CloseFile, CloseCursor };
 
 // Views belong to the operation. An accepted driver retains that operation
 // until the original primitive completes, including after cancellation.
@@ -56,6 +56,10 @@ inline MutationCompletion execute_primitive(IO &io, const MutationRequest &reque
 	try {
 		switch (request.kind) {
 		case PrimitiveKind::Scan: result.cursor = io.scan_directory(); break;
+		case PrimitiveKind::CloseCursor:
+			if (!request.cursor) { throw std::invalid_argument("close requires a directory cursor"); }
+			request.cursor->close();
+			break;
 		case PrimitiveKind::InspectEntry: result.inspection = io.inspect_entry(request.source); break;
 		case PrimitiveKind::InspectFile:
 			if (!request.file) { throw std::invalid_argument("held inspection requires a file"); }

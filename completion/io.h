@@ -28,8 +28,9 @@ enum class LeaseMode { Shared, Exclusive };
 struct ManagedCapabilities {
 	bool caller_scan = false, entry_inspection = false, file_inspection = false;
 	bool nonblocking_leases = false, file_close = false;
+	bool cursor_close = false;
 	bool complete() const noexcept {
-		return caller_scan && entry_inspection && file_inspection && nonblocking_leases && file_close;
+		return caller_scan && entry_inspection && file_inspection && nonblocking_leases && file_close && cursor_close;
 	}
 };
 
@@ -68,6 +69,7 @@ public:
 	virtual std::optional<std::size_t> next_into(std::span<char>) {
 		throw std::logic_error("caller-buffer directory scanning unsupported");
 	}
+	virtual void close() { throw std::logic_error("explicit cursor close unsupported"); }
 };
 
 class IO {

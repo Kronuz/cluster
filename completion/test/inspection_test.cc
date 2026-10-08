@@ -147,8 +147,11 @@ int main(int argc, char **argv) {
 		rejects([&] { queue.submit(invalid); });
 		check(!invalid->in_flight() && !queue.busy());
 		auto stats = queue.stats();
-		for (std::size_t at = 1; at < stats.fallback_extensions.size(); ++at)
+		for (auto kind : {c::Kind::InspectEntry, c::Kind::InspectFile, c::Kind::SharedLease,
+						  c::Kind::ExclusiveLease, c::Kind::CloseFile}) {
+			auto at = static_cast<std::size_t>(kind) - stats.fallback_by_primitive.size();
 			check(stats.fallback_extensions[at] > 0 && stats.native_extensions[at] == 0);
+		}
 		check(stats.fallback_by_primitive.size() == 12);
 		std::filesystem::remove_all(directory);
 		std::cout << "no-follow stable inspection, nonblocking leases and retained close originals passed\n";

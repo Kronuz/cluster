@@ -103,7 +103,7 @@ class Operation final : public c::Operation {
 	inline static constexpr std::array kinds_{
 		c::Kind::Scan, c::Kind::NextInto,		c::Kind::NextInto,	  c::Kind::InspectEntry,
 		c::Kind::Open, c::Kind::InspectFile,	c::Kind::SharedLease, c::Kind::CloseFile,
-		c::Kind::Open, c::Kind::ExclusiveLease, c::Kind::CloseFile};
+		c::Kind::Open, c::Kind::ExclusiveLease, c::Kind::CloseFile,	  c::Kind::CloseCursor};
 	std::shared_ptr<State> state_;
 	std::optional<c::Kind> single_;
 	c::Request request_;
@@ -145,7 +145,7 @@ int main(int argc, char **argv) {
 				std::rethrow_exception(failure);
 			if (state->error)
 				std::rethrow_exception(state->error);
-			check(done && weak.expired() && state->completed == 11 && !queue->busy());
+			check(done && weak.expired() && state->completed == 12 && !queue->busy());
 			check(driver->stats().submitted_to_reaped.size() == 12);
 			context.restart();
 			auto invalid = std::make_shared<Operation>(state, static_cast<c::Kind>(999));
