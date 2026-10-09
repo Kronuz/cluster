@@ -27,11 +27,15 @@ find_package(Threads REQUIRED)
 FetchContent_Declare(reactor GIT_REPOSITORY https://github.com/Kronuz/reactor.git GIT_TAG main)
 FetchContent_MakeAvailable(reactor)
 
+# --- varint: the length/string/bool/char wire codec behind length.h ---
+FetchContent_Declare(varint GIT_REPOSITORY https://github.com/Kronuz/varint.git GIT_TAG main)
+FetchContent_MakeAvailable(varint)
+
 # --- the cluster substrate (header-only) ---
 add_library(cluster INTERFACE)
 target_include_directories(cluster INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}")
 target_compile_features(cluster INTERFACE cxx_std_20)
-target_link_libraries(cluster INTERFACE reactor::reactor)
+target_link_libraries(cluster INTERFACE reactor::reactor varint::varint)
 add_library(cluster::cluster ALIAS cluster)
 
 # Generic durable storage has no reactor, socket, or consensus dependency.
@@ -132,4 +136,9 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 		set_tests_properties(cluster_linux_completion PROPERTIES TIMEOUT 30)
 	endif()
 
+
+	add_executable(cluster_liveness_test test/liveness_test.cc)
+	target_link_libraries(cluster_liveness_test PRIVATE cluster)
+	add_test(NAME cluster_liveness COMMAND cluster_liveness_test)
+	set_tests_properties(cluster_liveness PROPERTIES TIMEOUT 60)
 endif()

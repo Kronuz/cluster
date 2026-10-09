@@ -20,97 +20,29 @@
  * THE SOFTWARE.
  */
 
-// A varint length codec + a length-prefixed string, BYTE-COMPATIBLE with Xapiand's
-// serialise_length / serialise_string (src/length.{h,cc}). Vendored here (header-only,
-// no exceptions -- the unserialise side returns false on bad/short data) so the cluster
-// wire format interoperates with the existing discovery protocol without pulling in a
-// dependency. The encoding: a byte < 255 is the length verbatim; 0xff introduces a
-// (len - 255) little-endian base-128 continuation where the final byte has 0x80 set.
+// The length/string/bool/char wire codec cluster uses for its own Raft and
+// bus message framing now lives in its own library, github.com/Kronuz/varint
+// (extracted from this exact code -- see its README's "Provenance" section
+// for why, including a real licensing issue found in Xapiand's original
+// length.h/length.cc that this code was NEVER actually derived from, despite
+// the similar name). This header is now a thin compatibility shim: every
+// call site in this repo uses these names unqualified from inside
+// `namespace cluster`, so re-exporting them here via `using` keeps every
+// existing #include "length.h" and call site working unchanged.
 
 #pragma once
 
-#include <cstddef>
-#include <limits>
-#include <string>
-#include <string_view>
+#include <varint.hh>
 
 namespace cluster {
 
-inline std::string serialise_length(unsigned long long len) {
-	std::string result;
-	if (len < 255) {
-		result += static_cast<char>(static_cast<unsigned char>(len));
-	} else {
-		result += '\xff';
-		len -= 255;
-		while (true) {
-			auto b = static_cast<unsigned char>(len & 0x7f);
-			len >>= 7;
-			if (len == 0) {
-				result += static_cast<char>(b | static_cast<unsigned char>(0x80));
-				break;
-			}
-			result += static_cast<char>(b);
-		}
-	}
-	return result;
-}
+using varint::serialise_length;
+using varint::unserialise_length;
+using varint::serialise_string;
+using varint::unserialise_string;
+using varint::serialise_bool;
+using varint::unserialise_bool;
+using varint::serialise_char;
+using varint::unserialise_char;
 
-// Read a length from [*p, end); advance *p. false on truncated/overlong input.
-// Templated on the destination integer type so it binds equally to uint64_t,
-// unsigned long long, or size_t (these are distinct types under LP64 even when
-// same-width, so a fixed unsigned-long-long& reference would reject a uint64_t).
-template <typename T>
-inline bool unserialise_length(const char** p, const char* end, T& out) {
-	if (*p == end) { return false; }
-	unsigned long long len = static_cast<unsigned char>(*(*p)++);
-	if (len == 0xff) {
-		len = 0;
-		unsigned char ch = 0;
-		unsigned shift = 0;
-		do {
-			if (*p == end || shift >= std::numeric_limits<unsigned long long>::digits) { return false; }
-			ch = static_cast<unsigned char>(*(*p)++);
-			auto chunk = static_cast<unsigned long long>(ch & 0x7f);
-			if (chunk > (std::numeric_limits<unsigned long long>::max() >> shift)) { return false; }
-			len |= chunk << shift;
-			shift += 7;
-		} while ((ch & 0x80) == 0);
-		if (len > std::numeric_limits<unsigned long long>::max() - 255) { return false; }
-		len += 255;
-	}
-	if (len > static_cast<unsigned long long>(std::numeric_limits<T>::max())) { return false; }
-	out = static_cast<T>(len);
-	return true;
-}
-
-inline std::string serialise_string(std::string_view input) {
-	std::string result = serialise_length(input.size());
-	result.append(input.data(), input.size());
-	return result;
-}
-
-// A boolean is one byte, '1' or '0' -- byte-compatible with Xapiand's serialise_bool.
-inline std::string serialise_bool(bool value) {
-	return value ? "1" : "0";
-}
-
-inline bool unserialise_bool(const char** p, const char* end, bool& out) {
-	if (*p == end) { return false; }
-	char c = *(*p)++;
-	if (c < '0' || c > '1') { return false; }
-	out = (c != '0');
-	return true;
-}
-
-// Read a length-prefixed string; out views into the same buffer as *p. false on truncation.
-inline bool unserialise_string(const char** p, const char* end, std::string_view& out) {
-	unsigned long long len = 0;
-	if (!unserialise_length(p, end, len)) { return false; }
-	if (static_cast<unsigned long long>(end - *p) < len) { return false; }
-	out = std::string_view(*p, static_cast<std::size_t>(len));
-	*p += len;
-	return true;
-}
-
-}  // namespace cluster
+} // namespace cluster
