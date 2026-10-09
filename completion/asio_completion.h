@@ -77,6 +77,16 @@ class AsioCompletionDriver : public std::enable_shared_from_this<AsioCompletionD
 		return metrics_ ? metrics_->snapshot() : CompletionDriverStats{};
 	}
 	asio::awaitable<void> run(std::shared_ptr<IOOperation> operation) {
+		return drive(std::move(operation), false);
+	}
+	// Reap exactly one original primitive, then return control to the owner.
+	// This supports operations with explicit paused scheduling boundaries.
+	asio::awaitable<void> run_one(std::shared_ptr<IOOperation> operation) {
+		return drive(std::move(operation), true);
+	}
+
+  private:
+	asio::awaitable<void> drive(std::shared_ptr<IOOperation> operation, bool single) {
 		using namespace asio::experimental::awaitable_operators;
 		auto lifetime = this->shared_from_this();
 		auto current_executor = co_await asio::this_coro::executor;
@@ -149,6 +159,8 @@ class AsioCompletionDriver : public std::enable_shared_from_this<AsioCompletionD
 					}
 				}
 			}
+			if (single)
+				break;
 		}
 		if (metrics_) {
 			metrics_->original_drive.observe(elapsed_ns(started));

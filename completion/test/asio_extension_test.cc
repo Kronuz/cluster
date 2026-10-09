@@ -123,6 +123,14 @@ class Operation final : public c::Operation {
 	std::size_t step_ = 0;
 	bool submitted_ = false, done_ = false;
 };
+asio::awaitable<void> single_then_remaining(std::shared_ptr<j::AsioCompletionDriver<c::NativeQueue>> driver,
+											std::shared_ptr<Operation> operation,
+											std::shared_ptr<State> state,
+											std::shared_ptr<c::NativeQueue> queue) {
+	co_await driver->run_one(operation);
+	check(state->completed == 1 && !operation->done() && !operation->in_flight() && !queue->busy());
+	co_await driver->run(operation);
+}
 } // namespace
 int main(int argc, char **argv) {
 	try {
@@ -150,7 +158,9 @@ int main(int argc, char **argv) {
 			std::weak_ptr<Operation> weak = operation;
 			std::exception_ptr failure;
 			bool done = false;
-			asio::co_spawn(context, driver->run(operation), [&](std::exception_ptr error) {
+			auto work =
+				metrics ? driver->run(operation) : single_then_remaining(driver, operation, state, queue);
+			asio::co_spawn(context, std::move(work), [&](std::exception_ptr error) {
 				failure = error;
 				done = true;
 			});
