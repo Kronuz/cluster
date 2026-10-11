@@ -90,3 +90,7 @@ multicast, cluster-token scoping, and version rejection).
 See [Legacy Raft safety corrections](SAFETY.md) for corrected replication progress, mixed-version limits, and deterministic regressions. These are separately validated behavior corrections after extraction. Terms, votes, and logs are still volatile, and the legacy module is not a durable write authority.
 
 `cluster::Bus` and `cluster::Raft` are implemented; membership gossip stays application-side. Raft was extracted from Xapiand and now includes the separately reviewed corrections above. `test/raft_test.cc` exercises election, application, and re-election in three- and five-node in-memory clusters; `test/raft_safety_test.cc` exercises deterministic safety regressions. These schedules do not constitute a general consensus proof. `examples/raft_election.cc` demonstrates the API, and `benchmarks/raft_bench.cc` measures election latency (approximately 40 ms with a 20–60 ms election window in the recorded benchmark).
+
+## License
+
+MIT. See [LICENSE](LICENSE).
