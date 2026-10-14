@@ -66,9 +66,11 @@ CMakeLists.txt     Header-only INTERFACE target cluster::cluster; FetchContents 
                    only top-level.
 ```
 
-`journal/` is an additive generic storage module with its own CMake entry point and no reactor dependency. Read [journal/README.md](journal/README.md) before changing durability or recovery semantics. Its owner lock is stable across manifest publication, and failures fence until close/recovery; do not delete acknowledged history when replacing a Raft suffix. `test/journal_test.cc` injects filesystem failures and checks the POSIX backend. This module does not alter the legacy Raft persistence contract.
-
-`consensus/` is the additive strict fixed-voter core and semantic journal adapter. Read [consensus/README.md](consensus/README.md) before changing events/actions or recovery. Send/application effects depend on durable completions, local Applied events remain reliable while busy, and read quorum probes must not preempt data or create fixed-time feedback loops. `test/consensus_test.cc` covers deterministic and seeded host schedules plus real journal reopening and local checkpoints. Production transport and network snapshot installation remain pending.
+The completion I/O, the durable journal, and the strict durable consensus that grew here now
+live in their own repositories: [completion](https://github.com/Kronuz/completion),
+[journal](https://github.com/Kronuz/journal), [consensus](https://github.com/Kronuz/consensus),
+and [metrics](https://github.com/Kronuz/metrics). This repository keeps the bus, the legacy
+Raft, the length codec, and liveness; its history before the move still holds theirs.
 
 ## Invariants — do not regress these
 
@@ -182,12 +184,3 @@ the invariant documented). None was silently "improved".
 - Xapiand's Discovery is now a thin adapter over this substrate (`cluster::Bus` +
   `cluster::Raft` + `XapiandRaftDelegate`), replacing the libev UDP + all raft_* handlers.
   Validated: 2-node `cluster_check.sh` GREEN + a byte-identical discovery wire diff.
-
-
-## Completion-driven storage work
-
-`journal/mutation.h` provides explicit resumable append and shared manifest publication states. Both synchronous and completion drivers must execute these same states. Owned backend construction retains the directory, files and stable owner session across suspension. An accepted driver retains the operation until every original primitive is reaped; only matching owner/operation/step completions advance it. Final barriers precede frontier settlement. Never offload `Worker::run_one()` as a whole, invent completion after cancellation, or refund started storage permits before terminal settlement. `journal/bsd_completion.h` supplies a one-slot native-AIO/fallback backend, and optional `journal/asio_completion.h` supplies the owner-executor coroutine driver. macOS writes and required full-flush fallbacks are qualified; FreeBSD native qualification remains open; Linux now has an owned io_uring backend with native guest qualification recorded in the journal README. Store and Worker now provide opt-in owned completion appends. Owned artifact creation/chunk/sealing jobs also retain a shared replacement cycle with an exact job lease and detached preparation settlement. Checkpoint publication also uses an owned operation and admitted whole-cycle lease; detached publication must complete or fence rather than settle as orphan preparation. Worker preparation/publication, verification, source reads and reclamation now have completion dispatch; bootstrap/recovery remain synchronous before admission, and existing default library paths remain synchronous. Never describe the intermediate append profile as a fully asynchronous service.
-
-CTest configuration creates its build-local `.scratch/` parent before filesystem fixtures run. Fresh build directories must not depend on a developer having created that parent manually.
-
-Linux owned completion now has a raw io_uring queue in `journal/linux_completion.h`, selected by `native_completion.h`; shared completion values live in `completion.h`. Preserve one original primitive, reconcile published submissions after enter errors without fallback duplication, and retain final file/directory barriers. Initial Linux kernel fixtures are qualified; authority, sanitizer and component acceptance remain in progress. Never treat automatic fallback as native qualification.

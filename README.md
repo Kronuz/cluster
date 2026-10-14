@@ -64,9 +64,11 @@ never races the receive.
 
 **[reactor](https://github.com/Kronuz/reactor)** (which brings standalone **asio**), via CMake `FetchContent`; otherwise header-only. The node type, its state hooks / `apply(command)`, the message codec, and logging are **injected seams**, not dependencies.
 
-The additive [durable opaque batch journal](journal/README.md) has no reactor or consensus dependency. Build it separately with `cmake -S journal -B .scratch/journal`; its append/recovery protocol, POSIX backend, deterministic I/O tests, example, and initial measurements are documented there. It does not add persistence to legacy Raft.
-
-The additive [strict fixed-voter core](consensus/README.md) provides deterministic events/actions and semantic storage replay without transport or filesystem calls. Build it separately with `cmake -S consensus -B .scratch/consensus`. Its persistence barriers and qualification schedules are documented separately; checkpoints and production transport remain pending.
+The completion I/O, the durable journal, and the strict durable consensus that grew here now
+live in their own repositories: [completion](https://github.com/Kronuz/completion),
+[journal](https://github.com/Kronuz/journal), [consensus](https://github.com/Kronuz/consensus),
+and [metrics](https://github.com/Kronuz/metrics). This repository keeps the bus, the legacy
+Raft, the length codec, and liveness; its history before the move still holds theirs.
 
 ## Build
 

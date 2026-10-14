@@ -144,6 +144,8 @@ Consensus and gossip mechanics stay here; domain policy stays in the app.
 
 ## Additive durable storage
 
-The separately buildable `journal/` module stores bounded opaque batches behind an injected filesystem interface. It has no reactor, membership, Raft, or application-state dependency. Its checksummed durable frontier separates acknowledged storage history from an incomplete tail; recovery validates that frontier before discarding extra bytes. Raft hard-state encoding and suffix-replacement interpretation live in `consensus/storage.h`. See [the journal contract and qualification limits](journal/README.md). Legacy `cluster::Raft` retains its volatile semantics.
-
-The additive `consensus/` module implements a transport-free, fixed-voter core with explicit persistence and application completions. `consensus/storage.h` supplies hard-state/log operation encoding and semantic replay over opaque journal batches. Core timing and network identity come from the host; no discovery policy enters the voting denominator. Read [the strict-core host contract](consensus/README.md) before integrating it. Checkpoint installation/reclamation and authenticated authority transport remain separate milestones.
+The completion I/O, the durable journal, and the strict durable consensus that grew here now
+live in their own repositories: [completion](https://github.com/Kronuz/completion),
+[journal](https://github.com/Kronuz/journal), [consensus](https://github.com/Kronuz/consensus),
+and [metrics](https://github.com/Kronuz/metrics). This repository keeps the bus, the legacy
+Raft, the length codec, and liveness; its history before the move still holds theirs. Legacy `cluster::Raft` retains its volatile semantics.
