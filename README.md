@@ -1,5 +1,7 @@
 # cluster
 
+[![CI](https://github.com/Kronuz/cluster/actions/workflows/ci.yml/badge.svg)](https://github.com/Kronuz/cluster/actions/workflows/ci.yml)
+
 A UDP-multicast **cluster substrate** — a message bus, Raft consensus, and membership
 gossip — on the [Kronuz/reactor](https://github.com/Kronuz/reactor) Asio runtime. Header-only.
 
