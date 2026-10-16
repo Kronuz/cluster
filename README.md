@@ -1,100 +1,95 @@
 # cluster
 
 [![CI](https://github.com/Kronuz/cluster/actions/workflows/ci.yml/badge.svg)](https://github.com/Kronuz/cluster/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+![C++20](https://img.shields.io/badge/C%2B%2B-20-blue.svg)
+![Header-only](https://img.shields.io/badge/header--only-yes-green.svg)
 
-A UDP-multicast **cluster substrate** — a message bus, Raft consensus, and membership
-gossip — on the [Kronuz/reactor](https://github.com/Kronuz/reactor) Asio runtime. Header-only.
+A UDP-multicast cluster substrate for C++20: a typed message bus and leader election
+on the [reactor](https://github.com/Kronuz/reactor) Asio runtime. Nodes on one
+network find each other and elect a leader; your app decides what a committed
+command does.
 
-This is the reusable half of a gossip/discovery service: the parts that are the same for
-any distributed system (framed multicast messaging, leader election, node membership),
-with the app-specific parts (the node type, the cluster-lifecycle state machine, what a
-committed command *does*) left to the caller. A search engine, another distributed store,
-or a coordination service ride the same substrate instead of each re-implementing a
-multicast Raft.
+![cluster: Raft consensus riding a multicast Bus](assets/architecture.svg)
 
-## The layers
+## ✨ Highlights
 
+- 📡 **`cluster::Bus`**: one multicast socket carrying versioned, typed frames scoped
+  by a cluster token; traffic from other clusters or newer protocols is dropped.
+- 🗳️ **`cluster::Raft`**: terms, votes, log replication, and commit, with the node
+  type and `apply(command)` injected. Elections settle in about 40 ms with a 20–60 ms
+  window.
+- 💓 **`cluster::LivenessTracker`**: tracks when each peer was last heard, for Raft's
+  `is_alive()`.
+- 🧵 **One loop**: receives and timers run on the bus reactor, so single-threaded
+  protocol code never races.
+- 🔁 **Wire-compatible** with Xapiand's discovery frames.
+
+## 📦 Installation
+
+Requires a C++20 compiler and CMake 3.14 or newer; reactor and standalone Asio are
+fetched at configure time. CI builds it on Linux (x86_64, arm64), macOS (arm64,
+x86_64), and FreeBSD, plus ASan, UBSan, and TSan builds.
+
+```cmake
+include(FetchContent)
+FetchContent_Declare(cluster
+  GIT_REPOSITORY https://github.com/Kronuz/cluster.git
+  GIT_TAG        main)
+FetchContent_MakeAvailable(cluster)
+
+target_link_libraries(my_app PRIVATE cluster::cluster)
 ```
-  Kronuz/reactor   UdpServer / PeriodicTimer / Signal   -- the Asio transport + loop
-       |
-  cluster::Bus     versioned, token-scoped, typed multicast messaging
-       |
-  cluster::Raft    term / log / role / votes + election + append + commit
-  cluster::gossip  HELLO/WAVE/SNEER/ENTER/BYE naming + the node table
-       |
-  the app          its node type, state hooks, apply(command), its own message types
-```
 
-Raft and the membership gossip share one multicast socket (the `Bus`), one node table, and
-one cluster state, so they live together in this one lib (Raft is a separable module, not a
-separate repo). The app is injected — it provides the node type, the apply callback, and
-the cluster-lifecycle hooks; the substrate never learns what a "database" or a "shard" is.
-
-## `cluster::Bus` — the shared message bus
-
-Every protocol rides the `Bus`: one UDP multicast socket, one receive loop, and a frame
-that carries a protocol version, a message type, and the cluster token (so a node ignores
-traffic from other clusters or newer protocols). The frame is byte-compatible with the
-classic Xapiand discovery transport:
-
-```
-[major:1][minor:1][type:1][serialise_string(token)][content...]
-```
+## 🚀 Quick start
 
 ```cpp
 #include "bus.h"
 
-cluster::Bus bus(/*major*/1, /*minor*/0, /*token*/"my-cluster", /*max_type*/32,
-    [](int type, std::string_view content, const asio::ip::udp::endpoint& from) {
-        dispatch(type, content, from);          // on the bus reactor thread
-    });
+cluster::Bus bus(/*major*/ 1, /*minor*/ 0, /*token*/ "my-cluster", /*max_type*/ 32,
+	[](int type, std::string_view content, const asio::ip::udp::endpoint& from) {
+		dispatch(type, content, from);   // on the bus reactor thread
+	});
 reactor::UdpOptions o;
 o.multicast_group = "239.192.168.1";
-o.multicast_loop  = true;                       // one-host clusters see their own sends
-o.reuse_port      = true;                       // N nodes share the port
+o.multicast_loop = true;                 // one-host clusters see their own sends
+o.reuse_port = true;                     // several nodes share the port
 bus.set_options(o);
 bus.start(58880);
-bus.send(5, payload);                           // frame + broadcast to the group
+bus.send(5, payload);                    // framed and sent to the group
 ```
 
-A received datagram is dropped unless it is well-formed, its version is `<=` ours, its type
-is in range, and its token matches; otherwise it is dispatched on the bus reactor thread —
-the same loop the caller runs its timers on (`bus.io()`), so a single-threaded protocol
-never races the receive.
+Run the demos: `cluster_gossip` (three nodes announce themselves) and
+`cluster_raft_election`.
 
-## Dependencies
+## 🎯 When to use it
 
-**[reactor](https://github.com/Kronuz/reactor)** (which brings standalone **asio**), via CMake `FetchContent`; otherwise header-only. The node type, its state hooks / `apply(command)`, the message codec, and logging are **injected seams**, not dependencies.
+- ✅ Discovery and leader election on one LAN, for state you can rebuild.
+- ❌ Durable consensus: terms, votes, and logs here are in memory. Use
+  [consensus](https://github.com/Kronuz/consensus) with
+  [journal](https://github.com/Kronuz/journal).
+- ❌ Membership gossip out of the box: the HELLO/WAVE naming protocol is still the
+  application's (see `examples/gossip.cc`).
 
-The completion I/O, the durable journal, and the strict durable consensus that grew here now
-live in their own repositories: [completion](https://github.com/Kronuz/completion),
-[journal](https://github.com/Kronuz/journal), [consensus](https://github.com/Kronuz/consensus),
-and [metrics](https://github.com/Kronuz/metrics). This repository keeps the bus, the legacy
-Raft, the length codec, and liveness; its history before the move still holds theirs.
+## 📚 Documentation
 
-## Build
+- [ARCHITECTURE.md](ARCHITECTURE.md): the layers, the frame, and the threading model.
+- [SAFETY.md](SAFETY.md): the Raft safety corrections and what the tests cover.
+- [AGENTS.md](AGENTS.md): file map and invariants.
+
+## 🛠️ Building and testing
 
 ```sh
 cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build
 ctest --test-dir build --output-on-failure
+./build/cluster_bus_bench && ./build/cluster_raft_bench
 ```
 
-Header-only: add the directory to your include path (or `FetchContent` this repo) and link
-`cluster::cluster` (which pulls in `reactor::reactor` + standalone Asio). Point
-`-DFETCHCONTENT_SOURCE_DIR_REACTOR=<path>` at a local reactor checkout for dev.
+## 🤝 Contributing
 
-`examples/gossip.cc` (`cluster_gossip`) is a runnable demo — three nodes announce themselves
-over the bus and print what they hear. `benchmarks/bus_bench.cc` (`cluster_bus_bench`) measures
-the per-message overhead the bus adds (framing + parse/validate — ~30 ns / ~1.5 ns). `test/bus_test.cc`
-covers the length codec (wire-compat round-trips) and the bus (a two-node exchange over loopback
-multicast, cluster-token scoping, and version rejection).
+Issues and pull requests are welcome. Read [AGENTS.md](AGENTS.md) first. CI must
+pass on every platform.
 
-## Limitations
+## 📄 License
 
-See [Legacy Raft safety corrections](SAFETY.md) for corrected replication progress, mixed-version limits, and deterministic regressions. These are separately validated behavior corrections after extraction. Terms, votes, and logs are still volatile, and the legacy module is not a durable write authority.
-
-`cluster::Bus` and `cluster::Raft` are implemented; membership gossip stays application-side. Raft was extracted from Xapiand and now includes the separately reviewed corrections above. `test/raft_test.cc` exercises election, application, and re-election in three- and five-node in-memory clusters; `test/raft_safety_test.cc` exercises deterministic safety regressions. These schedules do not constitute a general consensus proof. `examples/raft_election.cc` demonstrates the API, and `benchmarks/raft_bench.cc` measures election latency (approximately 40 ms with a 20–60 ms election window in the recorded benchmark).
-
-## License
-
-MIT. See [LICENSE](LICENSE).
+MIT, Copyright (c) 2026 Germán Méndez Bravo. See [LICENSE](LICENSE).

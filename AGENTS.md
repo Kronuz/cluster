@@ -5,9 +5,9 @@ Orientation for anyone (human or agent) working on this library.
 ## What this is
 
 A UDP-multicast **cluster substrate** on the Kronuz/reactor Asio runtime: a message bus,
-Raft consensus, and membership gossip — the reusable half of a gossip/discovery service.
+Raft consensus, and (next) membership gossip — the reusable half of a gossip/discovery service.
 The app is injected (its node type, cluster-lifecycle hooks, and apply callback); the
-substrate never learns the app's domain. Header-only. Read `README.md` for the layering;
+substrate never learns the app's domain. Header-only. Read `ARCHITECTURE.md` for the layering;
 this is the working notes.
 
 ## Origin + the fidelity rule
@@ -29,7 +29,7 @@ length.h    A thin compatibility shim over the external `varint` library
             `namespace cluster`, so every existing #include/call site keeps working
             unchanged. The actual codec used to be vendored here directly; it's now
             varint's own code (this repo's prior rewrite, extracted -- see varint's
-            README for why, including a real licensing issue in Xapiand's original
+            AGENTS.md for why, including a real licensing issue in Xapiand's original
             length.h that this code was never actually derived from).
 liveness.h  LivenessTracker -- a ready-to-use RaftDelegate::is_alive() implementation
             (last-seen timestamp per peer, timeout-based), for a delegate with no other
