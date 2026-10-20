@@ -132,6 +132,7 @@ struct RaftDelegate {
 	virtual bool joining() = 0;   // state == JOINING (single-node bootstrap special-case)
 	virtual void ensure_setup() = 0;                      // JOINING -> SETUP + setup_node
 	virtual void set_leader(const Node& leader) = 0;      // _raft_set_leader_node
+	// A throw keeps this entry pending; leave state unchanged or support idempotent replay.
 	virtual void apply(const std::string& command) = 0;   // _raft_apply_command
 };
 
@@ -243,7 +244,15 @@ private:
 		return true;
 	}
 
+	void apply_committed() {
+		while (last_applied_ < commit_index_ && last_applied_ < log_.size()) {
+			apply_command(log_[last_applied_].command);
+			++last_applied_;
+		}
+	}
+
 	void commit_log() {   // _raft_commit_log
+		apply_committed();
 		auto last_index = log_.size();
 		for (std::size_t index = commit_index_ + 1; index <= last_index; ++index) {
 			if (log_[index - 1].term == current_term_) {
@@ -253,12 +262,7 @@ private:
 				}
 				if (d_->quorum(d_->total_nodes(), matches)) {
 					commit_index_ = index;
-					if (commit_index_ > last_applied_) {
-						while (commit_index_ > last_applied_ && last_applied_ < last_index) {
-							apply_command(log_[last_applied_].command);
-							++last_applied_;
-						}
-					}
+					apply_committed();
 				}
 			}
 		}
@@ -532,13 +536,10 @@ private:
 
 				if (leader_commit > commit_index_) {
 					commit_index_ = std::max(commit_index_, std::min(leader_commit, verified_index));
-					if (commit_index_ > last_applied_) {
-						while (commit_index_ > last_applied_ && last_applied_ < last_index) {
-							apply_command(log_[last_applied_].command);
-							++last_applied_;
-						}
-					}
+
 				}
+
+				apply_committed();
 
 				if (leader_commit == commit_index_) {
 					if (d_->joining()) { d_->ensure_setup(); }
@@ -591,6 +592,7 @@ private:
 				// never prove data replication, even when their indexes look valid.
 				if (type == RaftMessage::HEARTBEAT_RESPONSE) {
 					next_indexes_[id] = match_indexes_[id] + 1;
+					apply_committed();
 					return;
 				}
 				if (match_index > log_.size() || next_index < match_index + 1) { return; }
@@ -635,6 +637,7 @@ private:
 			return;
 		}
 
+		apply_committed();
 		Node local = d_->local_node();
 		auto last_log_index = log_.size();
 		if (last_log_index > 0) {
@@ -696,7 +699,14 @@ private:
 				command = std::move(cmd_queue_.front());
 				cmd_queue_.pop_front();
 			}
-			do_add_command(command);
+			try {
+				do_add_command(command);
+			} catch (...) {
+				bool more;
+				{ std::lock_guard<std::mutex> lk(cmd_mtx_); more = !cmd_queue_.empty(); }
+				if (more) { add_command_signal_.send(); }
+				throw;
+			}
 		}
 	}
 

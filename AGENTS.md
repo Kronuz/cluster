@@ -184,3 +184,5 @@ the invariant documented). None was silently "improved".
 - Xapiand's Discovery is now a thin adapter over this substrate (`cluster::Bus` +
   `cluster::Raft` + `XapiandRaftDelegate`), replacing the libev UDP + all raft_* handlers.
   Validated: 2-node `cluster_check.sh` GREEN + a byte-identical discovery wire diff.
+
+Application failure keeps `last_applied_` behind the committed cursor. `apply_committed()` is the single drain; it advances only after callback return and retries independently of new commitment. Keep unchanged-commit follower/leader, successful-prefix, idle-timer and queued-tail regressions in `test/raft_safety_test.cc`. The delegate must be atomic on throw or idempotent on replay. Use a UDP owner runtime that contains timer/Signal exceptions; do not swallow application errors or count heartbeat match claims as replication.

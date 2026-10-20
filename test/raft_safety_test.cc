@@ -47,6 +47,8 @@ struct Delegate : cluster::RaftDelegate<Node> {
 	std::string leader;
 	std::vector<Message> sent;
 	std::vector<std::string> applied;
+	std::string fail_value;
+	unsigned failures_left = 0, apply_attempts = 0;
 	explicit Delegate(std::size_t count, std::string id = "A") : members(count), me(std::move(id)) {}
 	void broadcast(RaftMessage type, const std::string& body) override { sent.push_back({type, body}); }
 	Node local_node() override { return {me}; }
@@ -68,7 +70,14 @@ struct Delegate : cluster::RaftDelegate<Node> {
 	bool joining() override { return false; }
 	void ensure_setup() override {}
 	void set_leader(const Node& node) override { leader = node.id; }
-	void apply(const std::string& command) override { applied.push_back(command); }
+	void apply(const std::string& command) override {
+		++apply_attempts;
+		if (failures_left && command == fail_value) {
+			--failures_left;
+			throw std::runtime_error("application unavailable");
+		}
+		applied.push_back(command);
+	}
 };
 
 struct Fixture {
@@ -429,8 +438,82 @@ static void exhausted_term() {
 		voted_for(last_election) == "A", "the last elected leader cannot campaign past the maximum or cast a second ballot");
 }
 
+
+static bool apply_throws(Fixture& f, RaftMessage type, const std::string& body) {
+	try { f.raft.on_message(type, body); }
+	catch (const std::runtime_error&) { return true; }
+	return false;
+}
+
+static void application_retry() {
+	for (bool heartbeat : {false, true}) {
+		Fixture f;
+		f.delegate.fail_value = "first";
+		f.delegate.failures_left = 1;
+		auto data = append("B", 1, 0, 0, 1) + serialise_length(1) + serialise_length(1) + serialise_string("first");
+		auto sent = f.delegate.sent.size();
+		check(apply_throws(f, RaftMessage::APPEND_ENTRIES, data), "follower propagates application failure");
+		check(f.delegate.applied.empty() && f.delegate.sent.size() == sent,
+			"failed application sends no success response");
+		auto type = heartbeat ? RaftMessage::HEARTBEAT : RaftMessage::APPEND_ENTRIES;
+		auto retry = heartbeat ? append("B", 1, 1, 1, 1) : data;
+		f.raft.on_message(type, retry);
+		check(f.delegate.applied == std::vector<std::string>{"first"} && f.delegate.apply_attempts == 2,
+			"unchanged commit retries on heartbeat or data retransmission");
+		f.raft.on_message(type, retry);
+		check(f.delegate.apply_attempts == 2, "successful application is not replayed");
+	}
+	{
+		Fixture f;
+		f.delegate.fail_value = "second";
+		f.delegate.failures_left = 2;
+		auto entry = [](std::uint64_t previous, std::uint64_t committed, const char* value) {
+			return append("B", 1, previous, previous ? 1 : 0, committed) +
+				serialise_length(previous + 1) + serialise_length(1) + serialise_string(value);
+		};
+		f.raft.on_message(RaftMessage::APPEND_ENTRIES, entry(0, 1, "first"));
+		auto sent = f.delegate.sent.size();
+		check(apply_throws(f, RaftMessage::APPEND_ENTRIES, entry(1, 2, "second")), "second entry may fail after a successful prefix");
+		check(apply_throws(f, RaftMessage::APPEND_ENTRIES, entry(2, 3, "third")), "persistent failure prevents later application");
+		check(f.delegate.applied == std::vector<std::string>{"first"} && f.delegate.sent.size() == sent,
+			"failed suffix neither replays the prefix nor acknowledges success");
+		f.raft.on_message(RaftMessage::HEARTBEAT, append("B", 1, 3, 1, 3));
+		check(f.delegate.applied == std::vector<std::string>{"first", "second", "third"} && f.delegate.apply_attempts == 5,
+			"recovery drains only the remaining committed suffix in order");
+	}
+	for (unsigned path = 0; path != 3; ++path) {
+		Fixture f(3, "A", path == 2);
+		f.leader();
+		f.delegate.fail_value = "first";
+		f.delegate.failures_left = 1;
+		f.command("first");
+		auto response = serialise_string("B") + serialise_length(f.raft.term()) + serialise_length(1) + serialise_length(2) + serialise_length(1);
+		check(apply_throws(f, RaftMessage::APPEND_ENTRIES_RESPONSE, response), "leader propagates a committed application failure");
+		if (path == 2) { f.io.restart(); f.io.run_for(std::chrono::milliseconds(25)); }
+		else { f.raft.on_message(path == 0 ? RaftMessage::APPEND_ENTRIES_RESPONSE : RaftMessage::HEARTBEAT_RESPONSE, response); }
+		check(f.delegate.applied == std::vector<std::string>{"first"} && f.delegate.apply_attempts == 2,
+			"leader retries on unchanged data acknowledgement, heartbeat response or idle timer");
+	}
+	{
+		Fixture f;
+		f.leader();
+		f.delegate.members = 1;
+		f.delegate.fail_value = "first";
+		f.delegate.failures_left = 1;
+		f.raft.add_command("first");
+		f.raft.add_command("second");
+		bool failed = false;
+		f.io.restart();
+		try { f.io.poll(); } catch (const std::runtime_error&) { failed = true; }
+		check(failed && f.delegate.applied.empty(), "posted command failure reaches the executor owner");
+		f.io.poll();
+		check(f.delegate.applied == std::vector<std::string>{"first", "second"},
+			"remaining queued commands have a future wake after application failure");
+	}
+}
+
 int main() {
-	try { heartbeat_safety(); affirmative_majority(); retained_vote(); inherited_log(); term_safety(); exhausted_term(); }
+	try { heartbeat_safety(); affirmative_majority(); retained_vote(); inherited_log(); term_safety(); exhausted_term(); application_retry(); }
 	catch (const std::exception& e) { check(false, e.what()); }
 	return failures == 0 ? 0 : 1;
 }

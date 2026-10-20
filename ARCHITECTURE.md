@@ -149,3 +149,7 @@ live in their own repositories: [completion](https://github.com/Kronuz/completio
 [journal](https://github.com/Kronuz/journal), [consensus](https://github.com/Kronuz/consensus),
 and [metrics](https://github.com/Kronuz/metrics). This repository keeps the bus, the legacy
 Raft, the length codec, and liveness; its history before the move still holds theirs. Legacy `cluster::Raft` retains its volatile semantics.
+
+## Committed application
+
+`apply_committed()` drains the committed prefix from the application cursor. It runs independently of commit growth, so a restored application can catch up on a repeated heartbeat or acknowledgement. Leader idle retry uses the existing heartbeat timer, not a second scheduler. A callback throw leaves the current entry pending and propagates to the owner runtime. See [SAFETY.md](SAFETY.md#application-failure-and-ordered-retry) for delegate replay obligations and response ordering.

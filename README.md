@@ -93,3 +93,7 @@ pass on every platform.
 ## 📄 License
 
 MIT, Copyright (c) 2026 Germán Méndez Bravo. See [LICENSE](LICENSE).
+
+### Application exceptions
+
+An `apply()` exception preserves the pending entry for ordered retry on subsequent valid traffic or the leader's heartbeat timer. It propagates to the executor owner. The delegate must leave state unchanged or support consistent idempotent replay; normal return means definitively handled. See [SAFETY.md](SAFETY.md#application-failure-and-ordered-retry). This changes neither the wire format nor legacy volatile persistence.
