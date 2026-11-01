@@ -95,6 +95,35 @@ Not for:
   ordered retry, so the delegate must leave state unchanged or replay it consistently
   ([SAFETY.md](SAFETY.md#application-failure-and-ordered-retry)).
 
+## ⚡ Performance
+
+`cluster_bus_bench` times the CPU work the bus adds per message, with no socket, over 2,000,000
+messages: *frame* builds a 200-byte message (version, type, token and content) as `Bus::send()`
+does, and *parse and validate* reads one back and checks its version, type and token as the
+receive path does. `cluster_raft_bench` starts a fresh three-node in-memory cluster 20 times,
+with a 10 ms heartbeat and a 20 to 60 ms election window, and reports the median time until one
+leader is elected. Each cell is the range over three runs.
+
+| Workload | Apple M4 Pro | Intel Core i9-9980HK |
+|---|---:|---:|
+| frame a 200-byte message (ns) | 30.7 to 32.5 | 83.9 to 84.7 |
+| parse and validate a frame (ns) | 1.5 to 2.5 | 8.2 to 10.5 |
+| elect a leader, median of 20 (ms) | 38.8 to 40.6 | 37.4 to 39.5 |
+
+There is no comparator: the frame is Xapiand's discovery wire format, which no other library
+writes, and the election time follows the configured election window, not the CPU (every one of
+the 120 starts elected a leader).
+
+Apple M4 Pro (arm64), macOS 26.7.2, and Intel Core i9-9980HK (x86_64), macOS 15.8.1, both with
+Apple clang 17.0.0 and `-O3 -DNDEBUG`, at `acff32b`:
+
+```sh
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --target cluster_bus_bench cluster_raft_bench
+./build/cluster_bus_bench
+./build/cluster_raft_bench 20
+```
+
 ## 📚 Documentation
 
 - [ARCHITECTURE.md](ARCHITECTURE.md): the layers, the frame and the threading model.
