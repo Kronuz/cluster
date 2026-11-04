@@ -24,11 +24,11 @@ find_package(Threads REQUIRED)
 # --- reactor: the Asio runtime (UdpServer + PeriodicTimer + Signal + the reactor pool) ---
 # Provides reactor::reactor, including UDP callback containment and timer retries.
 # Set -DFETCHCONTENT_SOURCE_DIR_REACTOR=<path> to build against a local checkout.
-FetchContent_Declare(reactor GIT_REPOSITORY https://github.com/Kronuz/reactor.git GIT_TAG a59e9f8808e46b7d030aa2a936564038843100f4)
+FetchContent_Declare(reactor GIT_REPOSITORY https://github.com/Kronuz/reactor.git GIT_TAG ab69cf26e556f7108fb800d89c324648779e2549)
 FetchContent_MakeAvailable(reactor)
 
 # --- varint: the length/string/bool/char wire codec behind length.h ---
-FetchContent_Declare(varint GIT_REPOSITORY https://github.com/Kronuz/varint.git GIT_TAG ac6003e1ca12a2e52f6cf086d8a328d17672a558)
+FetchContent_Declare(varint GIT_REPOSITORY https://github.com/Kronuz/varint.git GIT_TAG 1c3e526a9b99612038ed3573215a7560f0b2cd20)
 FetchContent_MakeAvailable(varint)
 
 # --- the cluster substrate (header-only) ---
