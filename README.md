@@ -2,6 +2,8 @@
 
 Part of [Kronuz C++ Libraries](https://github.com/Kronuz/cpp-libraries), a collection of small, reusable C++ libraries.
 
+> **Archived.** Use [consensus](https://github.com/Kronuz/consensus) for Raft. The multicast `Bus` and `LivenessTracker` have no successor; existing pinned commits remain available.
+
 [![CI](https://github.com/Kronuz/cluster/actions/workflows/ci.yml/badge.svg)](https://github.com/Kronuz/cluster/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![C++20](https://img.shields.io/badge/C%2B%2B-20-blue.svg)
